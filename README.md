@@ -46,9 +46,9 @@ Early days. The repository is scaffolded; the tools are being built. Planned too
 - `hollow` and `drill_holes`: hollow a model to save resin, then drill a suction-relief
   hole through each cavity's floor and a vent through its roof so it can drain
   (always follow `hollow` with `drill_holes`)
-
 - `auto_support_and_slice`: DragonFruit's own auto-supports and raft, sliced
-  into the print (a spike, NDFM-8; see below)
+  into the print, with the same printer, format and material options as `slice`
+  (NDFM-8; see below)
 
 Supports: upstream has no headless command for them, so `ts/autosupport-slice.ts`
 runs the app's own placement and support export under Node, and

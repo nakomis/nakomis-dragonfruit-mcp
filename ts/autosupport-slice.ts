@@ -13,7 +13,7 @@
  *   entry point) -> `commitAutoPlacePlan` into the support store ->
  *   `buildSupportAndRaftWorldTriangles` (the app's export path) -> model
  *   triangles first, then supports and raft, with `modelTriangleCount` at the
- *   split -> the job `scene slice` assembles for the printer preset ->
+ *   split -> the job `scene slice` assembles for the printer profile ->
  *   `dragonfruit-cli slice run --job`.
  *
  * Run by `nakomis_dragonfruit_mcp.cli.run_ts` with DragonFruit's tsx, its
@@ -33,7 +33,8 @@
  *
  * Usage:
  *   tsx autosupport-slice.ts --stl <in.stl> [--out <out.ctb>] --cli <dragonfruit-cli> [--tools <dragonfruit-mcp-tools>]
- *     [--printer <presetId>] [--lift-mm 7] [--density 1] [--raft solid|line|off]
+ *     --printer-json <profile.json> [--material <material.json>] [--layer-height N]
+ *     [--aa-preset sharp|balanced|smooth|raw] [--lift-mm 7] [--density 1] [--raft solid|line|off]
  *     [--settings <json>] [--coarse-islands] [--px-mm 0.05] [--supported-stl <out.stl>] [--plate-stl <out.stl>] [--job-dir <dir>]
  *     [--no-slice] [--verbose]
  *
@@ -116,7 +117,10 @@ interface Options {
     out: string | null;
     cli: string | null;
     tools: string | null;
-    printer: string;
+    printerJson: string | null;
+    material: string | null;
+    layerHeight: string | null;
+    aaPreset: string | null;
     liftMm: number;
     density: number;
     raft: RaftMode;
@@ -136,7 +140,10 @@ function parseArgs(argv: string[]): Options {
         out: null,
         cli: null,
         tools: null,
-        printer: 'elegoo-mars-5-ultra-ctb',
+        printerJson: null,
+        material: null,
+        layerHeight: null,
+        aaPreset: null,
         liftMm: DEFAULT_LIFT_DISTANCE_MM,
         density: 1,
         raft: 'solid',
@@ -166,7 +173,10 @@ function parseArgs(argv: string[]): Options {
         else if (arg === '--out') options.out = resolve(value());
         else if (arg === '--cli') options.cli = resolve(value());
         else if (arg === '--tools') options.tools = resolve(value());
-        else if (arg === '--printer') options.printer = value();
+        else if (arg === '--printer-json') options.printerJson = resolve(value());
+        else if (arg === '--material') options.material = resolve(value());
+        else if (arg === '--layer-height') options.layerHeight = String(number());
+        else if (arg === '--aa-preset') options.aaPreset = value();
         else if (arg === '--lift-mm') options.liftMm = number();
         else if (arg === '--density') options.density = number();
         else if (arg === '--raft') options.raft = value() as RaftMode;
@@ -181,6 +191,7 @@ function parseArgs(argv: string[]): Options {
         else throw new Error(`unknown argument "${arg}"`);
     }
     if (!options.stl) throw new Error('--stl is required');
+    if (!options.printerJson) throw new Error('--printer-json is required (a preset reference, custom profile or bundle)');
     if (options.slice && !options.cli) throw new Error('--cli is required unless --no-slice');
     if (!['solid', 'line', 'off'].includes(options.raft)) throw new Error('--raft must be solid, line or off');
     if (options.liftMm < 0) throw new Error('--lift-mm must not be negative');
@@ -338,18 +349,23 @@ async function main(): Promise<void> {
     type SliceJobModule = typeof import('../vendor/dragonfruit/scripts/cli/sceneSliceJob');
     type SceneSliceGeometry = import('../vendor/dragonfruit/scripts/cli/sceneSliceJob').SceneSliceGeometry;
     const sliceJob = await time('profiles_ms', () => importDragonFruitScript<SliceJobModule>('scripts/cli/sceneSliceJob.ts'));
-    const job = sliceJob.resolveSceneSliceJob({ printer: { presetId: options.printer } });
-    if (!job.printer || !job.material) throw new Error(`printer preset '${options.printer}' did not resolve`);
-    if (job.printer.officialPresetId !== options.printer) {
-        throw new Error(`'${options.printer}' is not a known printer preset`);
-    }
+    // As `scene slice` does: the parsed printer and material JSON, through the
+    // profile store the way the app adds them.
+    const readJson = (path: string): unknown => JSON.parse(readFileSync(path, 'utf-8'));
+    const job = sliceJob.resolveSceneSliceJob({
+        printer: readJson(options.printerJson!),
+        material: options.material ? readJson(options.material) : undefined,
+        layerHeight: options.layerHeight ?? undefined,
+        aaPreset: (options.aaPreset ?? undefined) as Parameters<typeof sliceJob.resolveSceneSliceJob>[0]['aaPreset'],
+    });
+    if (!job.printer || !job.material) throw new Error(`the printer profile in ${options.printerJson} did not resolve`);
     // The printer decides the format: without --out the print goes beside the
     // STL, named for it; an --out naming another format is refused rather than
     // written as a file whose extension lies about its contents.
     const format = `.${job.printer.display.outputFormat.replace(/^\./, '').toLowerCase()}`;
     if (!options.out) options.out = join(dirname(options.stl), `${basename(options.stl).replace(/\.stl$/i, '')}-supported${format}`);
     if (options.slice && extname(options.out).toLowerCase() !== format) {
-        throw new Error(`--out ${options.out}: printer '${options.printer}' writes ${format} files, so the output must end in ${format}`);
+        throw new Error(`--out ${options.out}: printer '${job.printer.name}' writes ${format} files, so the output must end in ${format}`);
     }
     setActivePrinterProfile(job.printer.id);
     setActiveMaterialProfile(job.material.id);
@@ -583,7 +599,7 @@ async function main(): Promise<void> {
     console.error(`autosupport-slice: ${islands.length} islands, ${committed.contacts} contacts, ${supportTriangles.length} support/raft triangles`);
     process.stdout.write(`${JSON.stringify({
         stl: options.stl,
-        printer: { preset_id: options.printer, name: job.printer.name, material: job.material.name, layer_height_mm: layerHeightMm },
+        printer: { preset_id: job.printer.officialPresetId ?? null, name: job.printer.name, output_format: format, material: job.material.name, layer_height_mm: layerHeightMm },
         lift_mm: options.liftMm,
         model_bbox_mm: { min: box.min.toArray(), max: box.max.toArray() },
         // Plate frame: the engine's X/Y origin is the plate centre, Z is up from the plate.

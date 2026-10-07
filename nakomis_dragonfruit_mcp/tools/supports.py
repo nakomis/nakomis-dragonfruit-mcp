@@ -8,15 +8,22 @@ tool supplies the overhang scan the app runs as a Tauri command.
 
 from __future__ import annotations
 
+import functools
+import json
+import tempfile
 from pathlib import Path
+from typing import Any
 
+import anyio
 from pydantic import BaseModel, Field
 
 from nakomis_dragonfruit_mcp import cli
+from nakomis_dragonfruit_mcp import stl as stl_io
 from nakomis_dragonfruit_mcp.app import ToolResult, mcp
+from nakomis_dragonfruit_mcp.printers import SliceRun
+from nakomis_dragonfruit_mcp.tools import slicing
 
 SCRIPT = cli.REPO_ROOT / "ts" / "autosupport-slice.ts"
-DEFAULT_PRINTER_PRESET = "elegoo-mars-5-ultra-ctb"
 
 # Placement and island detection take seconds; slicing a tall part at 50 µm
 # takes minutes on an old machine.
@@ -35,6 +42,10 @@ _REQUIRED_KEYS = {
     "timings_ms",
     "warnings",
 }
+
+
+# What the sidecar and result need from `dragonfruit-cli slice run --json`.
+_SLICE_KEYS = {"layers", "layer_height_mm", "format", "resolution_px"}
 
 
 class PlateTransform(BaseModel):
@@ -65,10 +76,13 @@ class LayerFrame(BaseModel):
 
 
 class SupportedSlice(ToolResult):
-    output: str | None = Field(description="The sliced print, supports and raft included")
-    printer_preset: str
-    printer_name: str
+    output_path: str = Field(description="The sliced print, supports and raft included")
+    format: str
+    printer: str
+    printer_chosen_by: str
     material: str
+    layers: int
+    layer_height_mm: float
     lift_mm: float
     islands: int
     islands_by_source: dict[str, int] = Field(
@@ -87,21 +101,38 @@ class SupportedSlice(ToolResult):
     build_height_mm: float
     model_triangles: int
     support_triangles: int
-    layers: int | None
+    profile: dict[str, Any] = Field(description="The DragonFruit profile the slice used")
+    sidecar_path: str = Field(description="`<print file>.ndfm.json`: how this file was made")
+    plate_offset_mm: list[float] = Field(
+        description="Translation applied to the STL: XY bounding-box centre to the plate centre "
+        "(0, 0), lowest point to z = lift_mm"
+    )
     plate_transform: PlateTransform
     layer_frame: LayerFrame
-    plate_stl: str | None = Field(description="The model alone, as placed for the slice")
-    supported_stl: str | None = Field(description="Model, supports and raft, as sliced")
+    plate_stl_path: str | None = Field(
+        default=None, description="With export_plate_stl: the model as sliced, without supports"
+    )
+    plate_bbox_mm: dict[str, list[float]] | None = None
+    supported_stl_path: str | None = Field(
+        default=None, description="With export_supported_stl: model, supports and raft as sliced"
+    )
     overwritten: list[str] = Field(
         description="Output files that already existed and were replaced"
+    )
+    extra_files: list[str] = Field(
+        default_factory=list, description="Written by the printer driver"
     )
     timings_ms: dict[str, int]
 
 
 @mcp.tool()
-def auto_support_and_slice(
+async def auto_support_and_slice(
     stl_path: str,
-    printer_preset: str = DEFAULT_PRINTER_PRESET,
+    printer: str | None = None,
+    format: str | None = None,  # noqa: A002
+    material: str | None = None,
+    layer_height: float | None = None,
+    aa_preset: str | None = None,
     out_path: str | None = None,
     lift_mm: float | None = None,
     density: float | None = None,
@@ -109,11 +140,17 @@ def auto_support_and_slice(
     export_plate_stl: bool = False,
     export_supported_stl: bool = False,
     fast_islands: bool = False,
+    options: dict[str, Any] | None = None,
 ) -> SupportedSlice:
     """Auto-support an STL with DragonFruit's own placement, add a raft, and slice it.
 
     Slow: expect a minute or two for a 70 mm part on this machine, and up to the
     45-minute timeout when the machine is busy or the part is large.
+
+    Printer, format, material, layer_height, aa_preset and options work as in
+    `slice`: `printer` is a name from `list_printers` (default `$NDFM_PRINTER`,
+    then config.toml, then `mars5ultra`, which writes `.goo`); `material` is a
+    path to a DragonFruit material profile JSON.
 
     What it does: centres the model on the plate and lifts it (default 7 mm, the
     app's own auto-lift) so supports fit under it, as it stands: there is no
@@ -126,15 +163,18 @@ def auto_support_and_slice(
     area (2 = twice as many). `raft` adds the app's default solid raft.
 
     Outputs: the print at `out_path`, or beside the STL as
-    `<name>-supported.<format>`. The printer preset decides the format; an
-    `out_path` with another extension is refused. Parent folders are created,
-    and existing files are overwritten (listed in `overwritten`).
-    `export_plate_stl` writes the model alone, exactly as placed for the slice
-    (plate frame: X/Y origin at the plate centre, Z up from the plate; see
-    `plate_transform`); `export_supported_stl` writes model, supports and raft.
-    `layer_frame` maps a layer image onto that frame: the image spans the build
-    area centred on the origin, rows run down from +Y, and `mirror_x`/`mirror_y`
-    say whether the printer's images are mirrored (the Mars 5 Ultra mirrors X).
+    `<name>-<printer>-supported<ext>`. The printer profile decides the format;
+    an `out_path` with another extension is refused. Parent folders are
+    created, and existing files are overwritten (listed in `overwritten`).
+    `<print>.ndfm.json` records how it was made (inspect_print and
+    preview_layer read the mirroring from it). `export_plate_stl` writes the
+    model alone, exactly as placed for the slice, as `<print>.plate.stl` (plate
+    frame: X/Y origin at the plate centre, Z up from the plate, the same frame
+    as `slice`'s); `export_supported_stl` writes model, supports and raft as
+    `<print>.supported.stl`. `layer_frame` maps a layer image onto that frame:
+    the image spans the build area centred on the origin, rows run down from
+    +Y, and `mirror_x`/`mirror_y` say whether the printer's images are mirrored
+    (the Mars 5 Ultra mirrors X).
 
     Read `warnings`: they name islands left without support, supports culled as
     orphans, and anything else that makes the print riskier. Contact counts
@@ -142,60 +182,182 @@ def auto_support_and_slice(
     tracing is order-dependent). Not yet validated on a real printer: check
     the supports before printing.
     """
+    run = functools.partial(
+        run_auto_support_and_slice,
+        stl_path,
+        printer=printer,
+        format=format,
+        material=material,
+        layer_height=layer_height,
+        aa_preset=aa_preset,
+        out_path=out_path,
+        lift_mm=lift_mm,
+        density=density,
+        raft=raft,
+        export_plate_stl=export_plate_stl,
+        export_supported_stl=export_supported_stl,
+        fast_islands=fast_islands,
+        options=options,
+    )
+    # Minutes of work: keep the event loop free meanwhile.
+    return await anyio.to_thread.run_sync(run)
+
+
+def run_auto_support_and_slice(
+    stl_path: str,
+    *,
+    printer: str | None = None,
+    format: str | None = None,  # noqa: A002
+    material: str | None = None,
+    layer_height: float | None = None,
+    aa_preset: str | None = None,
+    out_path: str | None = None,
+    lift_mm: float | None = None,
+    density: float | None = None,
+    raft: bool = True,
+    export_plate_stl: bool = False,
+    export_supported_stl: bool = False,
+    fast_islands: bool = False,
+    options: dict[str, Any] | None = None,
+) -> SupportedSlice:
+    """The blocking body of `auto_support_and_slice`."""
     stl = Path(stl_path).expanduser().resolve()
     if not stl.is_file():
-        raise cli.CliError(f"{stl} not found")
+        raise cli.CliError(f"STL not found: {stl}")
     if density is not None and density <= 0:
         raise ValueError("density must be positive")
     if lift_mm is not None and lift_mm < 0:
         raise ValueError("lift_mm must not be negative")
+    if layer_height is not None and layer_height <= 0:
+        raise ValueError("layer_height must be positive")
+    if aa_preset is not None and aa_preset not in slicing.AA_PRESETS:
+        raise ValueError(f"aa_preset must be one of {', '.join(slicing.AA_PRESETS)}")
+    material_path = None
+    if material is not None:
+        material_path = Path(material).expanduser().resolve()
+        if not material_path.is_file():
+            raise cli.CliError(f"material profile not found: {material_path}")
+    if format is not None:
+        format = format.lower()
+        if not format.startswith("."):
+            format = "." + format
 
-    out = Path(out_path).expanduser().resolve() if out_path else None
-    # The extra STLs go beside the print (or the STL, before the print is named).
-    stem_dir = out.parent if out else stl.parent
-    stem = out.stem if out else f"{stl.stem}-supported"
-    args = [
-        "--stl",
-        str(stl),
-        "--cli",
-        str(cli.find_binary(cli.DRAGONFRUIT_CLI)),
-        "--tools",
-        str(cli.find_binary(cli.MCP_TOOLS)),
-        "--printer",
-        printer_preset,
-        "--raft",
-        "solid" if raft else "off",
-    ]
-    if out:
-        args += ["--out", str(out)]
-    if lift_mm is not None:
-        args += ["--lift-mm", str(lift_mm)]
-    if density is not None:
-        args += ["--density", str(density)]
-    if fast_islands:
-        args.append("--coarse-islands")
-    if export_plate_stl:
-        args += ["--plate-stl", str(stem_dir / f"{stem}-plate.stl")]
-    if export_supported_stl:
-        args += ["--supported-stl", str(stem_dir / f"{stem}-with-supports.stl")]
+    plan = slicing.plan_slice(
+        stl,
+        printer=printer,
+        format=format,
+        layer_height=layer_height,
+        material_path=material_path,
+        aa_preset=aa_preset,
+        out_path=out_path,
+        options=options,
+        name_tag="-supported",
+    )
+    chosen, job = plan.printer, plan.job
+    if job.out_path.suffix.lower() != plan.suffix:
+        # Unlike `slice`, refused: the TS side would refuse it after minutes of work.
+        raise cli.CliError(
+            f"out_path ends {job.out_path.suffix!r} but printer {chosen.name!r} writes "
+            f"{plan.suffix!r}; use a {plan.suffix} path"
+        )
+    warnings = [w for w in plan.warnings if not w.startswith("out_path ends")]
+    extra = slicing.call_hook(chosen, "extra_slice_args", chosen.extra_slice_args, job)
+    if extra:
+        warnings.append(
+            f"printer {chosen.name!r} asks for extra `scene slice` arguments {extra}, which "
+            "auto_support_and_slice does not use"
+        )
 
-    result = cli.run_ts(args, script=SCRIPT, parse_json=True, timeout=TIMEOUT_S)
+    job.out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="ndfm-autosupport-py-") as tmp:
+        profile_file = Path(tmp) / "printer.json"
+        profile_file.write_text(json.dumps(plan.profile))
+        args = [
+            "--stl", str(job.stl_path),
+            "--out", str(job.out_path),
+            "--cli", str(cli.find_binary(cli.DRAGONFRUIT_CLI)),
+            "--tools", str(cli.find_binary(cli.MCP_TOOLS)),
+            "--printer-json", str(profile_file),
+            "--raft", "solid" if raft else "off",
+        ]  # fmt: skip
+        if job.material:
+            args += ["--material", str(job.material)]
+        if job.layer_height is not None:
+            args += ["--layer-height", f"{job.layer_height:g}"]
+        if job.aa_preset:
+            args += ["--aa-preset", job.aa_preset]
+        if lift_mm is not None:
+            args += ["--lift-mm", f"{lift_mm:g}"]
+        if density is not None:
+            args += ["--density", f"{density:g}"]
+        if fast_islands:
+            args.append("--coarse-islands")
+        if export_supported_stl:
+            args += [
+                "--supported-stl",
+                str(job.out_path.with_name(job.out_path.name + ".supported.stl")),
+            ]
+        result = cli.run_ts(args, script=SCRIPT, parse_json=True, timeout=TIMEOUT_S)
+
     data = result.data
     if not isinstance(data, dict) or not data.keys() >= _REQUIRED_KEYS:
         raise cli.CliError(f"unexpected autosupport-slice output: {result.stdout[:200]!r}")
+    slice_info = data.get("slice")
+    if not isinstance(slice_info, dict) or not slice_info.keys() >= _SLICE_KEYS:
+        raise cli.CliError(f"the slicer reported nothing usable: {str(slice_info)[:200]!r}")
+    out_file = Path(data["output"])
+    if not out_file.is_file():
+        raise cli.CliError(f"the slicer reported success but {out_file} does not exist")
 
-    warnings = list(data["warnings"])
-    slice_info = data.get("slice") or {}
-    if data.get("output") and not slice_info:
-        warnings.append("the slicer reported nothing about the print it wrote")
+    warnings += data["warnings"]
     if data["contacts"] == 0:
         warnings.append("no supports were placed: the print will have none")
-    printer = data.get("printer", {})
+    run = SliceRun(profile=plan.profile, cli_args=args, result=slice_info)
+    final = slicing.call_hook(chosen, "postprocess", chosen.postprocess, out_file, job, run)
+
+    offset = [float(v) + 0.0 for v in data["plate_transform"]["translate_mm"]]
+    bbox = data.get("model_bbox_mm") or {}
+    plate_bbox = {"min": bbox.get("min", []), "max": bbox.get("max", [])}
+    plate_path = None
+    if export_plate_stl:
+        # The same writer and frame as `slice`'s plate STL: the STL moved by the offset.
+        plate = final.with_name(final.name + ".plate.stl")
+        try:
+            stl_io.write_translated(job.stl_path, plate, (offset[0], offset[1], offset[2]))
+        except (OSError, stl_io.StlError) as e:
+            warnings.append(f"the slice succeeded but the plate STL could not be written: {e}")
+        else:
+            plate_path = str(plate)
+    supports_info = {
+        "lift_mm": data.get("lift_mm"),
+        "raft": data["raft"],
+        "islands": data["islands"],
+        "islands_by_source": data["islands_by_source"],
+        "supports_by_type": data["placed_by_type"],
+        "contacts": data["contacts"],
+        "islands_uncovered": data.get("islands_uncovered", 0),
+        "supported_stl": data.get("supported_stl"),
+    }
+    sidecar = slicing.write_sidecar(
+        final,
+        chosen,
+        plan.profile,
+        slice_info,
+        place_on_plate=True,
+        offset=offset,
+        plate_path=plate_path,
+        plate_bbox=plate_bbox if plate_path else None,
+        supports=supports_info,
+    )
+    printer_info = data.get("printer", {})
     return SupportedSlice(
-        output=data.get("output"),
-        printer_preset=printer.get("preset_id", printer_preset),
-        printer_name=printer.get("name", ""),
-        material=printer.get("material", ""),
+        output_path=str(final),
+        format=slice_info["format"],
+        printer=chosen.name,
+        printer_chosen_by=plan.origin,
+        material=printer_info.get("material", ""),
+        layers=slice_info["layers"],
+        layer_height_mm=round(slice_info["layer_height_mm"], 4),
         lift_mm=data.get("lift_mm", lift_mm or 0),
         islands=data["islands"],
         islands_by_source=data["islands_by_source"],
@@ -210,12 +372,16 @@ def auto_support_and_slice(
         build_height_mm=data.get("build_height_mm", 0.0),
         model_triangles=data["model_triangles"],
         support_triangles=data["support_triangles"],
-        layers=slice_info.get("layers"),
+        profile=plan.profile,
+        sidecar_path=str(sidecar),
+        plate_offset_mm=offset,
         plate_transform=PlateTransform(**data["plate_transform"]),
         layer_frame=LayerFrame(**data["layer_frame"]),
-        plate_stl=data.get("plate_stl"),
-        supported_stl=data.get("supported_stl"),
+        plate_stl_path=plate_path,
+        plate_bbox_mm=plate_bbox if plate_path else None,
+        supported_stl_path=data.get("supported_stl"),
         overwritten=data.get("overwritten", []),
+        extra_files=[str(p) for p in run.extra_files],
         timings_ms=data["timings_ms"],
         warnings=warnings,
     )

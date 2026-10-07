@@ -4,10 +4,10 @@ import shutil
 from pathlib import Path
 
 import pytest
-from test_cli import make_fake_binary
 
 from nakomis_dragonfruit_mcp import cli
 from nakomis_dragonfruit_mcp.tools import supports
+from tests.test_cli import make_fake_binary
 
 # The integration tests need a real model: set NDFM_TEST_STL to a binary STL
 # that fits the Mars 5 Ultra (the project's own is the 70 mm logo model).
@@ -15,12 +15,14 @@ TEST_STL = Path(os.environ["NDFM_TEST_STL"]) if os.environ.get("NDFM_TEST_STL") 
 
 SUMMARY = {
     "printer": {
-        "preset_id": "elegoo-mars-5-ultra-ctb",
+        "preset_id": None,
         "name": "Mars 5 Ultra",
+        "output_format": ".goo",
         "material": "Standard 405nm",
         "layer_height_mm": 0.05,
     },
     "lift_mm": 7,
+    "model_bbox_mm": {"min": [-2, -4, 7], "max": [2, 4, 11]},
     "islands": 14,
     "islands_by_source": {"voxel": 9, "overhang": 5},
     "placed_by_type": {"trunk": 91, "branch": 36, "leaf": 80, "twig": 42},
@@ -30,14 +32,11 @@ SUMMARY = {
     "islands_uncovered": 3,
     "area_coverage": 1.27,
     "raft": "solid",
-    "height_mm": 77.2,
+    "height_mm": 11,
     "build_height_mm": 165,
-    "overwritten": ["/tmp/model-supported.ctb"],
-    "model_triangles": 462916,
+    "model_triangles": 2,
     "support_triangles": 140812,
-    "plate_transform": {"translate_mm": [0, 0.15, 7], "rotation": None, "scale": 1},
-    "plate_stl": None,
-    "supported_stl": None,
+    "plate_transform": {"translate_mm": [-12, -24, 2], "rotation": None, "scale": 1},
     "layer_frame": {
         "source_width_px": 8520,
         "source_height_px": 4320,
@@ -50,130 +49,172 @@ SUMMARY = {
         "mirror_x": True,
         "mirror_y": False,
     },
-    "output": "/tmp/model-supported.ctb",
-    "slice": {"layers": 1545, "format": ".ctb"},
+    "supported_stl": None,
+    "overwritten": [],
+    "output": "__OUT__",
+    "slice": {
+        "layers": 220,
+        "format": ".goo",
+        "layer_height_mm": 0.05,
+        "resolution_px": [8520, 4320],
+    },
     "timings_ms": {"islands_ms": 4317, "auto_place_ms": 6559, "slice_ms": 42748},
     "warnings": ["3 of 14 islands have no support near them"],
 }
 
 
 @pytest.fixture
-def fake_env(tmp_path, monkeypatch):
-    """Fake binaries, and a fake tsx that records its argv and prints `summary.json`."""
+def fake_env(fake_df, tmp_path, monkeypatch):
+    """The shared fake DragonFruit, plus fake binaries and the summary our script prints."""
     bins = tmp_path / "bin"
     bins.mkdir()
     make_fake_binary(bins, "dragonfruit-cli", "exit 0")
     make_fake_binary(bins, "dragonfruit-mcp-tools", "exit 0")
-    df = tmp_path / "df"
-    tsx_dir = df / "node_modules" / ".bin"
-    tsx_dir.mkdir(parents=True)
-    make_fake_binary(
-        tsx_dir,
-        "tsx",
-        f'printf "%s\\n" "$@" > {tmp_path}/argv; printf "%s" "$NODE_PATH" > {tmp_path}/node_path; '
-        f"cat {tmp_path}/summary.json",
-    )
     monkeypatch.setenv("NDFM_BIN_DIR", str(bins))
-    monkeypatch.setenv("NDFM_DRAGONFRUIT_DIR", str(df))
-    stl = tmp_path / "model.stl"
-    stl.write_bytes(b"\0" * 84)
-    (tmp_path / "summary.json").write_text(json.dumps(SUMMARY))
-    return tmp_path
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps(SUMMARY))
+    monkeypatch.setenv("FAKE_SUMMARY", str(summary))
+    fake_df.summary = summary
+    return fake_df
 
 
-def argv(tmp_path: Path) -> list[str]:
-    return (tmp_path / "argv").read_text().splitlines()
+def script_args(fake_df) -> list[str]:
+    lines = [ln for ln in fake_df.log.read_text().splitlines() if "autosupport-slice.ts" in ln]
+    assert len(lines) == 1
+    return lines[0].split()
 
 
-def test_auto_support_and_slice_maps_summary(fake_env):
-    result = supports.auto_support_and_slice(str(fake_env / "model.stl"))
-    assert result.output == "/tmp/model-supported.ctb"
+def run(stl, **kwargs):
+    return supports.run_auto_support_and_slice(str(stl), **kwargs)
+
+
+def test_maps_summary_and_uses_the_default_printer(fake_env, stl):
+    result = run(stl)
+    assert result.printer == "mars5ultra" and result.printer_chosen_by == "default"
+    assert result.output_path == str(stl.with_name("model-mars5ultra-supported.goo"))
+    assert result.format == ".goo"
     assert result.supports_by_type == {"trunk": 91, "branch": 36, "leaf": 80, "twig": 42}
-    assert result.contacts == 286
-    assert result.islands_by_source == {"voxel": 9, "overhang": 5}
-    assert result.layers == 1545
-    assert result.layer_frame.mirror_x is True
-    assert result.plate_transform.translate_mm == [0, 0.15, 7]
-    assert result.warnings == ["3 of 14 islands have no support near them"]
-    assert result.islands_covered == 11
+    assert result.contacts == 286 and result.islands_covered == 11
     assert result.area_coverage == 1.27
-    assert result.height_mm == 77.2
-    assert result.overwritten == ["/tmp/model-supported.ctb"]
+    assert result.layers == 220
+    assert result.layer_frame.mirror_x is True
+    assert result.plate_offset_mm == [-12.0, -24.0, 2.0]
+    assert result.warnings == ["3 of 14 islands have no support near them"]
+    # mars5ultra defaults to .goo: a custom profile derived from the .ctb preset.
+    profile = fake_env.printer_json()
+    assert profile["display"]["outputFormat"] == ".goo"
+    assert "presetId" not in profile
 
 
-def test_default_arguments(fake_env):
-    supports.auto_support_and_slice(str(fake_env / "model.stl"))
-    args = argv(fake_env)
+def test_sidecar_records_supports_and_mirroring(fake_env, stl):
+    result = run(stl)
+    sidecar = json.loads(Path(result.sidecar_path).read_text())
+    assert result.sidecar_path == result.output_path + ".ndfm.json"
+    assert sidecar["supports_included"] is True
+    assert sidecar["profile"]["mirrorX"] is True
+    assert sidecar["supports"]["contacts"] == 286
+    assert sidecar["supports"]["lift_mm"] == 7
+    assert sidecar["plate_offset_mm"] == [-12.0, -24.0, 2.0]
+    assert sidecar["layers"] == 220
+
+
+def test_default_arguments(fake_env, stl):
+    run(stl)
+    args = script_args(fake_env)
     assert args[0] == str(supports.SCRIPT)
-    assert args[args.index("--printer") + 1] == "elegoo-mars-5-ultra-ctb"
     assert args[args.index("--raft") + 1] == "solid"
-    assert args[args.index("--cli") + 1] == str(fake_env / "bin" / "dragonfruit-cli")
-    assert args[args.index("--tools") + 1] == str(fake_env / "bin" / "dragonfruit-mcp-tools")
-    for flag in (
-        "--out",
-        "--lift-mm",
-        "--density",
-        "--plate-stl",
-        "--supported-stl",
-        "--coarse-islands",
-    ):
+    assert args[args.index("--cli") + 1].endswith("/bin/dragonfruit-cli")
+    assert args[args.index("--tools") + 1].endswith("/bin/dragonfruit-mcp-tools")
+    for flag in ("--material", "--lift-mm", "--density", "--supported-stl", "--coarse-islands"):
         assert flag not in args
-    assert (fake_env / "node_path").read_text() == str(fake_env / "df" / "node_modules")
 
 
-def test_options_are_passed_through(fake_env):
-    supports.auto_support_and_slice(
-        str(fake_env / "model.stl"),
-        printer_preset="elegoo-mars-4-ultra",
-        out_path=str(fake_env / "out" / "print.ctb"),
+def test_options_are_passed_through(fake_env, stl, tmp_path):
+    material = tmp_path / "material.json"
+    material.write_text('{"name": "known good", "bottomExposureSec": 40}')
+    out = tmp_path / "out" / "print.ctb"
+    result = run(
+        stl,
+        format="ctb",
+        material=str(material),
+        layer_height=0.03,
+        aa_preset="sharp",
+        out_path=str(out),
         lift_mm=5,
         density=2,
         raft=False,
-        export_plate_stl=True,
         export_supported_stl=True,
         fast_islands=True,
     )
-    args = argv(fake_env)
-    assert "--coarse-islands" in args
-    assert args[args.index("--printer") + 1] == "elegoo-mars-4-ultra"
-    assert args[args.index("--out") + 1] == str(fake_env / "out" / "print.ctb")
+    args = script_args(fake_env)
+    assert args[args.index("--out") + 1] == str(out)
+    assert args[args.index("--layer-height") + 1] == "0.03"
+    assert args[args.index("--aa-preset") + 1] == "sharp"
     assert args[args.index("--lift-mm") + 1] == "5"
     assert args[args.index("--density") + 1] == "2"
     assert args[args.index("--raft") + 1] == "off"
-    assert args[args.index("--plate-stl") + 1] == str(fake_env / "out" / "print-plate.stl")
-    assert args[args.index("--supported-stl") + 1] == str(
-        fake_env / "out" / "print-with-supports.stl"
-    )
+    assert args[args.index("--supported-stl") + 1] == str(out) + ".supported.stl"
+    assert "--coarse-islands" in args
+    assert json.loads(Path(f"{fake_env.log}.material").read_text())["bottomExposureSec"] == 40
+    # .ctb is the preset's own format: the preset reference goes through unchanged.
+    assert fake_env.printer_json() == {"presetId": "elegoo-mars-5-ultra-ctb"}
+    assert result.output_path == str(out)
 
 
-def test_extra_stls_default_beside_the_stl(fake_env):
-    supports.auto_support_and_slice(str(fake_env / "model.stl"), export_plate_stl=True)
-    args = argv(fake_env)
-    assert args[args.index("--plate-stl") + 1] == str(fake_env / "model-supported-plate.stl")
+def test_plate_stl_uses_slices_frame(fake_env, stl):
+    result = run(stl, export_plate_stl=True)
+    plate = Path(result.plate_stl_path)
+    assert plate.name == "model-mars5ultra-supported.goo.plate.stl"
+    from nakomis_dragonfruit_mcp import stl as stl_io
+
+    lo, hi = stl_io.bbox(plate)
+    # The fixture STL spans x 10..14, y 20..28, z 5..9; moved by the reported offset.
+    assert lo == [-2.0, -4.0, 7.0] and hi == [2.0, 4.0, 11.0]
 
 
-def test_no_supports_is_a_warning(fake_env):
-    summary = {**SUMMARY, "contacts": 0, "placed_by_type": {}, "warnings": []}
-    (fake_env / "summary.json").write_text(json.dumps(summary))
-    result = supports.auto_support_and_slice(str(fake_env / "model.stl"))
-    assert result.warnings == ["no supports were placed: the print will have none"]
+def test_a_mismatched_extension_is_refused_before_any_work(fake_env, stl, tmp_path):
+    with pytest.raises(cli.CliError, match="writes '.goo'"):
+        run(stl, out_path=str(tmp_path / "x.ctb"))
+    assert not fake_env.log.exists()
 
 
-def test_unexpected_output_raises(fake_env):
-    (fake_env / "summary.json").write_text('{"islands": 3}')
+def test_no_supports_is_a_warning(fake_env, stl):
+    fake_env.summary.write_text(json.dumps({**SUMMARY, "contacts": 0, "warnings": []}))
+    assert run(stl).warnings == ["no supports were placed: the print will have none"]
+
+
+def test_unexpected_output_raises(fake_env, stl):
+    fake_env.summary.write_text('{"islands": 3}')
     with pytest.raises(cli.CliError, match="unexpected"):
-        supports.auto_support_and_slice(str(fake_env / "model.stl"))
+        run(stl)
 
 
-def test_missing_stl_raises(fake_env):
-    with pytest.raises(cli.CliError, match="not found"):
-        supports.auto_support_and_slice(str(fake_env / "nope.stl"))
+def test_missing_output_raises(fake_env, stl):
+    fake_env.summary.write_text(json.dumps({**SUMMARY, "output": "/nonexistent/x.goo"}))
+    with pytest.raises(cli.CliError, match="does not exist"):
+        run(stl)
 
 
-@pytest.mark.parametrize("kwargs", [{"density": 0}, {"lift_mm": -1}])
-def test_bad_numbers_raise(fake_env, kwargs):
+def test_missing_stl_and_material_raise(fake_env, stl, tmp_path):
+    with pytest.raises(cli.CliError, match="STL not found"):
+        run(tmp_path / "nope.stl")
+    with pytest.raises(cli.CliError, match="material profile not found"):
+        run(stl, material=str(tmp_path / "nope.json"))
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"density": 0}, {"lift_mm": -1}, {"layer_height": 0}, {"aa_preset": "fuzzy"}]
+)
+def test_bad_values_raise(fake_env, stl, kwargs):
     with pytest.raises(ValueError):
-        supports.auto_support_and_slice(str(fake_env / "model.stl"), **kwargs)
+        run(stl, **kwargs)
+
+
+def test_the_tool_runs_off_the_event_loop(fake_env, stl):
+    import asyncio
+
+    result = asyncio.run(supports.auto_support_and_slice(str(stl)))
+    assert result.contacts == 286
 
 
 def _real_pipeline_available() -> bool:
@@ -195,9 +236,16 @@ needs_pipeline = pytest.mark.skipif(
 )
 
 
-def _run_script(*args: str) -> dict:
+def _run_script(tmp_path: Path, *args: str) -> dict:
     """The TS script directly, for what the tool does not expose (--no-slice, --job-dir)."""
-    base = ["--stl", str(TEST_STL), "--tools", str(cli.find_binary(cli.MCP_TOOLS))]
+    printer = tmp_path / "printer.json"
+    printer.write_text('{"presetId": "elegoo-mars-5-ultra-ctb"}')
+    base = [
+        "--stl", str(TEST_STL),
+        "--tools", str(cli.find_binary(cli.MCP_TOOLS)),
+        "--cli", str(cli.find_binary(cli.DRAGONFRUIT_CLI)),
+        "--printer-json", str(printer),
+    ]  # fmt: skip
     return cli.run_ts([*base, *args], script=supports.SCRIPT, parse_json=True).data
 
 
@@ -207,26 +255,26 @@ def test_real_auto_support_and_slice(tmp_path):
     # A copy, so the default outputs land in tmp_path rather than beside the original.
     stl = tmp_path / TEST_STL.name
     shutil.copy(TEST_STL, stl)
-    result = supports.auto_support_and_slice(str(stl), export_plate_stl=True)
-    assert result.output and Path(result.output).stat().st_size > 0
-    assert Path(result.output).suffix == ".ctb"
+    result = supports.run_auto_support_and_slice(str(stl), export_plate_stl=True)
+    out = Path(result.output_path)
+    assert out.stat().st_size > 0
+    assert out.suffix == ".goo" and result.printer == "mars5ultra"
     assert result.islands_by_source.get("overhang", 0) > 0
     assert result.contacts > 50
     assert result.support_triangles > 0
-    assert result.layers and result.layers > 1400
+    assert result.layers > 1400
     assert result.height_mm <= result.build_height_mm
     assert result.overwritten == []
-    assert (
-        result.plate_stl
-        and Path(result.plate_stl).stat().st_size == 84 + 50 * result.model_triangles
-    )
+    assert Path(result.plate_stl_path).stat().st_size == 84 + 50 * result.model_triangles
+    sidecar = json.loads(Path(result.sidecar_path).read_text())
+    assert sidecar["supports_included"] is True and sidecar["profile"]["mirrorX"] is True
 
 
 @pytest.mark.integration
 @needs_pipeline
 def test_real_job_splits_model_from_supports(tmp_path):
     job_dir = tmp_path / "job"
-    data = _run_script("--no-slice", "--coarse-islands", "--job-dir", str(job_dir))
+    data = _run_script(tmp_path, "--no-slice", "--coarse-islands", "--job-dir", str(job_dir))
     job = json.loads((job_dir / "job.json").read_text())
     # The engine treats triangles after this count as support.
     assert job["model_triangle_count"] == data["model_triangles"]
@@ -237,8 +285,8 @@ def test_real_job_splits_model_from_supports(tmp_path):
 
 @pytest.mark.integration
 @needs_pipeline
-def test_real_without_raft():
-    data = _run_script("--no-slice", "--coarse-islands", "--raft", "off")
+def test_real_without_raft(tmp_path):
+    data = _run_script(tmp_path, "--no-slice", "--coarse-islands", "--raft", "off")
     assert data["raft"] == "off"
     assert data["contacts"] > 0
     assert data["support_triangles"] > 0
@@ -248,13 +296,13 @@ def test_real_without_raft():
 @needs_pipeline
 def test_real_refuses_a_print_taller_than_the_printer(tmp_path):
     with pytest.raises(cli.CliError, match="builds only"):
-        supports.auto_support_and_slice(
-            str(TEST_STL), out_path=str(tmp_path / "x.ctb"), lift_mm=500
+        supports.run_auto_support_and_slice(
+            str(TEST_STL), out_path=str(tmp_path / "x.goo"), lift_mm=500
         )
 
 
 @pytest.mark.integration
 @needs_pipeline
-def test_real_refuses_an_extension_the_printer_does_not_write(tmp_path):
+def test_real_script_refuses_an_extension_the_printer_does_not_write(tmp_path):
     with pytest.raises(cli.CliError, match="writes .ctb files"):
-        supports.auto_support_and_slice(str(TEST_STL), out_path=str(tmp_path / "x.goo"))
+        _run_script(tmp_path, "--out", str(tmp_path / "x.goo"))
