@@ -2,6 +2,10 @@
 # Build dragonfruit-cli (from the DragonFruit submodule) and our own
 # dragonfruit-mcp-tools crate, in release mode, into bin/.
 #
+# Needs cargo, Node, and cmake plus a C++ compiler: dragonfruit-mcp-tools builds
+# DragonFruit's `manifold` backend (manifold3d) from source, which takes several
+# minutes the first time.
+#
 # Full output goes to /tmp/ndfm-build.log as well as the terminal; follow it
 # with `less +F /tmp/ndfm-build.log`.
 set -euo pipefail
