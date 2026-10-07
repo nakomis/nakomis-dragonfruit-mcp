@@ -367,7 +367,7 @@ def test_real_cli_inspects_what_it_sliced(tmp_path):
 def test_real_slice_inspect_and_preview(tmp_path, printer, fmt):
     model = tmp_path / slicing_tests.TEST_MODEL.name
     shutil.copy(slicing_tests.TEST_MODEL, model)
-    sliced = slicing.slice(str(model), printer=printer, format=fmt, layer_height=0.2)
+    sliced = slicing.run_slice(str(model), printer=printer, format=fmt, layer_height=0.2)
     assert sliced.layers == 352
     info = printfile.describe(sliced.output_path)
     assert info.layers == 352 and info.layer_height_mm == 0.2
