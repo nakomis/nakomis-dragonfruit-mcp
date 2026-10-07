@@ -37,11 +37,20 @@ def rle(pixels: list[int]) -> bytes:
     return b"\x55" + bytes(body) + bytes([~sum(body) & 0xFF])
 
 
-def make_goo(path: Path, layers: list[list[int]], width=4, height=2, mirror=False) -> None:
+def make_goo(
+    path: Path,
+    layers: list[list[int]],
+    width=4,
+    height=2,
+    mirror=False,
+    software="Other Slicer",
+    machine="Test Printer",
+) -> None:
     s = goo.SETTINGS_OFFSET
     head = bytearray(goo.HEADER_BYTES)
     head[:12] = b"V1.2" + goo.FILE_MAGIC
-    head[92:104] = b"Test Printer"
+    head[12 : 12 + len(software)] = software.encode()
+    head[92 : 92 + len(machine)] = machine.encode()
     struct.pack_into(">I", head, s, len(layers))
     struct.pack_into(">HH", head, s + 4, width, height)
     head[s + 8] = int(mirror)
@@ -125,7 +134,7 @@ def test_goo_errors(goo_file, tmp_path):
 
 
 def test_inspect_goo(goo_file):
-    info = printfile.inspect_print(str(goo_file))
+    info = printfile.describe(str(goo_file))
     assert (info.format, info.container, info.layers) == (".goo", "goo", 3)
     assert info.resolution_px == [4, 2] and info.layer_height_mm == 0.05
     assert info.estimated_print_time_s == 1234 and info.machine == "Test Printer"
@@ -135,53 +144,92 @@ def test_inspect_goo(goo_file):
 def test_ctb_is_reported_not_read(tmp_path):
     ctb = tmp_path / "m.ctb"
     ctb.write_bytes(struct.pack("<I", 0x12FD0107) + b"\0" * 100)
-    info = printfile.inspect_print(str(ctb))
+    info = printfile.describe(str(ctb))
     assert info.container == "ctb" and info.layers is None
-    assert "v5 encrypted" in info.warnings[0]
+    assert "encrypted CTB (v5enc)" in info.warnings[0]
     with pytest.raises(cli.CliError, match="encrypted"):
-        printfile.preview_layer(str(ctb), 1)
+        printfile.render(str(ctb), 1)
 
 
 def test_unknown_and_missing_files(tmp_path):
     other = tmp_path / "x.bin"
     other.write_bytes(b"hello world, nothing here")
     with pytest.raises(cli.CliError, match="not a ZIP"):
-        printfile.inspect_print(str(other))
+        printfile.describe(str(other))
     with pytest.raises(cli.CliError, match="not found"):
-        printfile.inspect_print(str(tmp_path / "nope"))
+        printfile.describe(str(tmp_path / "nope"))
 
 
 def test_preview_goo(goo_file, tmp_path):
     out = tmp_path / "p.png"
-    content = printfile.preview_layer(str(goo_file), 1, out_path=str(out))
+    content = printfile.render(str(goo_file), 1, out_path=str(out))
     meta = json.loads(content[0])
     assert (meta["layer"], meta["layers"], meta["width"], meta["height"]) == (1, 3, 4, 2)
-    assert meta["flipped_x"] is False
-    assert any("no mirror flag" in w for w in meta["warnings"])
+    # Another slicer's file: its own header flag (false) decides, and there is nothing to warn of.
+    assert (meta["flipped_x"], meta["mirror_source"], meta["warnings"]) == (False, "goo-header", [])
     assert list(Image.open(out).tobytes()) == LAYER_1
     assert content[1].data[:4] == b"\x89PNG"
-    flipped = printfile.preview_layer(str(goo_file), 1, out_path=str(out), flip_x=True)
-    assert json.loads(flipped[0])["flipped_x"] is True
+    flipped = printfile.render(str(goo_file), 1, out_path=str(out), flip_x=True)
+    assert json.loads(flipped[0])["mirror_source"] == "argument"
     assert list(Image.open(out).tobytes()) == LAYER_1[:4][::-1] + LAYER_1[4:][::-1]
 
 
-def test_preview_goo_default_path_and_downscale(goo_file):
-    meta = json.loads(printfile.preview_layer(str(goo_file), 2, image_px=2)[0])
-    assert meta["png_path"] == f"{goo_file}.layer-2.png"
-    assert meta["image_px"] == [2, 1]
+def test_preview_goo_default_path_is_in_temp_and_downscale_is_clamped(goo_file):
+    meta = json.loads(printfile.render(str(goo_file), 2, image_px=2)[0])
+    assert meta["png_path"].endswith("-layer-2.png") and "ndfm-preview" in meta["png_path"]
+    assert not Path(meta["png_path"]).is_relative_to(goo_file.parent)
+    assert meta["image_px"] == [4, 2]  # 2 clamped up to 64, and 4 px is already smaller
+    big = json.loads(printfile.render(str(goo_file), 2, image_px=10**9)[0])
+    assert big["image_px"] == [4, 2]
 
 
-def test_preview_goo_mirrored_header_flips_by_default(tmp_path):
-    path = tmp_path / "mm.goo"
-    make_goo(path, [LAYER_1], mirror=True)
-    out = tmp_path / "p.png"
-    meta = json.loads(printfile.preview_layer(str(path), 1, out_path=str(out))[0])
-    assert meta["flipped_x"] is True and meta["warnings"] == []
+@pytest.mark.parametrize("layer", [0, -1, 1.5, True, "1"])
+def test_preview_rejects_bad_layer_numbers(goo_file, layer):
+    with pytest.raises(ValueError, match="integer >= 1"):
+        printfile.render(str(goo_file), layer)
+
+
+def test_dragonfruit_goo_mirror_comes_from_the_preset(tmp_path, fake_df):
+    path = tmp_path / "df.goo"
+    make_goo(path, [LAYER_1], software="DragonFruit", machine="Mars 5 Ultra")
+    info = printfile.describe(str(path))
+    assert (info.mirror_x, info.mirror_source, info.warnings) == (True, "preset", [])
+    meta = json.loads(printfile.render(str(path), 1, out_path=str(tmp_path / "o.png"))[0])
+    assert (meta["flipped_x"], meta["mirror_source"]) == (True, "preset")
+
+
+def test_dragonfruit_goo_sidecar_wins(tmp_path, fake_df):
+    path = tmp_path / "df.goo"
+    make_goo(path, [LAYER_1], software="DragonFruit", machine="Mars 5 Ultra")
+    Path(f"{path}.ndfm.json").write_text(json.dumps({"profile": {"mirrorX": False}}))
+    info = printfile.describe(str(path))
+    assert (info.mirror_x, info.mirror_source) == (False, "sidecar")
+
+
+def test_dragonfruit_goo_of_unknown_machine_is_not_guessed(tmp_path, fake_df):
+    path = tmp_path / "df.goo"
+    make_goo(path, [LAYER_1], software="DragonFruit", machine="Mystery Box")
+    info = printfile.describe(str(path))
+    assert info.mirror_x is None and info.mirror_source is None
+    assert "cannot tell" in info.warnings[0]
+    meta = json.loads(printfile.render(str(path), 1, out_path=str(tmp_path / "o.png"))[0])
+    assert meta["flipped_x"] is False and "cannot tell" in meta["warnings"][0]
+
+
+def test_ambiguous_preset_names_are_not_guessed(tmp_path, fake_df):
+    other = fake_df.dir / "plugins" / "other" / "printers"
+    other.mkdir(parents=True)
+    (other / "p.json").write_text(
+        json.dumps([{"presetId": "x", "name": "Mars 5 Ultra", "display": {"mirrorX": False}}])
+    )
+    path = tmp_path / "df.goo"
+    make_goo(path, [LAYER_1], software="DragonFruit", machine="Mars 5 Ultra")
+    assert printfile.describe(str(path)).mirror_x is None
 
 
 def test_preview_goo_bad_layer(goo_file):
     with pytest.raises(cli.CliError, match="out of range"):
-        printfile.preview_layer(str(goo_file), 9)
+        printfile.render(str(goo_file), 9)
 
 
 # -- ZIP-based archives, with a fake dragonfruit-cli --------------------------------------------
@@ -234,7 +282,7 @@ fi""",
 
 
 def test_inspect_zip(zip_file):
-    info = printfile.inspect_print(str(zip_file))
+    info = printfile.describe(str(zip_file))
     assert (info.container, info.layers, info.layer_height_mm) == ("zip", 2, 0.1)
     assert info.resolution_px == [6, 2] and info.machine == "Athena 8K"
     assert info.estimated_resin_ml == 0.15  # (1000 + 500) mm2 x 0.1 mm = 150 mm3
@@ -247,7 +295,7 @@ def test_inspect_zip_without_dragonfruit_metadata(tmp_path, bin_dir):
     with zipfile.ZipFile(path, "w") as z:
         z.writestr("1.png", b"")
     make_fake_binary(bin_dir, "dragonfruit-cli", """echo '{"numeric_layer_count": 1}'""")
-    info = printfile.inspect_print(str(path))
+    info = printfile.describe(str(path))
     assert info.layers == 1 and info.layer_height_mm is None
     assert "only the layer count" in info.warnings[0]
 
@@ -255,31 +303,29 @@ def test_inspect_zip_without_dragonfruit_metadata(tmp_path, bin_dir):
 def test_inspect_zip_unexpected_output(zip_file, bin_dir):
     make_fake_binary(bin_dir, "dragonfruit-cli", "echo '{}'")
     with pytest.raises(cli.CliError, match="unexpected"):
-        printfile.inspect_print(str(zip_file))
+        printfile.describe(str(zip_file))
 
 
 def test_preview_zip_unpacks_rgb_and_flips(zip_file, tmp_path):
     out = tmp_path / "z.png"
-    meta = json.loads(printfile.preview_layer(str(zip_file), 1, out_path=str(out))[0])
+    meta = json.loads(printfile.render(str(zip_file), 1, out_path=str(out))[0])
     assert (meta["width"], meta["height"], meta["flipped_x"]) == (6, 2, True)
     # Unpacked row 0 is 1,2,3,4,5,6; flipped left-right it reads 6,5,4,3,2,1.
     assert list(Image.open(out).tobytes())[:6] == [6, 5, 4, 3, 2, 1]
-    raw = printfile.preview_layer(str(zip_file), 1, out_path=str(out), flip_x=False)
+    raw = printfile.render(str(zip_file), 1, out_path=str(out), flip_x=False)
     assert json.loads(raw[0])["flipped_x"] is False
     assert list(Image.open(out).tobytes())[:6] == [1, 2, 3, 4, 5, 6]
 
 
 def test_preview_zip_layer_out_of_range(zip_file):
     with pytest.raises(cli.CliError, match="out of range"):
-        printfile.preview_layer(str(zip_file), 3)
+        printfile.render(str(zip_file), 3)
 
 
 def test_preview_zip_other_packing_is_converted_with_warning(zip_file, tmp_path):
     with zipfile.ZipFile(zip_file, "w") as z:
         z.writestr("slicer.json", json.dumps({"effective": {"xPackingMode": "weird"}}))
-    meta = json.loads(
-        printfile.preview_layer(str(zip_file), 1, out_path=str(tmp_path / "w.png"))[0]
-    )
+    meta = json.loads(printfile.render(str(zip_file), 1, out_path=str(tmp_path / "w.png"))[0])
     assert "converted to grey" in meta["warnings"][0]
 
 
@@ -309,7 +355,7 @@ def test_real_cli_inspects_what_it_sliced(tmp_path):
     with zipfile.ZipFile(path, "w") as z:
         z.writestr("1.png", b"")
         z.writestr("2.png", b"")
-    assert printfile.inspect_print(str(path)).layers == 2
+    assert printfile.describe(str(path)).layers == 2
 
 
 @pytest.mark.integration
@@ -323,12 +369,87 @@ def test_real_slice_inspect_and_preview(tmp_path, printer, fmt):
     shutil.copy(slicing_tests.TEST_MODEL, model)
     sliced = slicing.slice(str(model), printer=printer, format=fmt, layer_height=0.2)
     assert sliced.layers == 352
-    info = printfile.inspect_print(sliced.output_path)
+    info = printfile.describe(sliced.output_path)
     assert info.layers == 352 and info.layer_height_mm == 0.2
     assert info.resolution_px == sliced.resolution_px
-    base, top = (json.loads(printfile.preview_layer(sliced.output_path, n)[0]) for n in (1, 352))
+    base, top = (json.loads(printfile.render(sliced.output_path, n)[0]) for n in (1, 352))
     base_png, top_png = (Image.open(m["png_path"]) for m in (base, top))
     assert base_png.size == tuple(sliced.resolution_px)
     base_area = sum(1 for v in base_png.tobytes() if v)
     top_area = sum(1 for v in top_png.tobytes() if v)
     assert base_area > 10 * top_area > 0
+
+
+# -- robustness -------------------------------------------------------------------------------
+
+
+def test_truncated_run_raises_goo_error_not_index_error():
+    # A grey run (needs a value byte) and a run needing extension bytes, each cut short.
+    for body in (bytes([0b01 << 6 | 1]), bytes([0b11 << 6 | 2 << 4 | 1, 5])):
+        data = b"\x55" + body + bytes([~sum(body) & 0xFF])
+        with pytest.raises(goo.GooError, match="layer data truncated"):
+            goo.decode_layer(data, 4, 2)
+
+
+def test_header_resolution_is_capped(tmp_path):
+    path = tmp_path / "huge.goo"
+    make_goo(path, [LAYER_1], width=30_001, height=1)
+    with pytest.raises(goo.GooError, match="implausible screen"):
+        goo.read_header(path)
+    make_goo(path, [LAYER_1], width=25_000, height=25_000)
+    with pytest.raises(goo.GooError, match="implausible screen"):
+        goo.read_header(path)
+
+
+def test_header_layer_count_is_checked_against_file_size(goo_file):
+    data = bytearray(goo_file.read_bytes())
+    struct.pack_into(">I", data, goo.SETTINGS_OFFSET, 10_000_000)
+    goo_file.write_bytes(data)
+    with pytest.raises(goo.GooError, match="too short"):
+        goo.read_header(goo_file)
+
+
+def test_layer_size_beyond_the_file_is_refused(goo_file):
+    h = goo.read_header(goo_file)
+    data = bytearray(goo_file.read_bytes())
+    struct.pack_into(">I", data, h.layer_table_offset + goo.LAYER_DEF_BYTES, 10**9)
+    goo_file.write_bytes(data)
+    with pytest.raises(goo.GooError, match="more than the file holds"):
+        goo.read_layer(goo_file, h, 1)
+
+
+def test_goo_v5_is_detected_and_unsupported(tmp_path):
+    path = tmp_path / "v5.goo"
+    path.write_bytes(b"V5.1" + goo.FILE_MAGIC + b"\0" * 100)
+    info = printfile.describe(str(path))
+    assert info.container == "goo5" and "V5.1" in info.warnings[0]
+    with pytest.raises(cli.CliError, match="V5.1"):
+        printfile.render(str(path), 1)
+
+
+def test_other_ctb_versions_are_not_called_encrypted(tmp_path):
+    ctb = tmp_path / "old.ctb"
+    ctb.write_bytes(struct.pack("<I", 0x12FD0086) + b"\0" * 100)
+    (warning,) = printfile.describe(str(ctb)).warnings
+    assert "not implemented" in warning and "encrypted" not in warning
+
+
+def test_malformed_slicer_json_is_survived(tmp_path, bin_dir):
+    path = tmp_path / "bad.nanodlp"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("slicer.json", json.dumps(["not", "a", "dict"]))
+        z.writestr("info.json", json.dumps([1, {"TotalSolidArea": "x"}]))
+    make_fake_binary(bin_dir, "dragonfruit-cli", """echo '{"numeric_layer_count": 1}'""")
+    info = printfile.describe(str(path))
+    assert info.layers == 1 and info.estimated_resin_ml is None
+    assert "no usable" in info.warnings[0]
+    odd = tmp_path / "odd.nanodlp"
+    with zipfile.ZipFile(odd, "w") as z:
+        z.writestr("slicer.json", json.dumps({"printer": 1, "effective": {"mirrorX": "yes"}}))
+    assert printfile.describe(str(odd)).mirror_x is None
+
+
+def test_tools_are_async_over_mcp(goo_file):
+    info = asyncio.run(mcp.call_tool("inspect_print", {"print_path": str(goo_file)}))
+    text = info[0][0].text if isinstance(info, tuple) else info[0].text
+    assert json.loads(text)["layers"] == 3
