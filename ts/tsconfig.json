@@ -1,0 +1,20 @@
+{
+  "//": "Type-checking only (tsx runs with DragonFruit's own tsconfig): cd vendor/dragonfruit && node_modules/.bin/tsc -p ../../ts/tsconfig.json. Bare imports map to DragonFruit's node_modules, as NODE_PATH does at run time.",
+  "extends": "../vendor/dragonfruit/tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "incremental": false,
+    "plugins": [],
+    "baseUrl": "../vendor/dragonfruit",
+    "paths": {
+      "@/*": ["./src/*"],
+      "three": ["./node_modules/@types/three"],
+      "three/*": ["./node_modules/@types/three/*"],
+      "react": ["./node_modules/@types/react"],
+      "react/*": ["./node_modules/@types/react/*"],
+      "*": ["./node_modules/*", "./node_modules/@types/*"]
+    }
+  },
+  "include": [],
+  "files": ["autosupport-slice.ts"]
+}

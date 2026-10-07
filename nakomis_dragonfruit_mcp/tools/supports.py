@@ -46,7 +46,12 @@ class PlateTransform(BaseModel):
 
 
 class LayerFrame(BaseModel):
-    """How a layer image maps to the plate frame the STLs are in."""
+    """How a layer image maps to the plate frame the STLs are in.
+
+    The image spans the build area (`build_width_mm` x `build_depth_mm`) centred
+    on the plate origin; columns run from -X, rows run down from +Y. With
+    `mirror_x` (or `mirror_y`) the printer's images are flipped on that axis.
+    """
 
     source_width_px: int
     source_height_px: int
@@ -72,8 +77,14 @@ class SupportedSlice(ToolResult):
     supports_by_type: dict[str, int]
     contacts: int
     roots: int
-    islands_uncovered: int
+    islands_covered: int
+    islands_uncovered: int = Field(description="Islands with no support near them; see warnings")
+    area_coverage: float = Field(
+        description="Covered island area / total island area (can exceed 1: overlapping regions)"
+    )
     raft: str
+    height_mm: float = Field(description="Top of the print above the plate, lift and raft included")
+    build_height_mm: float
     model_triangles: int
     support_triangles: int
     layers: int | None
@@ -81,6 +92,9 @@ class SupportedSlice(ToolResult):
     layer_frame: LayerFrame
     plate_stl: str | None = Field(description="The model alone, as placed for the slice")
     supported_stl: str | None = Field(description="Model, supports and raft, as sliced")
+    overwritten: list[str] = Field(
+        description="Output files that already existed and were replaced"
+    )
     timings_ms: dict[str, int]
 
 
@@ -94,17 +108,39 @@ def auto_support_and_slice(
     raft: bool = True,
     export_plate_stl: bool = False,
     export_supported_stl: bool = False,
+    fast_islands: bool = False,
 ) -> SupportedSlice:
     """Auto-support an STL with DragonFruit's own placement, add a raft, and slice it.
 
-    The model is centred on the plate and lifted (default 7 mm, the app's own
-    auto-lift) so supports fit under it. `density` scales supports per area
-    (2 = twice as many). The print goes to `out_path`, or beside the STL as
-    `<name>-supported.<format>`; the printer preset decides the format.
-    `export_plate_stl` writes the model alone, exactly as placed for the slice,
-    beside the print; `export_supported_stl` writes the model with its supports
-    and raft. Upstream's overhang perimeter tracing is not deterministic, so
-    the same model can come out a few supports different between runs.
+    Slow: expect a minute or two for a 70 mm part on this machine, and up to the
+    45-minute timeout when the machine is busy or the part is large.
+
+    What it does: centres the model on the plate and lifts it (default 7 mm, the
+    app's own auto-lift) so supports fit under it, as it stands: there is no
+    reorientation or tilt, so supports will touch visible faces that point
+    down or sideways (a flat cut face, raised lettering). It finds islands with
+    two of the app's three detectors (voxel slice growth at the Islands panel's
+    resolution, and mesh-normal overhangs); the third, mesh minima, is not run,
+    so isolated low points can be missed. `fast_islands` uses a coarser voxel
+    scan (quicker, finds fewer small islands). `density` scales supports per
+    area (2 = twice as many). `raft` adds the app's default solid raft.
+
+    Outputs: the print at `out_path`, or beside the STL as
+    `<name>-supported.<format>`. The printer preset decides the format; an
+    `out_path` with another extension is refused. Parent folders are created,
+    and existing files are overwritten (listed in `overwritten`).
+    `export_plate_stl` writes the model alone, exactly as placed for the slice
+    (plate frame: X/Y origin at the plate centre, Z up from the plate; see
+    `plate_transform`); `export_supported_stl` writes model, supports and raft.
+    `layer_frame` maps a layer image onto that frame: the image spans the build
+    area centred on the origin, rows run down from +Y, and `mirror_x`/`mirror_y`
+    say whether the printer's images are mirrored (the Mars 5 Ultra mirrors X).
+
+    Read `warnings`: they name islands left without support, supports culled as
+    orphans, and anything else that makes the print riskier. Contact counts
+    vary by about 7% between runs of the same model (upstream's overhang
+    tracing is order-dependent). Not yet validated on a real printer: check
+    the supports before printing.
     """
     stl = Path(stl_path).expanduser().resolve()
     if not stl.is_file():
@@ -136,6 +172,8 @@ def auto_support_and_slice(
         args += ["--lift-mm", str(lift_mm)]
     if density is not None:
         args += ["--density", str(density)]
+    if fast_islands:
+        args.append("--coarse-islands")
     if export_plate_stl:
         args += ["--plate-stl", str(stem_dir / f"{stem}-plate.stl")]
     if export_supported_stl:
@@ -164,8 +202,12 @@ def auto_support_and_slice(
         supports_by_type=data["placed_by_type"],
         contacts=data["contacts"],
         roots=data.get("roots", 0),
+        islands_covered=data.get("islands_covered", 0),
         islands_uncovered=data.get("islands_uncovered", 0),
+        area_coverage=data.get("area_coverage", 0.0),
         raft=data["raft"],
+        height_mm=data.get("height_mm", 0.0),
+        build_height_mm=data.get("build_height_mm", 0.0),
         model_triangles=data["model_triangles"],
         support_triangles=data["support_triangles"],
         layers=slice_info.get("layers"),
@@ -173,6 +215,7 @@ def auto_support_and_slice(
         layer_frame=LayerFrame(**data["layer_frame"]),
         plate_stl=data.get("plate_stl"),
         supported_stl=data.get("supported_stl"),
+        overwritten=data.get("overwritten", []),
         timings_ms=data["timings_ms"],
         warnings=warnings,
     )

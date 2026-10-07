@@ -10,6 +10,11 @@
 use std::{env, fs, path::PathBuf};
 
 const SOURCE: &str = "../../vendor/dragonfruit/src-tauri/src/overhang.rs";
+/// The copy is marker-based: everything before this doc comment (the classifier,
+/// its types and helpers) is kept; the Tauri command it introduces, and the
+/// tests after it, are not. If upstream rewords or moves it, the build fails
+/// here with a message rather than compiling something different; check the
+/// file still ends its library part at the command, then update the marker.
 const CUT_AT: &str = "/// Tauri IPC command: weld a world-space triangle soup";
 
 fn main() {

@@ -444,3 +444,81 @@ fn read_positions(path: &std::path::Path) -> Result<Vec<f32>, String> {
 fn linked_mesh_repair() -> bool {
     std::mem::size_of::<dragonfruit_mesh_repair::Vec3>() > 0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::overhang::overhang_and_stability_from_soup;
+
+    /// A closed, flat slab 20 x 20 x 2 mm, tilted about X by `tilt_deg`. Its
+    /// underside faces down at `tilt_deg` from horizontal.
+    fn tilted_slab(tilt_deg: f32) -> Vec<f32> {
+        let (s, c) = tilt_deg.to_radians().sin_cos();
+        let corner = |x: f32, y: f32, z: f32| [x, y * c - z * s, y * s + z * c + 20.0];
+        let v: Vec<[f32; 3]> = [
+            (0.0, 0.0, 0.0),
+            (20.0, 0.0, 0.0),
+            (20.0, 20.0, 0.0),
+            (0.0, 20.0, 0.0),
+            (0.0, 0.0, 2.0),
+            (20.0, 0.0, 2.0),
+            (20.0, 20.0, 2.0),
+            (0.0, 20.0, 2.0),
+        ]
+        .iter()
+        .map(|&(x, y, z)| corner(x, y, z))
+        .collect();
+        // Outward-facing winding.
+        let faces = [
+            [0, 2, 1],
+            [0, 3, 2], // bottom
+            [4, 5, 6],
+            [4, 6, 7], // top
+            [0, 1, 5],
+            [0, 5, 4], // front
+            [2, 3, 7],
+            [2, 7, 6], // back
+            [1, 2, 6],
+            [1, 6, 5], // right
+            [3, 0, 4],
+            [3, 4, 7], // left
+        ];
+        faces
+            .iter()
+            .flat_map(|f| f.iter().flat_map(|&i| v[i]))
+            .collect()
+    }
+
+    #[test]
+    fn a_shallow_underside_is_an_overhang() {
+        let (regions, _) = overhang_and_stability_from_soup(&tilted_slab(20.0), 45.0, 0.25, false);
+        assert_eq!(regions.len(), 1, "the 20° underside is one region");
+        let region = &regions[0];
+        assert!(
+            (region.area_mm2 - 400.0).abs() < 1.0,
+            "area {}",
+            region.area_mm2
+        );
+        assert!(region.projected_area_mm2 < region.area_mm2);
+    }
+
+    #[test]
+    fn a_steep_underside_is_only_a_steep_flat() {
+        // At 70° the big underside needs no support to form, so it comes back
+        // only as a steep flat (an anti-topple patch); the 2 mm end face now
+        // leans 20° from horizontal and is the one real overhang.
+        let (regions, _) = overhang_and_stability_from_soup(&tilted_slab(70.0), 45.0, 0.25, false);
+        let (steep, formation): (Vec<_>, Vec<_>) = regions.iter().partition(|r| r.steep_flat);
+        assert_eq!(formation.len(), 1);
+        assert!(
+            (formation[0].area_mm2 - 40.0).abs() < 1.0,
+            "area {}",
+            formation[0].area_mm2
+        );
+        assert_eq!(steep.len(), 1);
+        assert!(
+            (steep[0].area_mm2 - 400.0).abs() < 1.0,
+            "area {}",
+            steep[0].area_mm2
+        );
+    }
+}

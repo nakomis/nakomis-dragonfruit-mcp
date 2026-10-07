@@ -34,18 +34,21 @@
  * Usage:
  *   tsx autosupport-slice.ts --stl <in.stl> [--out <out.ctb>] --cli <dragonfruit-cli> [--tools <dragonfruit-mcp-tools>]
  *     [--printer <presetId>] [--lift-mm 7] [--density 1] [--raft solid|line|off]
- *     [--settings <json>] [--px-mm 0.1] [--supported-stl <out.stl>] [--plate-stl <out.stl>] [--job-dir <dir>]
+ *     [--settings <json>] [--coarse-islands] [--px-mm 0.05] [--supported-stl <out.stl>] [--plate-stl <out.stl>] [--job-dir <dir>]
  *     [--no-slice] [--verbose]
  *
  * `--supported-stl` writes model, supports and raft as sliced; `--plate-stl` the
  * model alone in the same plate frame (centred, lifted), to line up with a layer.
- * `--job-dir` keeps the engine's input (positions.bin, job.json) for inspection.
+ * `--job-dir` keeps the engine's input (positions.bin, job.json) for inspection;
+ * with `--no-slice` it writes them without slicing. `--coarse-islands` trades
+ * island detail for speed (the bench's resolution rather than the app panel's).
+ * Existing output files are overwritten.
  *
  * Prints one JSON summary on stdout; everything else goes to stderr.
  */
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -72,9 +75,16 @@ import { SUPPORT_STATE_TYPES } from '@/supports/supportTypeRegistry';
 import { DEFAULT_LIFT_DISTANCE_MM } from '@/features/transform/liftDefaults';
 import { DEFAULT_RAFT_SETTINGS } from '@/supports/Rafts/Crenelated/RaftDefaults';
 import { setRaftSettings } from '@/supports/Rafts/Crenelated/RaftState';
-import { setActiveMaterialProfile, setActivePrinterProfile } from '@/features/profiles/profileStore';
+import {
+    getActiveMaterialProfile,
+    getActivePrinterProfile,
+    setActiveMaterialProfile,
+    setActivePrinterProfile,
+} from '@/features/profiles/profileStore';
 import { buildSupportAndRaftWorldTriangles } from '@/features/slicing/rasterLayerZipExport';
-import { resolveSliceRasterSettings } from '@/features/slicing/sliceJobAssembly';
+import { resolveSliceLayerCount, resolveSliceRasterSettings } from '@/features/slicing/sliceJobAssembly';
+import { resolveSliceJobAntiAliasing } from '@/features/slicing/sliceAntiAliasing';
+import type { PlateFootprintSource } from '@/supports/Rafts/Crenelated/geometry/modelPlateFootprint';
 import { disposeEventLoopChannel } from '@/utils/yieldToEventLoop';
 import type { RaftSettings } from '@/supports/Rafts/Crenelated/RaftTypes';
 import { mergeOverhangRegions, overhangRegionToIsland } from '@/volumeAnalysis/Islands/useIslands';
@@ -83,6 +93,21 @@ import type { DetectedIsland, OverhangScan } from '@/volumeAnalysis/Islands/type
 
 /** The footprint resolution the app's island panel asks `scan_overhangs` for (useIslands.ts). */
 const OVERHANG_FOOTPRINT_PX_MM = 0.25;
+
+/**
+ * Voxel island resolution. `panel` is what the app's Islands panel starts from
+ * (useIslands.ts: pxMm 0.05, support buffer 0.25 mm); `coarse` is the bench's
+ * faster default (0.1 / 0.6), which misses smaller and shallower islands.
+ */
+const ISLAND_DETECT = {
+    panel: { pxMm: 0.05, supportBufferMm: 0.25 },
+    coarse: { pxMm: 0.1, supportBufferMm: 0.6 },
+} as const;
+
+/** Our temp dirs share a prefix, so a run can clear what a killed run left behind. */
+const TEMP_PREFIX = 'ndfm-autosupport-';
+/** Older than any run could be (the Python side times out at 45 minutes). */
+const STALE_TEMP_MS = 2 * 60 * 60 * 1000;
 
 type RaftMode = 'solid' | 'line' | 'off';
 
@@ -96,7 +121,8 @@ interface Options {
     density: number;
     raft: RaftMode;
     settings: Partial<AutoSupportSettings>;
-    pxMm: number;
+    pxMm: number | null;
+    coarseIslands: boolean;
     supportedStl: string | null;
     plateStl: string | null;
     jobDir: string | null;
@@ -115,7 +141,8 @@ function parseArgs(argv: string[]): Options {
         density: 1,
         raft: 'solid',
         settings: {},
-        pxMm: 0.1,
+        pxMm: null,
+        coarseIslands: false,
         supportedStl: null,
         plateStl: null,
         jobDir: null,
@@ -145,6 +172,7 @@ function parseArgs(argv: string[]): Options {
         else if (arg === '--raft') options.raft = value() as RaftMode;
         else if (arg === '--settings') options.settings = JSON.parse(value()) as Partial<AutoSupportSettings>;
         else if (arg === '--px-mm') options.pxMm = number();
+        else if (arg === '--coarse-islands') options.coarseIslands = true;
         else if (arg === '--supported-stl') options.supportedStl = resolve(value());
         else if (arg === '--plate-stl') options.plateStl = resolve(value());
         else if (arg === '--job-dir') options.jobDir = resolve(value());
@@ -202,7 +230,7 @@ async function deferWorkerMessages(install: () => Promise<void>): Promise<void> 
  * to islands with the app's own `overhangRegionToIsland`.
  */
 function scanOverhangs(tools: string, positions: Float32Array, angleDeg: number, hasRaft: boolean): DetectedIsland[] {
-    const tmp = mkdtempSync(join(tmpdir(), 'ndfm-overhangs-'));
+    const tmp = mkdtempSync(join(tmpdir(), TEMP_PREFIX));
     try {
         const input = join(tmp, 'positions.bin');
         writeFileSync(input, Buffer.from(positions.buffer, positions.byteOffset, positions.byteLength));
@@ -214,6 +242,25 @@ function scanOverhangs(tools: string, positions: Float32Array, angleDeg: number,
     } finally {
         rmSync(tmp, { recursive: true, force: true });
     }
+}
+
+/** Clear temp dirs a killed run left behind (only ours, and only stale ones). */
+function pruneStaleTempDirs(): void {
+    try {
+        for (const name of readdirSync(tmpdir())) {
+            if (!name.startsWith(TEMP_PREFIX)) continue;
+            const path = join(tmpdir(), name);
+            if (Date.now() - statSync(path).mtimeMs > STALE_TEMP_MS) rmSync(path, { recursive: true, force: true });
+        }
+    } catch {
+        // Best effort: a dir another run is removing is not our problem.
+    }
+}
+
+/** Create the parent directory, and note whether the file was already there. */
+function prepareOutput(path: string): boolean {
+    mkdirSync(dirname(path), { recursive: true });
+    return existsSync(path);
 }
 
 /** Centre the model on the plate in X/Y and put its lowest point at `liftMm`. */
@@ -272,6 +319,7 @@ async function main(): Promise<void> {
     const options = parseArgs(process.argv.slice(2));
     const startupMs = Math.round(process.uptime() * 1000);
     quietPipelineLogs(options.verbose);
+    pruneStaleTempDirs();
     const timings: Record<string, number> = { startup_ms: startupMs };
     const warnings: string[] = [];
     const time = async <T>(label: string, run: () => T | Promise<T>): Promise<T> => {
@@ -288,21 +336,27 @@ async function main(): Promise<void> {
     // the support export reads the *active* profiles for tip penetration (with
     // none active it silently uses 0).
     type SliceJobModule = typeof import('../vendor/dragonfruit/scripts/cli/sceneSliceJob');
+    type SceneSliceGeometry = import('../vendor/dragonfruit/scripts/cli/sceneSliceJob').SceneSliceGeometry;
     const sliceJob = await time('profiles_ms', () => importDragonFruitScript<SliceJobModule>('scripts/cli/sceneSliceJob.ts'));
     const job = sliceJob.resolveSceneSliceJob({ printer: { presetId: options.printer } });
     if (!job.printer || !job.material) throw new Error(`printer preset '${options.printer}' did not resolve`);
-    if (job.printer.presetId !== options.printer && job.printer.officialPresetId !== options.printer) {
+    if (job.printer.officialPresetId !== options.printer) {
         throw new Error(`'${options.printer}' is not a known printer preset`);
     }
-    // The printer decides the format, whatever the file is called: without
-    // --out the print goes beside the STL, named for it.
+    // The printer decides the format: without --out the print goes beside the
+    // STL, named for it; an --out naming another format is refused rather than
+    // written as a file whose extension lies about its contents.
     const format = `.${job.printer.display.outputFormat.replace(/^\./, '').toLowerCase()}`;
     if (!options.out) options.out = join(dirname(options.stl), `${basename(options.stl).replace(/\.stl$/i, '')}-supported${format}`);
     if (options.slice && extname(options.out).toLowerCase() !== format) {
-        warnings.push(`${options.out} will hold a ${format} print: the printer preset decides the format, not the file name`);
+        throw new Error(`--out ${options.out}: printer '${options.printer}' writes ${format} files, so the output must end in ${format}`);
     }
     setActivePrinterProfile(job.printer.id);
     setActiveMaterialProfile(job.material.id);
+    // The support export reads these, and quietly uses no tip penetration without them.
+    if (getActivePrinterProfile()?.id !== job.printer.id || getActiveMaterialProfile()?.id !== job.material.id) {
+        throw new Error('the profile store did not take the printer and material as active');
+    }
     const layerHeightMm = job.material.layerHeightMm;
 
     // Load and place the model.
@@ -322,6 +376,16 @@ async function main(): Promise<void> {
     if (box.max.x - box.min.x > build.width || box.max.y - box.min.y > build.depth) {
         warnings.push(`the model (${(box.max.x - box.min.x).toFixed(1)} x ${(box.max.y - box.min.y).toFixed(1)} mm) is larger than the plate (${build.width} x ${build.depth} mm)`);
     }
+    // Z, before the slow part: supports and raft never rise above the model,
+    // so its top is the print's. The engine would clamp a taller print to the
+    // build height (resolveSliceLayerCount), silently cutting off the top.
+    const buildHeightMm = Number(build.height) || 0;
+    if (box.max.z > buildHeightMm) {
+        throw new Error(
+            `the print would be ${box.max.z.toFixed(2)} mm tall (model ${(box.max.z - box.min.z).toFixed(2)} mm + lift ${options.liftMm} mm), `
+            + `but '${job.printer.name}' builds only ${buildHeightMm} mm: lower the lift or scale the model down`,
+        );
+    }
     if (options.liftMm === 0) {
         warnings.push('lift 0: the model sits on the plate, so only overhangs above its base are supported');
     }
@@ -330,9 +394,11 @@ async function main(): Promise<void> {
     type IslandScanModule = typeof import('../vendor/dragonfruit/scripts/bench-island-scan');
     const islandScan = await importDragonFruitScript<IslandScanModule>('scripts/bench-island-scan.ts');
     await deferWorkerMessages(islandScan.installInProcessWorkers);
+    const detect = options.coarseIslands ? ISLAND_DETECT.coarse : ISLAND_DETECT.panel;
     const voxelIslands = await time('islands_ms', () => islandScan.detectIslands(geometry, {
         ...islandScan.DEFAULT_DETECT_OPTIONS,
-        pxMm: options.pxMm,
+        pxMm: options.pxMm ?? detect.pxMm,
+        supportBufferMm: detect.supportBufferMm,
         layerHeightMm,
     }));
 
@@ -373,6 +439,9 @@ async function main(): Promise<void> {
         settingsOverride.areaPerSupportMm2 = (settingsOverride.areaPerSupportMm2 ?? autoDefaults.areaPerSupportMm2) / options.density;
     }
     setSettings(appSettings);
+    // The raft is part of the scene placement sees (stumps and plate roots read it).
+    const raftSettings: RaftSettings = { ...DEFAULT_RAFT_SETTINGS, bottomMode: options.raft };
+    setRaftSettings(raftSettings);
     const modelId = 'model';
     const mesh = new THREE.Mesh(geometry);
     mesh.updateMatrixWorld(true);
@@ -398,10 +467,16 @@ async function main(): Promise<void> {
     const orphans = analytics.forestReport?.orphans?.length ?? 0;
     if (orphans > 0) warnings.push(`${orphans} supports were culled as orphans`);
 
-    // Raft, then the export path's support and raft triangles.
-    const raftSettings: RaftSettings = { ...DEFAULT_RAFT_SETTINGS, bottomMode: options.raft };
-    setRaftSettings(raftSettings);
-    const plateClearance = [{
+    // The export path's support and raft triangles. The tip shrink comes from
+    // the job's anti-aliasing, as the app's export orchestrator resolves it.
+    const raster = resolveSliceRasterSettings({ printerProfile: job.printer, materialProfile: job.material });
+    const { supportTipShrinkPercent } = resolveSliceJobAntiAliasing({
+        printerProfile: job.printer,
+        materialProfile: job.material,
+        layerHeightMm: raster.layerHeightMm,
+        request: job.antiAliasing ?? undefined,
+    });
+    const plateClearance: PlateFootprintSource[] = [{
         geometry: { geometry, center: new THREE.Vector3() },
         transform: { position: new THREE.Vector3(), rotation: new THREE.Euler(), scale: new THREE.Vector3(1, 1, 1) },
         visible: true,
@@ -409,8 +484,8 @@ async function main(): Promise<void> {
     const supportTriangles = await time('support_mesh_ms', () => buildSupportAndRaftWorldTriangles(
         new Set([modelId]),
         undefined,
-        0,
-        plateClearance as never,
+        supportTipShrinkPercent,
+        plateClearance,
     ));
 
     // Model first, then supports: the engine splits the buffer at modelTriangleCount.
@@ -425,14 +500,31 @@ async function main(): Promise<void> {
     }
     if (supportTriangles.length === 0 && committed.roots > 0) warnings.push('supports were placed but produced no triangles');
 
-    if (options.supportedStl) writeBinaryStl(options.supportedStl, merged);
+    // The same check on what will actually be sliced, in case a support or the
+    // raft ever does rise above the model.
+    const topMm = maxZ(merged);
+    const layerCount = resolveSliceLayerCount({ maxZMm: topMm, printerProfile: job.printer, layerHeightMm: raster.layerHeightMm });
+    if (layerCount.tallestObjectHeightMm < topMm) {
+        throw new Error(
+            `the print is ${topMm.toFixed(2)} mm tall (model ${(box.max.z - box.min.z).toFixed(2)} mm + lift ${options.liftMm} mm), `
+            + `but '${job.printer.name}' builds only ${buildHeightMm} mm: lower the lift or scale the model`,
+        );
+    }
+    const overwritten: string[] = [];
+
+    if (options.supportedStl) {
+        if (prepareOutput(options.supportedStl)) overwritten.push(options.supportedStl);
+        writeBinaryStl(options.supportedStl, merged);
+    }
     // The model alone, in the frame the slicer gets: for a viewer to lay beside a layer image.
-    if (options.plateStl) writeBinaryStl(options.plateStl, modelPositions);
+    if (options.plateStl) {
+        if (prepareOutput(options.plateStl)) overwritten.push(options.plateStl);
+        writeBinaryStl(options.plateStl, modelPositions);
+    }
 
     // How a layer image maps to the plate frame, for a viewer laying the plate
     // STL beside one: the image spans the build area centred on the origin,
     // image rows run from +Y down, and the printer may mirror either axis.
-    const raster = resolveSliceRasterSettings({ printerProfile: job.printer, materialProfile: job.material });
     const layerFrame = {
         source_width_px: raster.sourceResolutionX,
         source_height_px: raster.sourceResolutionY,
@@ -447,34 +539,38 @@ async function main(): Promise<void> {
     };
 
     let slice: Record<string, unknown> | null = null;
-    if (options.slice) {
-        const tmp = options.jobDir ?? mkdtempSync(join(tmpdir(), 'ndfm-autosupport-'));
+    if (options.slice || options.jobDir) {
+        const tmp = options.jobDir ?? mkdtempSync(join(tmpdir(), TEMP_PREFIX));
         if (options.jobDir) mkdirSync(tmp, { recursive: true });
         try {
             const positionsPath = join(tmp, 'positions.bin');
             writeFileSync(positionsPath, Buffer.from(merged.buffer, merged.byteOffset, merged.byteLength));
             const jobPath = join(tmp, 'job.json');
-            const run = sliceJob.buildSceneSliceRun(job, {
-                maxZMm: maxZ(merged),
+            const geometryForJob: SceneSliceGeometry = {
+                maxZMm: topMm,
                 models: [{
                     id: modelId,
-                    name: options.stl.split('/').pop()!.replace(/\.stl$/i, ''),
+                    name: basename(options.stl).replace(/\.stl$/i, ''),
                     polygonCount: modelTriangleCount,
                     transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0 }, scale: { x: 1, y: 1, z: 1 } },
                 }],
-            } as never, positionsPath, options.out!, jobPath);
+            };
+            const run = sliceJob.buildSceneSliceRun(job, geometryForJob, positionsPath, options.out!, jobPath);
             // `scene slice` sends no split (it never slices supports); ours goes
             // where the app's export puts it, after the model's own triangles.
             const payload = JSON.parse(run.jobJson!) as Record<string, unknown>;
             if (!('model_triangle_count' in payload)) throw new Error('the slice job no longer carries model_triangle_count');
             payload.model_triangle_count = modelTriangleCount;
             writeFileSync(jobPath, JSON.stringify(payload));
-            const stdout = await time('slice_ms', () => execFileSync(options.cli!, run.args, {
-                encoding: 'utf-8',
-                maxBuffer: 64 * 1024 * 1024,
-                stdio: ['ignore', 'pipe', 'inherit'],
-            }));
-            slice = JSON.parse(stdout) as Record<string, unknown>;
+            if (options.slice) {
+                if (prepareOutput(options.out!)) overwritten.push(options.out!);
+                const stdout = await time('slice_ms', () => execFileSync(options.cli!, run.args, {
+                    encoding: 'utf-8',
+                    maxBuffer: 64 * 1024 * 1024,
+                    stdio: ['ignore', 'pipe', 'inherit'],
+                }));
+                slice = JSON.parse(stdout) as Record<string, unknown>;
+            }
         } finally {
             if (!options.jobDir) rmSync(tmp, { recursive: true, force: true });
         }
@@ -494,6 +590,11 @@ async function main(): Promise<void> {
         plate_transform: { translate_mm: plateShift.toArray(), rotation: null, scale: 1 },
         plate_stl: options.plateStl,
         layer_frame: layerFrame,
+        height_mm: topMm,
+        build_height_mm: buildHeightMm,
+        layers_expected: layerCount.totalLayers,
+        support_tip_shrink_percent: supportTipShrinkPercent,
+        island_detection: { px_mm: options.pxMm ?? detect.pxMm, support_buffer_mm: detect.supportBufferMm },
         islands: islands.length,
         islands_by_source: islands.reduce<Record<string, number>>((counts, island) => {
             counts[island.source] = (counts[island.source] ?? 0) + 1;
@@ -520,6 +621,8 @@ async function main(): Promise<void> {
         total_triangles: merged.length / 9,
         supported_stl: options.supportedStl,
         output: options.slice ? options.out : null,
+        job_dir: options.jobDir,
+        overwritten,
         slice,
         timings_ms: timings,
         warnings,

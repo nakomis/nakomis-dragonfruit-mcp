@@ -9,12 +9,9 @@ from test_cli import make_fake_binary
 from nakomis_dragonfruit_mcp import cli
 from nakomis_dragonfruit_mcp.tools import supports
 
-TEST_STL = Path(
-    os.environ.get(
-        "NDFM_TEST_STL",
-        "/Users/martinmu_1/Pictures/falai-mcp/ndfm-logos/3d/ndfm-logo-3d-plain-mcp-vertical.stl",
-    )
-)
+# The integration tests need a real model: set NDFM_TEST_STL to a binary STL
+# that fits the Mars 5 Ultra (the project's own is the 70 mm logo model).
+TEST_STL = Path(os.environ["NDFM_TEST_STL"]) if os.environ.get("NDFM_TEST_STL") else None
 
 SUMMARY = {
     "printer": {
@@ -29,8 +26,13 @@ SUMMARY = {
     "placed_by_type": {"trunk": 91, "branch": 36, "leaf": 80, "twig": 42},
     "contacts": 286,
     "roots": 91,
+    "islands_covered": 11,
     "islands_uncovered": 3,
+    "area_coverage": 1.27,
     "raft": "solid",
+    "height_mm": 77.2,
+    "build_height_mm": 165,
+    "overwritten": ["/tmp/model-supported.ctb"],
     "model_triangles": 462916,
     "support_triangles": 140812,
     "plate_transform": {"translate_mm": [0, 0.15, 7], "rotation": None, "scale": 1},
@@ -93,6 +95,10 @@ def test_auto_support_and_slice_maps_summary(fake_env):
     assert result.layer_frame.mirror_x is True
     assert result.plate_transform.translate_mm == [0, 0.15, 7]
     assert result.warnings == ["3 of 14 islands have no support near them"]
+    assert result.islands_covered == 11
+    assert result.area_coverage == 1.27
+    assert result.height_mm == 77.2
+    assert result.overwritten == ["/tmp/model-supported.ctb"]
 
 
 def test_default_arguments(fake_env):
@@ -103,7 +109,14 @@ def test_default_arguments(fake_env):
     assert args[args.index("--raft") + 1] == "solid"
     assert args[args.index("--cli") + 1] == str(fake_env / "bin" / "dragonfruit-cli")
     assert args[args.index("--tools") + 1] == str(fake_env / "bin" / "dragonfruit-mcp-tools")
-    for flag in ("--out", "--lift-mm", "--density", "--plate-stl", "--supported-stl"):
+    for flag in (
+        "--out",
+        "--lift-mm",
+        "--density",
+        "--plate-stl",
+        "--supported-stl",
+        "--coarse-islands",
+    ):
         assert flag not in args
     assert (fake_env / "node_path").read_text() == str(fake_env / "df" / "node_modules")
 
@@ -118,8 +131,10 @@ def test_options_are_passed_through(fake_env):
         raft=False,
         export_plate_stl=True,
         export_supported_stl=True,
+        fast_islands=True,
     )
     args = argv(fake_env)
+    assert "--coarse-islands" in args
     assert args[args.index("--printer") + 1] == "elegoo-mars-4-ultra"
     assert args[args.index("--out") + 1] == str(fake_env / "out" / "print.ctb")
     assert args[args.index("--lift-mm") + 1] == "5"
@@ -162,6 +177,8 @@ def test_bad_numbers_raise(fake_env, kwargs):
 
 
 def _real_pipeline_available() -> bool:
+    if TEST_STL is None or not TEST_STL.exists():
+        return False
     try:
         cli.find_binary(cli.DRAGONFRUIT_CLI)
         cli.find_binary(cli.MCP_TOOLS)
@@ -169,14 +186,23 @@ def _real_pipeline_available() -> bool:
     except cli.CliError:
         return False
     generated = cli.dragonfruit_dir() / "src" / "supports" / "generatedSupportRegistrations.ts"
-    return generated.exists() and TEST_STL.exists()
+    return generated.exists()
+
+
+needs_pipeline = pytest.mark.skipif(
+    not _real_pipeline_available(),
+    reason="needs NDFM_TEST_STL, bin/, DragonFruit's node_modules and generated registrations",
+)
+
+
+def _run_script(*args: str) -> dict:
+    """The TS script directly, for what the tool does not expose (--no-slice, --job-dir)."""
+    base = ["--stl", str(TEST_STL), "--tools", str(cli.find_binary(cli.MCP_TOOLS))]
+    return cli.run_ts([*base, *args], script=supports.SCRIPT, parse_json=True).data
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(
-    not _real_pipeline_available(),
-    reason="needs bin/, DragonFruit's node_modules and generated registrations, and the test STL",
-)
+@needs_pipeline
 def test_real_auto_support_and_slice(tmp_path):
     # A copy, so the default outputs land in tmp_path rather than beside the original.
     stl = tmp_path / TEST_STL.name
@@ -188,7 +214,47 @@ def test_real_auto_support_and_slice(tmp_path):
     assert result.contacts > 50
     assert result.support_triangles > 0
     assert result.layers and result.layers > 1400
+    assert result.height_mm <= result.build_height_mm
+    assert result.overwritten == []
     assert (
         result.plate_stl
         and Path(result.plate_stl).stat().st_size == 84 + 50 * result.model_triangles
     )
+
+
+@pytest.mark.integration
+@needs_pipeline
+def test_real_job_splits_model_from_supports(tmp_path):
+    job_dir = tmp_path / "job"
+    data = _run_script("--no-slice", "--coarse-islands", "--job-dir", str(job_dir))
+    job = json.loads((job_dir / "job.json").read_text())
+    # The engine treats triangles after this count as support.
+    assert job["model_triangle_count"] == data["model_triangles"]
+    assert (job_dir / "positions.bin").stat().st_size == 36 * data["total_triangles"]
+    assert data["support_triangles"] > 0
+    assert data["output"] is None
+
+
+@pytest.mark.integration
+@needs_pipeline
+def test_real_without_raft():
+    data = _run_script("--no-slice", "--coarse-islands", "--raft", "off")
+    assert data["raft"] == "off"
+    assert data["contacts"] > 0
+    assert data["support_triangles"] > 0
+
+
+@pytest.mark.integration
+@needs_pipeline
+def test_real_refuses_a_print_taller_than_the_printer(tmp_path):
+    with pytest.raises(cli.CliError, match="builds only"):
+        supports.auto_support_and_slice(
+            str(TEST_STL), out_path=str(tmp_path / "x.ctb"), lift_mm=500
+        )
+
+
+@pytest.mark.integration
+@needs_pipeline
+def test_real_refuses_an_extension_the_printer_does_not_write(tmp_path):
+    with pytest.raises(cli.CliError, match="writes .ctb files"):
+        supports.auto_support_and_slice(str(TEST_STL), out_path=str(tmp_path / "x.goo"))

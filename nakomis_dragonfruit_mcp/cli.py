@@ -107,6 +107,9 @@ def run_ts(
     `stderr` and never treated as a failure.
     """
     df = dragonfruit_dir()
+    # NODE_PATH only reaches CommonJS resolution. tsx loads our scripts as
+    # CommonJS because no package.json above ts/ says "type": "module"; adding
+    # one would break their bare imports (`three`) unless they move to ESM paths.
     env = {
         **os.environ,
         "TSX_TSCONFIG_PATH": str(df / "tsconfig.json"),
