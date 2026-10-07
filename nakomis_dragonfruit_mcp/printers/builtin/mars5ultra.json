@@ -1,4 +1,5 @@
 {
-  "description": "Elegoo Mars 5 Ultra (DragonFruit's official preset; .ctb by default, format='.goo' for .goo)",
-  "presetId": "elegoo-mars-5-ultra-ctb"
+  "description": "Elegoo Mars 5 Ultra. Defaults to .goo: Martin's printer is proven to print .goo (real captures ROOK.goo and keystamp.goo), and .goo can be inspected and previewed. format='.ctb' gives upstream's .ctb v5enc, which DragonFruit encrypts and this server cannot read back.",
+  "presetId": "elegoo-mars-5-ultra-ctb",
+  "default_format": ".goo"
 }

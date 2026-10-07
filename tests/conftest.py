@@ -61,6 +61,7 @@ def fake_df(tmp_path, monkeypatch):
                         "resolutionY": 4320,
                         "outputFormat": ".ctb",
                         "formatVersion": "v5enc",
+                        "mirrorX": True,
                     },
                 }
             ]

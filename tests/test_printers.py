@@ -98,6 +98,23 @@ def test_missing_directories_are_fine(monkeypatch, tmp_path):
     assert loader.discover().failures == []
 
 
+def test_non_string_config_printer_warns(monkeypatch):
+    config = loader.config_dir()
+    config.mkdir(parents=True)
+    (config / "config.toml").write_text("printer = 5\n")
+    warnings = []
+    assert loader.choose_name(None, warnings) == ("mars5ultra", "default")
+    assert "expected a string" in warnings[0]
+
+
+def test_json_default_format_is_stripped_and_used(drop_in):
+    (drop_in / "x.json").write_text(
+        json.dumps({"presetId": "p", "default_format": ".foo", "display": {}})
+    )
+    printer = loader.discover().printers["x"]
+    assert printer.default_format == ".foo" and "default_format" not in printer.base_profile()
+
+
 def test_config_dir_printers_win_over_env_dir(drop_in):
     config_printers = loader.config_dir() / "printers"
     config_printers.mkdir(parents=True)
@@ -136,9 +153,15 @@ def test_unknown_printer_lists_what_exists_and_what_failed(drop_in):
         loader.get(loader.discover(), "nope")
 
 
-def test_format_swap_derives_a_custom_profile(fake_df):
+def test_same_format_keeps_the_upstream_preset_untouched(fake_df):
     printer = loader.discover().printers["mars5ultra"]
     assert printer.effective_profile() == {"presetId": "elegoo-mars-5-ultra-ctb"}
+    # Asking for the profile's own format (.ctb v5enc) is not a change.
+    assert printer.effective_profile(".ctb") == {"presetId": "elegoo-mars-5-ultra-ctb"}
+
+
+def test_format_swap_derives_a_custom_profile(fake_df):
+    printer = loader.discover().printers["mars5ultra"]
     swapped = printer.effective_profile(".goo")
     assert "presetId" not in swapped
     assert swapped["display"]["outputFormat"] == ".goo"
@@ -164,8 +187,9 @@ def test_format_swap_of_unknown_preset_says_so(fake_df):
 def test_build_volume_derived_from_screen(fake_df):
     printer = loader.discover().printers["mars5ultra"]
     assert printer.build_volume_mm() == {"width": 153.36, "depth": 77.76, "height": 165}
-    assert printer.output_format() == ".ctb"
-    assert printer.output_format(".goo") == ".goo"
+    assert printer.native_format() == ".ctb"  # the upstream preset
+    assert printer.output_format() == ".goo"  # mars5ultra's default
+    assert printer.output_format(".ctb") == ".ctb"
 
 
 def test_build_volume_unknown_preset_is_none(fake_df):

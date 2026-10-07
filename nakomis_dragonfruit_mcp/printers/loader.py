@@ -52,6 +52,8 @@ def printer_dirs() -> list[Path]:
 
 
 def discover() -> Registry:
+    """Scan every directory afresh. Drop-in `.py` files are re-imported on each call, so
+    edits take effect without a restart (and import-time side effects repeat)."""
     registry = Registry()
     for directory in printer_dirs():
         if not directory.is_dir():
@@ -88,11 +90,15 @@ def _load_json(path: Path, registry: Registry) -> list[Printer]:
         section = profile["printer"] if isinstance(profile.get("printer"), dict) else profile
         if "presetId" not in section and "display" not in section:
             raise ValueError("neither a presetId nor a display section: not a DragonFruit profile")
-        # `description` is ours, not DragonFruit's: take it out before the profile goes on.
+        # `description` and `default_format` are ours, not DragonFruit's: take them out
+        # before the profile goes on.
+        default_format = profile.pop("default_format", None)
         description = profile.pop("description", None)
         if not isinstance(description, str):
             description = section.get("name") if isinstance(section.get("name"), str) else None
-        printer = Printer(path.stem, profile=profile, description=description)
+        printer = Printer(
+            path.stem, profile=profile, description=description, default_format=default_format
+        )
     except (OSError, ValueError) as e:
         registry.failures.append(Failure(str(path), f"{type(e).__name__}: {e}"))
         return []
@@ -134,8 +140,8 @@ def _load_py(path: Path, registry: Registry) -> list[Printer]:
     return printers
 
 
-def configured_printer() -> str | None:
-    """`printer = "..."` from config.toml, if there is one."""
+def configured_printer(warnings: list[str] | None = None) -> str | None:
+    """`printer = "..."` from config.toml, if there is one (a non-string one is warned of)."""
     path = config_dir() / "config.toml"
     try:
         value = tomllib.loads(path.read_text()).get("printer")
@@ -143,22 +149,24 @@ def configured_printer() -> str | None:
         return None
     except (OSError, tomllib.TOMLDecodeError) as e:
         raise ValueError(f"cannot read {path}: {e}") from e
+    if value is not None and not isinstance(value, str) and warnings is not None:
+        warnings.append(f"ignoring `printer` in {path}: expected a string, got {value!r}")
     return value if isinstance(value, str) and value else None
 
 
-def choose_name(requested: str | None) -> tuple[str, str]:
+def choose_name(requested: str | None, warnings: list[str] | None = None) -> tuple[str, str]:
     """The printer name and where the choice came from: arg, env, config or default."""
     if requested:
         return requested, "argument"
     if env := os.environ.get("NDFM_PRINTER"):
         return env, "$NDFM_PRINTER"
-    if configured := configured_printer():
+    if configured := configured_printer(warnings):
         return configured, "config.toml"
     return DEFAULT_PRINTER, "default"
 
 
 def get(registry: Registry, requested: str | None) -> tuple[Printer, str]:
-    name, origin = choose_name(requested)
+    name, origin = choose_name(requested, registry.warnings)
     printer = registry.printers.get(name)
     if printer is None:
         known = ", ".join(sorted(registry.printers)) or "none"

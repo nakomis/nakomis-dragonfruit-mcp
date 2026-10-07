@@ -59,3 +59,22 @@ def build_volume(profile: dict[str, Any]) -> dict[str, float | None]:
         "depth": axis(volume.get("depth"), "resolutionY", "y"),
         "height": volume.get("height"),
     }
+
+
+def summary(profile: dict[str, Any]) -> dict[str, Any]:
+    """The facts about a profile that downstream tools want, resolving a preset reference."""
+    printer = printer_section(profile)
+    preset_id = printer.get("presetId")
+    if "display" not in printer:
+        printer = find(preset_id) or {}
+    display = printer.get("display") or {}
+    return {
+        "presetId": preset_id,
+        "outputFormat": display.get("outputFormat"),
+        "formatVersion": display.get("formatVersion"),
+        "resolutionX": display.get("resolutionX"),
+        "resolutionY": display.get("resolutionY"),
+        "pixelSize": printer.get("pixelSize"),
+        "mirrorX": display.get("mirrorX"),
+        "mirrorY": display.get("mirrorY"),
+    }

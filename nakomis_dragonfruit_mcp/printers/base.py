@@ -60,6 +60,8 @@ class Printer:
     # preset; `profile` is a custom profile or an app-exported bundle.
     preset_id: ClassVar[str | None] = None
     profile: ClassVar[dict[str, Any] | None] = None
+    # Output format used when the caller asks for none; None means the profile's own.
+    default_format: ClassVar[str | None] = None
 
     def __init__(
         self,
@@ -67,6 +69,7 @@ class Printer:
         *,
         profile: dict[str, Any] | None = None,
         description: str | None = None,
+        default_format: str | None = None,
     ) -> None:
         # Instances of the base class are the JSON route; `name` and `profile`
         # come from the file. Subclasses use their class attributes.
@@ -76,6 +79,8 @@ class Printer:
             self.profile = profile
         if description is not None:
             self.description = description
+        if default_format is not None:
+            self.default_format = default_format
         self.route = "py" if type(self) is not Printer else "json"
         self.source: Path | None = None
 
@@ -99,8 +104,8 @@ class Printer:
         does on the same screen).
         """
         profile = self.base_profile()
-        if format is None:
-            return profile
+        if format is None or format == self.native_format():
+            return profile  # nothing to change: keep presetId and formatVersion
         printer = profile["printer"] if isinstance(profile.get("printer"), dict) else profile
         if "display" not in printer:
             resolved = presets.find(printer.get("presetId"))
@@ -117,14 +122,16 @@ class Printer:
         display.pop("formatVersion", None)
         return profile
 
-    def output_format(self, format: str | None = None) -> str | None:
-        """The extension the sliced file will have, if the profile says."""
-        if format:
-            return format
+    def native_format(self) -> str | None:
+        """The output format of the profile as declared, if it says."""
         section = presets.printer_section(self.base_profile())
         if "display" not in section:
             section = presets.find(section.get("presetId")) or {}
         return (section.get("display") or {}).get("outputFormat")
+
+    def output_format(self, format: str | None = None) -> str | None:
+        """The extension the sliced file will have: asked for, else the default, else native."""
+        return format or self.default_format or self.native_format()
 
     def build_volume_mm(self) -> dict[str, float | None] | None:
         """Width, depth and height of the build plate, derived from the screen if need be."""
