@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from nakomis_dragonfruit_mcp import cli, server
+from nakomis_dragonfruit_mcp import cli
+from nakomis_dragonfruit_mcp.tools import engine
 
 
 def make_fake_binary(directory: Path, name: str, script: str) -> Path:
@@ -97,7 +98,7 @@ def test_engine_info(bin_dir):
         "dragonfruit-cli",
         """echo '{"version": "1.0.0", "supported_formats": [".goo", ".ctb"]}'""",
     )
-    result = server.engine_info()
+    result = engine.engine_info()
     assert result.version == "1.0.0"
     assert result.formats == [".goo", ".ctb"]
     assert result.cli_path == str(bin_dir / "dragonfruit-cli")
@@ -108,7 +109,7 @@ def test_engine_info(bin_dir):
 def test_engine_info_unexpected_schema(bin_dir, output):
     make_fake_binary(bin_dir, "dragonfruit-cli", f"echo {output}")
     with pytest.raises(cli.CliError, match="unexpected"):
-        server.engine_info()
+        engine.engine_info()
 
 
 def _real_cli_available() -> bool:
@@ -125,4 +126,40 @@ def _real_cli_available() -> bool:
     reason="dragonfruit-cli not built (run scripts/build.sh)",
 )
 def test_engine_info_real_binary_lists_goo():
-    assert ".goo" in server.engine_info().formats
+    assert ".goo" in engine.engine_info().formats
+
+
+def test_dragonfruit_dir_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("NDFM_DRAGONFRUIT_DIR", str(tmp_path))
+    assert cli.dragonfruit_dir() == tmp_path
+
+
+def test_run_ts_missing_tsx_says_how_to_fix(monkeypatch, tmp_path):
+    monkeypatch.setenv("NDFM_DRAGONFRUIT_DIR", str(tmp_path))
+    with pytest.raises(cli.CliError, match="scripts/build.sh"):
+        cli.run_ts(["--help"])
+
+
+def test_run_ts_runs_script_from_dragonfruit_dir(monkeypatch, tmp_path):
+    # A stand-in tsx that reports its cwd, script, args and the tsconfig env var.
+    monkeypatch.setenv("NDFM_DRAGONFRUIT_DIR", str(tmp_path))
+    tsx_dir = tmp_path / "node_modules" / ".bin"
+    tsx_dir.mkdir(parents=True)
+    make_fake_binary(
+        tsx_dir,
+        "tsx",
+        'printf \'{"cwd": "%s", "argv": "%s", "tsconfig": "%s"}\' "$PWD" "$*" "$TSX_TSCONFIG_PATH"',
+    )
+    result = cli.run_ts(["scene", "list-models"], parse_json=True)
+    assert Path(result.data["cwd"]).resolve() == tmp_path.resolve()
+    assert result.data["argv"] == "scripts/dragonfruit-ts-cli.ts scene list-models"
+    assert result.data["tsconfig"] == str(tmp_path / "tsconfig.json")
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not (cli.dragonfruit_dir() / "node_modules" / ".bin" / "tsx").exists(),
+    reason="DragonFruit node_modules not installed (run scripts/build.sh)",
+)
+def test_run_ts_real_cli_help():
+    assert "scene" in cli.run_ts(["--help"]).stdout
