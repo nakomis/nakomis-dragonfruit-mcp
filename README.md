@@ -83,21 +83,32 @@ the printer directly: Cthulhu owns the SDCP connection and its quirks.
 | `CTHULHU_CLIENT_CERT`, `CTHULHU_CLIENT_KEY` | PEM paths of the mTLS client certificate Leia's nginx requires (no API key). Required for https URLs; an unset or missing path is a clear error |
 | `CTHULHU_UPLOAD_TIMEOUT_S` | Default 3600; the printer takes roughly 100 KB/s over WiFi |
 
-`send_to_printer(print_path, start=False, confirm=None)` uploads a `.goo` or `.ctb`
-and returns once the printer has verified and listed the file. Safety rules, enforced
-in code:
+Printing is a deliberate two-step flow:
 
-- By default it only uploads. Nothing prints.
-- Starting needs `start=True` **and** `confirm="Martin said go"`, which the caller may
-  pass only when Martin has explicitly said to start that print in the current session.
-  Without the exact phrase the call is refused before anything is uploaded.
-- The printer must be connected, idle (or showing a finished or stopped print) and
-  error-free, checked before uploading and again just before starting. Uploads are
-  refused during a print.
-- The result states what is printing (file, layers, layer height, estimated time) and
-  the printer's status as observed after starting; `started` is true only if the print
-  was actually seen to begin. Resin volume is not in `.goo`/`.ctb` headers, so it
-  comes from the slice results instead.
+1. `send_to_printer(print_path)` only uploads a `.goo` or `.ctb`. It never overwrites
+   (a taken name gets a content-hash suffix such as `logo-3f9a1c.goo`), waits for the
+   printer to verify and list the file, compares Cthulhu's MD5 with the local one, and
+   returns the remote name, a summary of what would be printed (layers, layer height,
+   estimated time) and the exact confirmation phrase. It is refused unless the printer is
+   connected, idle (or showing a finished or stopped print) and error-free.
+2. `start_print(remote_filename, confirm)` starts it. `confirm` must be exactly
+   `Martin said go: <remote filename>`, which the caller may pass only after Martin has
+   explicitly approved printing that file in the current session, having seen the
+   summary. The file must have been uploaded and MD5-verified by this server session
+   (an upload recovered after a dropped connection never qualifies), still be listed on
+   the printer, and the printer must again be idle and error-free. The result reports the
+   status observed afterwards; `started` is true only if that file was seen to begin, and
+   a start request that failed part-way is reported loudly as unknown, never as success.
+
+> [!NOTE]
+> The phrase is a convention enforced on the AI, not a cryptographic human-in-the-loop:
+> a misbehaving model could simply type it. Binding it to the uploaded file name makes
+> it harder to pre-fill by accident; true out-of-band confirmation (for example MCP
+> elicitation, asking Martin directly) is future work.
+
+File names are restricted to `[A-Za-z0-9._ -]`, plain `http://` is accepted only for a
+loopback host, and every request except the upload itself times out after 20 seconds.
+Resin volume is not in `.goo`/`.ctb` headers, so it comes from the slice results.
 
 Tests run against a fake Cthulhu (`httpx.MockTransport`); nothing contacts a real
 server or printer.

@@ -7,7 +7,8 @@ is no API key.
 
 Configuration, all from the environment:
 
-- `CTHULHU_URL`: base URL, default `https://cthulhu.home.nakomis.com`.
+- `CTHULHU_URL`: base URL, default `https://cthulhu.home.nakomis.com`. Plain http is
+  accepted only for a loopback host (a local Cthulhu in front of the fake printer).
 - `CTHULHU_CLIENT_CERT` and `CTHULHU_CLIENT_KEY`: PEM paths for the mTLS client
   certificate. Required for https URLs; unused for a plain http URL (a local
   Cthulhu in front of the fake printer).
@@ -29,12 +30,15 @@ Cthulhu's REST API, as used here (apps/server/src/app.ts in the cthulhu repo):
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -42,6 +46,8 @@ from nakomis_dragonfruit_mcp.cli import CliError
 
 DEFAULT_URL = "https://cthulhu.home.nakomis.com"
 DEFAULT_UPLOAD_TIMEOUT_S = 3600.0
+REQUEST_TIMEOUT_S = 20.0  # every request except the upload itself
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 # Cthulhu / SDCP machine status codes (packages/sdcp/src/protocol.ts).
 MACHINE_STATUS = {
@@ -61,6 +67,38 @@ class CthulhuError(CliError):
     """Cthulhu was unconfigured, unreachable, or answered with something unexpected."""
 
 
+class StartUnknown(CthulhuError):
+    """POST /api/print may or may not have reached the printer (timeout, drop, 5xx)."""
+
+
+def safe_filename(name: str) -> str:
+    """Restrict a file name to [A-Za-z0-9._ -]; anything else becomes an underscore."""
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]", "_", Path(name).name).strip()
+    return cleaned.lstrip(".") or "print"
+
+
+def unique_name(name: str, md5: str, taken: set[str]) -> str:
+    """`name` if free, else stem + content-hash suffix (`logo-3f9a1c.goo`). Never overwrites."""
+    if f"/local/{name}" not in taken:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    stem, ext = (stem, f".{ext}") if dot else (name, "")
+    for length in (6, 12, 32):
+        candidate = f"{stem}-{md5[:length]}{ext}"
+        if f"/local/{candidate}" not in taken:
+            return candidate
+    raise CthulhuError(f"{name} and its content-hashed variants are already on the printer")
+
+
+@dataclass
+class UploadOutcome:
+    remote_name: str
+    path: str
+    md5: str
+    size: int
+    verified: bool  # True only on Cthulhu's normal 200 with a matching MD5
+
+
 @dataclass
 class CthulhuConfig:
     url: str
@@ -71,6 +109,13 @@ class CthulhuConfig:
     @classmethod
     def from_env(cls) -> CthulhuConfig:
         url = os.environ.get("CTHULHU_URL", DEFAULT_URL).rstrip("/")
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise CthulhuError(f"CTHULHU_URL must be an http(s) URL, got {url!r}")
+        if parsed.scheme == "http" and parsed.hostname not in LOOPBACK_HOSTS:
+            raise CthulhuError(
+                f"CTHULHU_URL {url} is plain http to a non-loopback host; refusing. Use https."
+            )
         cert = os.environ.get("CTHULHU_CLIENT_CERT") or None
         key = os.environ.get("CTHULHU_CLIENT_KEY") or None
         if url.startswith("https://"):
@@ -99,15 +144,17 @@ class CthulhuClient:
         *,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.config = config
-        self._sleep = sleep
+        self.sleep = sleep
+        self.clock = clock
         cert = (config.cert, config.key) if config.cert and config.key else None
         self._http = httpx.Client(
             base_url=config.url,
             cert=cert,
             transport=transport,
-            timeout=httpx.Timeout(30.0, read=config.upload_timeout_s),
+            timeout=REQUEST_TIMEOUT_S,
         )
 
     def close(self) -> None:
@@ -155,49 +202,82 @@ class CthulhuClient:
         meta = self._json(response, "file details")
         return meta if isinstance(meta, dict) else None
 
-    def upload(self, filename: str, data: bytes) -> dict:
-        """Upload and wait until the printer lists the file (MD5 verified).
+    def upload(self, filename: str, data: bytes) -> UploadOutcome:
+        """Upload under a name that does not exist on the printer, and wait for its verdict.
 
-        Cthulhu answers only after `confirmUploaded()`, so a 200 means the printer
-        accepted the file. If the HTTP request itself dies part-way (a proxy timeout
-        on a long upload), the upload may still be running or have finished: follow it
-        through `/api/upload/progress` and the file listing before giving up.
+        Never overwrites: the listing is read first, and a taken name gets a content-hash
+        suffix. Cthulhu answers only after `confirmUploaded()` (the printer has MD5-checked
+        and listed the file), so a 200 whose MD5 matches ours is `verified`. If the request
+        dies part-way (a proxy timeout on a long upload) we follow the upload through
+        `/api/upload/progress` and accept the file only if it was absent before and is listed
+        now; that outcome is never `verified`, and so can never be started.
         """
-        path = f"/local/{filename}"
+        md5 = hashlib.md5(data).hexdigest()  # noqa: S324 (the printer's own integrity check)
+        before = {f.get("path") for f in self.files()}
+        remote = unique_name(safe_filename(filename), md5, before)
+        path = f"/local/{remote}"
         try:
             response = self._http.post(
                 "/api/upload",
                 content=data,
-                headers={"x-filename": filename, "content-type": "application/octet-stream"},
+                headers={"x-filename": remote, "content-type": "application/octet-stream"},
+                timeout=httpx.Timeout(REQUEST_TIMEOUT_S, read=self.config.upload_timeout_s),
             )
+        except (httpx.LocalProtocolError, httpx.ConnectError, httpx.ConnectTimeout) as e:
+            # Nothing was sent: a plain failure, not something to recover from.
+            raise CthulhuError(f"upload of {remote} failed before sending: {e!r}") from e
         except httpx.HTTPError as e:
-            return self._await_upload(filename, path, f"{e!r}")
+            return self._recover_upload(remote, path, md5, len(data), before, repr(e))
         if response.status_code == 504:
-            return self._await_upload(filename, path, "HTTP 504 from the proxy")
+            return self._recover_upload(
+                remote, path, md5, len(data), before, "HTTP 504 from the proxy"
+            )
         body = self._json(response, "upload")
-        if not isinstance(body, dict) or not isinstance(body.get("path"), str):
+        if not isinstance(body, dict) or body.get("path") != path:
             raise CthulhuError(f"unexpected Cthulhu /api/upload output: {str(body)[:200]!r}")
-        return body
+        if str(body.get("md5", "")).lower() != md5:
+            raise CthulhuError(
+                f"upload of {remote}: Cthulhu reported MD5 {body.get('md5')!r}, "
+                f"but the local file is {md5}. Not trusting it."
+            )
+        return UploadOutcome(remote, path, md5, len(data), verified=True)
 
-    def _await_upload(
-        self, filename: str, path: str, why: str, *, patience_s: float = 1800
-    ) -> dict:
-        deadline = time.monotonic() + patience_s
-        while time.monotonic() < deadline:
+    def _recover_upload(
+        self,
+        remote: str,
+        path: str,
+        md5: str,
+        size: int,
+        before: set,
+        why: str,
+        *,
+        patience_s: float = 1800,
+    ) -> UploadOutcome:
+        deadline = self.clock() + patience_s
+        while True:
             progress = self._request("GET", "/api/upload/progress")
             if progress.status_code == 204:
                 break
-            self._sleep(5)
-        else:
-            raise CthulhuError(f"upload of {filename} lost ({why}) and still running after a wait")
-        if any(f.get("path") == path for f in self.files()):
-            return {"filename": filename, "path": path, "md5": None, "size": None}
-        raise CthulhuError(
-            f"upload of {filename} did not complete ({why}); the printer does not list {path}"
-        )
+            if self.clock() >= deadline:
+                raise CthulhuError(
+                    f"upload of {remote} lost ({why}) and still running after a wait"
+                )
+            self.sleep(5)
+        now = {f.get("path") for f in self.files()}
+        if path in before or path not in now:
+            raise CthulhuError(
+                f"upload of {remote} did not complete ({why}); the printer does not list {path}"
+            )
+        return UploadOutcome(remote, path, md5, size, verified=False)
 
     def start_print(self, path: str) -> None:
-        response = self._request("POST", "/api/print", json={"filename": path})
+        """Ask Cthulhu to start. A 4xx is a definite refusal; anything murkier is StartUnknown."""
+        try:
+            response = self._http.post("/api/print", json={"filename": path})
+        except httpx.HTTPError as e:
+            raise StartUnknown(f"start request for {path} failed part-way: {e!r}") from e
+        if response.status_code >= 500:
+            raise StartUnknown(f"start request for {path}: HTTP {response.status_code}")
         self._json(response, "start print")
 
 
