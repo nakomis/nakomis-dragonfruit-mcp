@@ -54,6 +54,7 @@ def fake_df(tmp_path, monkeypatch):
             [
                 {
                     "presetId": "elegoo-mars-5-ultra-ctb",
+                    "name": "Mars 5 Ultra",
                     "pixelSize": {"x": 18, "y": 18},
                     "buildVolumeMm": {"width": None, "depth": None, "height": 165},
                     "display": {

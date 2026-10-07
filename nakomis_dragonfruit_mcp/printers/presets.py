@@ -35,6 +35,20 @@ def find(preset_id: str | None) -> dict[str, Any] | None:
     return None
 
 
+def find_by_name(name: str) -> list[dict[str, Any]]:
+    """Official presets whose display name is exactly `name` (a .goo header's machine name)."""
+    found = []
+    for path in sorted((cli.dragonfruit_dir() / "plugins").glob("*/printers/*.json")):
+        try:
+            entries = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        for entry in entries if isinstance(entries, list) else [entries]:
+            if isinstance(entry, dict) and entry.get("name") == name:
+                found.append(entry)
+    return found
+
+
 def build_volume(profile: dict[str, Any]) -> dict[str, float | None]:
     """Width, depth, height in mm. A null width or depth comes from screen x pixel size."""
     printer = printer_section(profile)

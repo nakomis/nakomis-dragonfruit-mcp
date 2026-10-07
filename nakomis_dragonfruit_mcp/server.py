@@ -13,7 +13,14 @@ dropped. The tools themselves live in `nakomis_dragonfruit_mcp/tools/`.
 from __future__ import annotations
 
 from nakomis_dragonfruit_mcp.app import mcp
-from nakomis_dragonfruit_mcp.tools import engine, hollow, islands, mesh, slicing  # noqa: F401
+from nakomis_dragonfruit_mcp.tools import (  # noqa: F401
+    engine,
+    hollow,
+    islands,
+    mesh,
+    printfile,
+    slicing,
+)
 
 
 def main() -> None:

@@ -40,7 +40,9 @@ Early days. The repository is scaffolded; the tools are being built. Planned too
 - `list_printers` and `slice`: slice to the printer's own format (`.goo` for the
   Elegoo Mars 5 Ultra, `.nanodlp` for the Concepts3D Athena 8K, and anything else
   you add as a plugin)
-- `preview_layer` and `inspect_print`: check the sliced output
+- `preview_layer` and `inspect_print`: check the sliced output. They read `.goo` and ZIP-based
+  files (`.nanodlp`); the Mars 5 Ultra's default `.ctb` (v5enc) is encrypted and cannot be read,
+  so slice with `format=".goo"` to preview it
 - `hollow` and `drill_holes`: hollow a model to save resin, then drill a suction-relief
   hole through each cavity's floor and a vent through its roof so it can drain
   (always follow `hollow` with `drill_holes`)
