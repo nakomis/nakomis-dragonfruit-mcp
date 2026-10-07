@@ -17,3 +17,6 @@ serde = { version = "1", features = ["derive"] }
 # not compile (see dragonfruit-organic-cut's Cargo.toml). Without this a fresh lock
 # resolves to the newest and the build breaks. Needs cmake and a C++ compiler.
 manifold-csg = { version = "=0.1.4", default-features = false }
+# For the overhang classifier borrowed from DragonFruit's app crate (see build.rs).
+log = "0.4"
+rayon = "1.10"

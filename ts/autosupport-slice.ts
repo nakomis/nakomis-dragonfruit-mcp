@@ -1,0 +1,532 @@
+/**
+ * Auto-support an STL and slice it, supports and raft included, headlessly.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * Upstream has the pieces but no command that joins them: `scripts/bench-auto-
+ * supports.ts` runs the placement pipeline under Node, and `scene slice` slices
+ * a scene without its supports. This script runs the app's own code end to end,
+ * importing DragonFruit's modules read-only:
+ *
+ *   STL -> lift off the plate -> voxel islands (`detectVoxelIslands`, through the
+ *   bench's in-process worker shim) -> `runAutoPlaceRequest` (the worker's own
+ *   entry point) -> `commitAutoPlacePlan` into the support store ->
+ *   `buildSupportAndRaftWorldTriangles` (the app's export path) -> model
+ *   triangles first, then supports and raft, with `modelTriangleCount` at the
+ *   split -> the job `scene slice` assembles for the printer preset ->
+ *   `dragonfruit-cli slice run --job`.
+ *
+ * Run by `nakomis_dragonfruit_mcp.cli.run_ts` with DragonFruit's tsx, its
+ * tsconfig (for the `@/` alias) and `NODE_PATH` at its node_modules (for bare
+ * imports such as `three`), from the DragonFruit checkout.
+ *
+ * The model is placed in world space by moving its vertices: centred on the
+ * plate in X/Y, its lowest point at the lift height. The support pipeline and
+ * the slicer then both see an identity transform, so there is no model/world
+ * space to get wrong between them.
+ *
+ * Islands: the app merges three families. The voxel family runs here through
+ * the bench's in-process worker; the overhang family is a Tauri command over
+ * Rust, which `dragonfruit-mcp-tools overhangs` runs for us (`--tools`); mesh
+ * minima (also Tauri) are not run, so a model may get fewer supports at
+ * isolated low points than the GUI would give it.
+ *
+ * Usage:
+ *   tsx autosupport-slice.ts --stl <in.stl> [--out <out.ctb>] --cli <dragonfruit-cli> [--tools <dragonfruit-mcp-tools>]
+ *     [--printer <presetId>] [--lift-mm 7] [--density 1] [--raft solid|line|off]
+ *     [--settings <json>] [--px-mm 0.1] [--supported-stl <out.stl>] [--plate-stl <out.stl>] [--job-dir <dir>]
+ *     [--no-slice] [--verbose]
+ *
+ * `--supported-stl` writes model, supports and raft as sliced; `--plate-stl` the
+ * model alone in the same plate frame (centred, lifted), to line up with a layer.
+ * `--job-dir` keeps the engine's input (positions.bin, job.json) for inspection.
+ *
+ * Prints one JSON summary on stdout; everything else goes to stderr.
+ */
+
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, dirname, extname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import * as THREE from 'three';
+import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
+
+import { initializeBVH, accelerateGeometry } from '@/utils/bvh';
+import { createDefaultSettings } from '@/supports/Settings/types';
+import { setSettings } from '@/supports/Settings/state';
+import { clearHistory } from '@/history/historyStore';
+import { getSnapshot, resetKickstandsInState, resetStore } from '@/supports/state';
+import { registerSupportHistoryHandlers } from '@/supports/history/useSupportHistoryHandlers';
+import { setModelMesh } from '@/supports/autoSupport/meshStore';
+import { commitAutoPlacePlan } from '@/supports/autoSupport/autoPlace';
+import { resolvedSizingBandsForRun } from '@/supports/autoSupport/parameterSizing';
+import {
+    modelMeshKey,
+    runAutoPlaceRequest,
+    serializeIsland,
+    serializeModelMesh,
+} from '@/supports/autoSupport/autoPlace.worker.shared';
+import type { AutoSupportSettings } from '@/supports/autoSupport/settings';
+import { SUPPORT_STATE_TYPES } from '@/supports/supportTypeRegistry';
+import { DEFAULT_LIFT_DISTANCE_MM } from '@/features/transform/liftDefaults';
+import { DEFAULT_RAFT_SETTINGS } from '@/supports/Rafts/Crenelated/RaftDefaults';
+import { setRaftSettings } from '@/supports/Rafts/Crenelated/RaftState';
+import { setActiveMaterialProfile, setActivePrinterProfile } from '@/features/profiles/profileStore';
+import { buildSupportAndRaftWorldTriangles } from '@/features/slicing/rasterLayerZipExport';
+import { resolveSliceRasterSettings } from '@/features/slicing/sliceJobAssembly';
+import { disposeEventLoopChannel } from '@/utils/yieldToEventLoop';
+import type { RaftSettings } from '@/supports/Rafts/Crenelated/RaftTypes';
+import { mergeOverhangRegions, overhangRegionToIsland } from '@/volumeAnalysis/Islands/useIslands';
+import { classifyIntersection } from '@/volumeAnalysis/Islands/intersection';
+import type { DetectedIsland, OverhangScan } from '@/volumeAnalysis/Islands/types';
+
+/** The footprint resolution the app's island panel asks `scan_overhangs` for (useIslands.ts). */
+const OVERHANG_FOOTPRINT_PX_MM = 0.25;
+
+type RaftMode = 'solid' | 'line' | 'off';
+
+interface Options {
+    stl: string;
+    out: string | null;
+    cli: string | null;
+    tools: string | null;
+    printer: string;
+    liftMm: number;
+    density: number;
+    raft: RaftMode;
+    settings: Partial<AutoSupportSettings>;
+    pxMm: number;
+    supportedStl: string | null;
+    plateStl: string | null;
+    jobDir: string | null;
+    slice: boolean;
+    verbose: boolean;
+}
+
+function parseArgs(argv: string[]): Options {
+    const options: Options = {
+        stl: '',
+        out: null,
+        cli: null,
+        tools: null,
+        printer: 'elegoo-mars-5-ultra-ctb',
+        liftMm: DEFAULT_LIFT_DISTANCE_MM,
+        density: 1,
+        raft: 'solid',
+        settings: {},
+        pxMm: 0.1,
+        supportedStl: null,
+        plateStl: null,
+        jobDir: null,
+        slice: true,
+        verbose: false,
+    };
+    for (let i = 0; i < argv.length; i++) {
+        const arg = argv[i];
+        const value = (): string => {
+            const next = argv[++i];
+            if (next === undefined) throw new Error(`${arg} needs a value`);
+            return next;
+        };
+        const number = (): number => {
+            const raw = value();
+            const parsed = Number(raw);
+            if (!Number.isFinite(parsed)) throw new Error(`${arg} needs a number, got "${raw}"`);
+            return parsed;
+        };
+        if (arg === '--stl') options.stl = resolve(value());
+        else if (arg === '--out') options.out = resolve(value());
+        else if (arg === '--cli') options.cli = resolve(value());
+        else if (arg === '--tools') options.tools = resolve(value());
+        else if (arg === '--printer') options.printer = value();
+        else if (arg === '--lift-mm') options.liftMm = number();
+        else if (arg === '--density') options.density = number();
+        else if (arg === '--raft') options.raft = value() as RaftMode;
+        else if (arg === '--settings') options.settings = JSON.parse(value()) as Partial<AutoSupportSettings>;
+        else if (arg === '--px-mm') options.pxMm = number();
+        else if (arg === '--supported-stl') options.supportedStl = resolve(value());
+        else if (arg === '--plate-stl') options.plateStl = resolve(value());
+        else if (arg === '--job-dir') options.jobDir = resolve(value());
+        else if (arg === '--no-slice') options.slice = false;
+        else if (arg === '--verbose') options.verbose = true;
+        else throw new Error(`unknown argument "${arg}"`);
+    }
+    if (!options.stl) throw new Error('--stl is required');
+    if (options.slice && !options.cli) throw new Error('--cli is required unless --no-slice');
+    if (!['solid', 'line', 'off'].includes(options.raft)) throw new Error('--raft must be solid, line or off');
+    if (options.liftMm < 0) throw new Error('--lift-mm must not be negative');
+    if (options.density <= 0) throw new Error('--density must be positive');
+    return options;
+}
+
+/**
+ * The pipeline logs freely through console.log, and stdout carries our JSON.
+ * Its chatter goes to stderr with --verbose and nowhere otherwise.
+ */
+function quietPipelineLogs(verbose: boolean): void {
+    const toStderr = (...args: unknown[]) => {
+        if (verbose) process.stderr.write(`${args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')}\n`);
+    };
+    console.log = toStderr;
+    console.info = toStderr;
+    console.warn = toStderr;
+    console.debug = toStderr;
+}
+
+/** Scripts outside `src/` are not under the `@/` alias, so load them by path. */
+async function importDragonFruitScript<T>(relativePath: string): Promise<T> {
+    return (await import(pathToFileURL(join(process.cwd(), relativePath)).href)) as T;
+}
+
+/**
+ * The bench's stand-in worker answers synchronously, and the detector asks for
+ * the next layer from inside each answer, so the stack grows by a few frames per
+ * layer: fine for the bench's small corpus, a stack overflow for a 70 mm part
+ * at 50 µm. Delivering each message on its own macrotask (as a real worker
+ * would) keeps the stack flat; the in-thread handler and its ordering are
+ * unchanged.
+ */
+async function deferWorkerMessages(install: () => Promise<void>): Promise<void> {
+    await install();
+    const globals = globalThis as unknown as { Worker: new () => { postMessage: (message: unknown) => void } };
+    const InProcessWorker = globals.Worker;
+    globals.Worker = function DeferredWorker() {
+        const inner = new InProcessWorker();
+        return { ...inner, postMessage: (message: unknown) => setImmediate(() => inner.postMessage(message)) };
+    } as unknown as typeof globals.Worker;
+}
+
+/**
+ * The app's `scan_overhangs`, through `dragonfruit-mcp-tools overhangs`, mapped
+ * to islands with the app's own `overhangRegionToIsland`.
+ */
+function scanOverhangs(tools: string, positions: Float32Array, angleDeg: number, hasRaft: boolean): DetectedIsland[] {
+    const tmp = mkdtempSync(join(tmpdir(), 'ndfm-overhangs-'));
+    try {
+        const input = join(tmp, 'positions.bin');
+        writeFileSync(input, Buffer.from(positions.buffer, positions.byteOffset, positions.byteLength));
+        const args = ['overhangs', input, '--angle', String(angleDeg), '--px-mm', String(OVERHANG_FOOTPRINT_PX_MM)];
+        if (hasRaft) args.push('--has-raft');
+        const stdout = execFileSync(tools, args, { encoding: 'utf-8', maxBuffer: 512 * 1024 * 1024 });
+        const scan = JSON.parse(stdout) as OverhangScan;
+        return scan.regions.map(overhangRegionToIsland);
+    } finally {
+        rmSync(tmp, { recursive: true, force: true });
+    }
+}
+
+/** Centre the model on the plate in X/Y and put its lowest point at `liftMm`. */
+function placeOnPlate(geometry: THREE.BufferGeometry, liftMm: number): THREE.Vector3 {
+    geometry.computeBoundingBox();
+    const box = geometry.boundingBox!;
+    const shift = new THREE.Vector3(
+        -(box.min.x + box.max.x) / 2,
+        -(box.min.y + box.max.y) / 2,
+        liftMm - box.min.z,
+    );
+    geometry.translate(shift.x, shift.y, shift.z);
+    geometry.computeBoundingBox();
+    return shift;
+}
+
+/** Every entity in the committed store, and its contacts, per registry type. */
+function countCommitted(): { byType: Record<string, number>; contacts: number; roots: number } {
+    const state = getSnapshot() as unknown as Record<string, Record<string, Record<string, unknown>>>;
+    const byType: Record<string, number> = {};
+    let contacts = 0;
+    for (const descriptor of SUPPORT_STATE_TYPES) {
+        const entities = Object.values(state[descriptor.location.key] ?? {});
+        if (entities.length > 0) byType[descriptor.id] = entities.length;
+        for (const entity of entities) {
+            for (const field of descriptor.contactFields) if (entity[field]) contacts++;
+        }
+    }
+    return { byType, contacts, roots: Object.keys(state.roots ?? {}).length };
+}
+
+function writeBinaryStl(path: string, positions: Float32Array): void {
+    const triangles = positions.length / 9;
+    const buffer = Buffer.alloc(84 + triangles * 50);
+    buffer.write('nakomis-dragonfruit-mcp autosupport-slice', 0, 'ascii');
+    buffer.writeUInt32LE(triangles, 80);
+    let offset = 84;
+    for (let t = 0; t < triangles; t++) {
+        offset += 12; // zero normal: readers recompute it from the winding
+        for (let k = 0; k < 9; k++) {
+            buffer.writeFloatLE(positions[t * 9 + k], offset);
+            offset += 4;
+        }
+        offset += 2;
+    }
+    writeFileSync(path, buffer);
+}
+
+function maxZ(positions: Float32Array): number {
+    let top = 0;
+    for (let i = 2; i < positions.length; i += 3) if (positions[i] > top) top = positions[i];
+    return top;
+}
+
+async function main(): Promise<void> {
+    const options = parseArgs(process.argv.slice(2));
+    const startupMs = Math.round(process.uptime() * 1000);
+    quietPipelineLogs(options.verbose);
+    const timings: Record<string, number> = { startup_ms: startupMs };
+    const warnings: string[] = [];
+    const time = async <T>(label: string, run: () => T | Promise<T>): Promise<T> => {
+        process.stderr.write(`autosupport-slice: ${label.replace(/_ms$/, '')}...\n`);
+        const started = performance.now();
+        try {
+            return await run();
+        } finally {
+            timings[label] = Math.round(performance.now() - started);
+        }
+    };
+
+    // The printer first: its material's layer height drives the island scan, and
+    // the support export reads the *active* profiles for tip penetration (with
+    // none active it silently uses 0).
+    type SliceJobModule = typeof import('../vendor/dragonfruit/scripts/cli/sceneSliceJob');
+    const sliceJob = await time('profiles_ms', () => importDragonFruitScript<SliceJobModule>('scripts/cli/sceneSliceJob.ts'));
+    const job = sliceJob.resolveSceneSliceJob({ printer: { presetId: options.printer } });
+    if (!job.printer || !job.material) throw new Error(`printer preset '${options.printer}' did not resolve`);
+    if (job.printer.presetId !== options.printer && job.printer.officialPresetId !== options.printer) {
+        throw new Error(`'${options.printer}' is not a known printer preset`);
+    }
+    // The printer decides the format, whatever the file is called: without
+    // --out the print goes beside the STL, named for it.
+    const format = `.${job.printer.display.outputFormat.replace(/^\./, '').toLowerCase()}`;
+    if (!options.out) options.out = join(dirname(options.stl), `${basename(options.stl).replace(/\.stl$/i, '')}-supported${format}`);
+    if (options.slice && extname(options.out).toLowerCase() !== format) {
+        warnings.push(`${options.out} will hold a ${format} print: the printer preset decides the format, not the file name`);
+    }
+    setActivePrinterProfile(job.printer.id);
+    setActiveMaterialProfile(job.material.id);
+    const layerHeightMm = job.material.layerHeightMm;
+
+    // Load and place the model.
+    const geometry = await time('load_ms', () => {
+        const bytes = readFileSync(options.stl);
+        const loaded = new STLLoader().parse(
+            bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
+        );
+        loaded.deleteAttribute('normal');
+        return loaded;
+    });
+    const plateShift = placeOnPlate(geometry, options.liftMm);
+    geometry.computeVertexNormals();
+    accelerateGeometry(geometry);
+    const box = geometry.boundingBox!;
+    const build = job.printer.buildVolumeMm;
+    if (box.max.x - box.min.x > build.width || box.max.y - box.min.y > build.depth) {
+        warnings.push(`the model (${(box.max.x - box.min.x).toFixed(1)} x ${(box.max.y - box.min.y).toFixed(1)} mm) is larger than the plate (${build.width} x ${build.depth} mm)`);
+    }
+    if (options.liftMm === 0) {
+        warnings.push('lift 0: the model sits on the plate, so only overhangs above its base are supported');
+    }
+
+    // Islands, the voxel family first, as the bench detects them.
+    type IslandScanModule = typeof import('../vendor/dragonfruit/scripts/bench-island-scan');
+    const islandScan = await importDragonFruitScript<IslandScanModule>('scripts/bench-island-scan.ts');
+    await deferWorkerMessages(islandScan.installInProcessWorkers);
+    const voxelIslands = await time('islands_ms', () => islandScan.detectIslands(geometry, {
+        ...islandScan.DEFAULT_DETECT_OPTIONS,
+        pxMm: options.pxMm,
+        layerHeightMm,
+    }));
+
+    // Then the overhang family, which is what puts a density grid under shallow
+    // slopes (the voxel detector only sees surfaces flatter than ~11°). The app
+    // runs it as a Tauri command; we run the same Rust through our own tool.
+    // Mesh minima (the third family) are not available headless.
+    const selfSupportAngleDeg = options.settings.overhangSelfSupportAngleDeg
+        ?? createDefaultSettings().autoSupport.overhangSelfSupportAngleDeg;
+    let overhangIslands: DetectedIsland[] = [];
+    if (options.tools) {
+        overhangIslands = await time('overhangs_ms', () => scanOverhangs(
+            options.tools!,
+            geometry.getAttribute('position').array as Float32Array,
+            selfSupportAngleDeg,
+            options.raft !== 'off',
+        ));
+    } else {
+        warnings.push('no --tools: overhang regions were not scanned, so shallow slopes get no supports');
+    }
+    const classified = classifyIntersection(voxelIslands, [], { xyToleranceMm: 0.5, zBandMm: layerHeightMm });
+    const islands = mergeOverhangRegions(classified.islands, overhangIslands);
+
+    // Placement, through the worker's entry point, then the app's commit.
+    resetStore();
+    resetKickstandsInState();
+    clearHistory();
+    const disposeHistory = registerSupportHistoryHandlers();
+    initializeBVH();
+    const appSettings = createDefaultSettings();
+    const autoDefaults = appSettings.autoSupport;
+    const settingsOverride: Partial<AutoSupportSettings> = {
+        ...autoDefaults,
+        ...options.settings,
+    };
+    if (options.density !== 1) {
+        // Density scales supports per area: twice the density, half the area each carries.
+        settingsOverride.areaPerSupportMm2 = (settingsOverride.areaPerSupportMm2 ?? autoDefaults.areaPerSupportMm2) / options.density;
+    }
+    setSettings(appSettings);
+    const modelId = 'model';
+    const mesh = new THREE.Mesh(geometry);
+    mesh.updateMatrixWorld(true);
+    setModelMesh(modelId, mesh);
+
+    const plan = await time('auto_place_ms', () => runAutoPlaceRequest({
+        modelId,
+        islands: islands.map(serializeIsland),
+        settingsOverride,
+        sizingBands: resolvedSizingBandsForRun(settingsOverride.sizingPreset ?? autoDefaults.sizingPreset),
+        appSettings,
+        baseState: getSnapshot(),
+        mesh: serializeModelMesh(mesh),
+        meshKey: modelMeshKey(mesh),
+    }));
+    if (!plan) throw new Error(`auto-support produced no plan (${islands.length} islands)`);
+    const result = commitAutoPlacePlan(plan);
+    disposeHistory();
+    const committed = countCommitted();
+    const analytics = plan.analytics;
+    if (islands.length === 0) warnings.push('no islands found: nothing was supported');
+    if (analytics.islandsUncovered > 0) warnings.push(`${analytics.islandsUncovered} of ${islands.length} islands have no support near them`);
+    const orphans = analytics.forestReport?.orphans?.length ?? 0;
+    if (orphans > 0) warnings.push(`${orphans} supports were culled as orphans`);
+
+    // Raft, then the export path's support and raft triangles.
+    const raftSettings: RaftSettings = { ...DEFAULT_RAFT_SETTINGS, bottomMode: options.raft };
+    setRaftSettings(raftSettings);
+    const plateClearance = [{
+        geometry: { geometry, center: new THREE.Vector3() },
+        transform: { position: new THREE.Vector3(), rotation: new THREE.Euler(), scale: new THREE.Vector3(1, 1, 1) },
+        visible: true,
+    }];
+    const supportTriangles = await time('support_mesh_ms', () => buildSupportAndRaftWorldTriangles(
+        new Set([modelId]),
+        undefined,
+        0,
+        plateClearance as never,
+    ));
+
+    // Model first, then supports: the engine splits the buffer at modelTriangleCount.
+    const modelPositions = geometry.getAttribute('position').array as Float32Array;
+    const modelTriangleCount = modelPositions.length / 9;
+    const merged = new Float32Array(modelPositions.length + supportTriangles.length * 9);
+    merged.set(modelPositions, 0);
+    let offset = modelPositions.length;
+    for (const t of supportTriangles) {
+        merged.set([t.ax, t.ay, t.az, t.bx, t.by, t.bz, t.cx, t.cy, t.cz], offset);
+        offset += 9;
+    }
+    if (supportTriangles.length === 0 && committed.roots > 0) warnings.push('supports were placed but produced no triangles');
+
+    if (options.supportedStl) writeBinaryStl(options.supportedStl, merged);
+    // The model alone, in the frame the slicer gets: for a viewer to lay beside a layer image.
+    if (options.plateStl) writeBinaryStl(options.plateStl, modelPositions);
+
+    // How a layer image maps to the plate frame, for a viewer laying the plate
+    // STL beside one: the image spans the build area centred on the origin,
+    // image rows run from +Y down, and the printer may mirror either axis.
+    const raster = resolveSliceRasterSettings({ printerProfile: job.printer, materialProfile: job.material });
+    const layerFrame = {
+        source_width_px: raster.sourceResolutionX,
+        source_height_px: raster.sourceResolutionY,
+        width_px: raster.widthPx,
+        height_px: raster.heightPx,
+        x_packing_mode: raster.xPackingMode,
+        build_width_mm: build.width,
+        build_depth_mm: build.depth,
+        layer_height_mm: raster.layerHeightMm,
+        mirror_x: raster.mirrorX,
+        mirror_y: raster.mirrorY,
+    };
+
+    let slice: Record<string, unknown> | null = null;
+    if (options.slice) {
+        const tmp = options.jobDir ?? mkdtempSync(join(tmpdir(), 'ndfm-autosupport-'));
+        if (options.jobDir) mkdirSync(tmp, { recursive: true });
+        try {
+            const positionsPath = join(tmp, 'positions.bin');
+            writeFileSync(positionsPath, Buffer.from(merged.buffer, merged.byteOffset, merged.byteLength));
+            const jobPath = join(tmp, 'job.json');
+            const run = sliceJob.buildSceneSliceRun(job, {
+                maxZMm: maxZ(merged),
+                models: [{
+                    id: modelId,
+                    name: options.stl.split('/').pop()!.replace(/\.stl$/i, ''),
+                    polygonCount: modelTriangleCount,
+                    transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0 }, scale: { x: 1, y: 1, z: 1 } },
+                }],
+            } as never, positionsPath, options.out!, jobPath);
+            // `scene slice` sends no split (it never slices supports); ours goes
+            // where the app's export puts it, after the model's own triangles.
+            const payload = JSON.parse(run.jobJson!) as Record<string, unknown>;
+            if (!('model_triangle_count' in payload)) throw new Error('the slice job no longer carries model_triangle_count');
+            payload.model_triangle_count = modelTriangleCount;
+            writeFileSync(jobPath, JSON.stringify(payload));
+            const stdout = await time('slice_ms', () => execFileSync(options.cli!, run.args, {
+                encoding: 'utf-8',
+                maxBuffer: 64 * 1024 * 1024,
+                stdio: ['ignore', 'pipe', 'inherit'],
+            }));
+            slice = JSON.parse(stdout) as Record<string, unknown>;
+        } finally {
+            if (!options.jobDir) rmSync(tmp, { recursive: true, force: true });
+        }
+    }
+
+    // The island detector's MessageChannel keeps the event loop alive.
+    disposeEventLoopChannel();
+
+    const placedByType = Object.fromEntries(Object.entries(result.placed).filter(([, count]) => count > 0));
+    console.error(`autosupport-slice: ${islands.length} islands, ${committed.contacts} contacts, ${supportTriangles.length} support/raft triangles`);
+    process.stdout.write(`${JSON.stringify({
+        stl: options.stl,
+        printer: { preset_id: options.printer, name: job.printer.name, material: job.material.name, layer_height_mm: layerHeightMm },
+        lift_mm: options.liftMm,
+        model_bbox_mm: { min: box.min.toArray(), max: box.max.toArray() },
+        // Plate frame: the engine's X/Y origin is the plate centre, Z is up from the plate.
+        plate_transform: { translate_mm: plateShift.toArray(), rotation: null, scale: 1 },
+        plate_stl: options.plateStl,
+        layer_frame: layerFrame,
+        islands: islands.length,
+        islands_by_source: islands.reduce<Record<string, number>>((counts, island) => {
+            counts[island.source] = (counts[island.source] ?? 0) + 1;
+            return counts;
+        }, {}),
+        island_list: islands.map((island) => ({
+            id: island.id,
+            source: island.source,
+            contact: [island.contact.x, island.contact.y, island.contact.z],
+            area_mm2: island.areaMm2 ?? null,
+        })),
+        status: result.status,
+        placed_by_type: placedByType,
+        entities_by_type: committed.byType,
+        contacts: committed.contacts,
+        roots: committed.roots,
+        islands_covered: analytics.islandsCovered,
+        islands_uncovered: analytics.islandsUncovered,
+        area_coverage: analytics.areaCoverage,
+        area_per_support_mm2: settingsOverride.areaPerSupportMm2,
+        raft: options.raft,
+        model_triangles: modelTriangleCount,
+        support_triangles: supportTriangles.length,
+        total_triangles: merged.length / 9,
+        supported_stl: options.supportedStl,
+        output: options.slice ? options.out : null,
+        slice,
+        timings_ms: timings,
+        warnings,
+    })}\n`);
+}
+
+main().catch((error) => {
+    process.stderr.write(`autosupport-slice: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+    process.exitCode = 1;
+});

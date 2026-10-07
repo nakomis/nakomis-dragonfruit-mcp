@@ -100,12 +100,18 @@ def run_ts(
 
     By default that is `dragonfruit-ts-cli`. `script` may also be one of our own
     scripts (an absolute path): it runs with DragonFruit's tsconfig, so imports
-    of DragonFruit's `src/` (including its `@/` alias) resolve. Upstream's
+    of DragonFruit's `src/` (including its `@/` alias) resolve, and with
+    `NODE_PATH` at DragonFruit's node_modules, so a script outside the checkout
+    can import the same `three` (and the rest) DragonFruit's own modules do. Upstream's
     stderr chatter (such as the SettingsStore localStorage trace) is left in
     `stderr` and never treated as a failure.
     """
     df = dragonfruit_dir()
-    env = {**os.environ, "TSX_TSCONFIG_PATH": str(df / "tsconfig.json")}
+    env = {
+        **os.environ,
+        "TSX_TSCONFIG_PATH": str(df / "tsconfig.json"),
+        "NODE_PATH": str(df / "node_modules"),
+    }
     return _run_command(
         find_tsx(),
         f"tsx {Path(script).name}",

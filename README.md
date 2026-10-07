@@ -47,7 +47,15 @@ Early days. The repository is scaffolded; the tools are being built. Planned too
   hole through each cavity's floor and a vent through its roof so it can drain
   (always follow `hollow` with `drill_holes`)
 
-Supports are out of scope: DragonFruit builds them by hand in its interface.
+- `auto_support_and_slice`: DragonFruit's own auto-supports and raft, sliced
+  into the print (a spike, NDFM-8; see below)
+
+Supports: upstream has no headless command for them, so `ts/autosupport-slice.ts`
+runs the app's own placement and support export under Node, and
+`dragonfruit-mcp-tools overhangs` runs the app's overhang scan (a Tauri command
+upstream). The third island family the app uses, mesh minima, isn't run, and
+the overhang scan isn't fully deterministic upstream, so support counts can
+differ slightly from the GUI's and between runs. Check a print before trusting it.
 
 ## Architecture Diagram
 
@@ -59,7 +67,8 @@ Supports are out of scope: DragonFruit builds them by hand in its interface.
 |---|---|
 | `nakomis_dragonfruit_mcp/` | The MCP server (Python, FastMCP) |
 | `tests/` | pytest; integration tests run only when `bin/` is built |
-| `rust/dragonfruit-mcp-tools/` | Our Rust tool (hollowing, hole punching), linking DragonFruit's `dragonfruit-mesh-repair` |
+| `rust/dragonfruit-mcp-tools/` | Our Rust tool (hollowing, hole punching, overhang scan), linking DragonFruit's `dragonfruit-mesh-repair` |
+| `ts/` | Our TypeScript scripts, run under DragonFruit's tsx against its own modules (auto-supports) |
 | `vendor/dragonfruit/` | DragonFruit, as a submodule pinned to upstream `dev` |
 | `scripts/build.sh` | Builds `bin/dragonfruit-cli` and `bin/dragonfruit-mcp-tools`, and installs DragonFruit's Node dependencies for `dragonfruit-ts-cli` |
 | `docs/architecture/` | Architecture diagram source (`.drawio`) and generated SVG |

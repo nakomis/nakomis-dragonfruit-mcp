@@ -31,6 +31,11 @@ echo "--- Installing DragonFruit's Node dependencies ---"
 echo "--- Generating DragonFruit plugin registry ---"
 (cd "$DF" && npm run generate:plugin-registry && npm run generate:builtin-simple-plugins)
 
+# Auto-supports (ts/autosupport-slice.ts) load every support type through
+# another generated, gitignored module.
+echo "--- Generating DragonFruit support type registrations ---"
+(cd "$DF" && npm run generate:support-registrations && npm run generate:support-renderers)
+
 echo "--- Building dragonfruit-cli ---"
 cargo build --release --manifest-path "$DF/rust/dragonfruit-cli/Cargo.toml"
 

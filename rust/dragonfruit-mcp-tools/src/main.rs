@@ -1,9 +1,17 @@
 //! Mesh operations that `dragonfruit-cli` doesn't expose: hollowing and hole
 //! punching (NDFM-6), both calling DragonFruit's mesh-repair crate the way its
 //! desktop app does.
+//!
+//! `overhangs` runs DragonFruit's mesh-normal overhang classifier (NDFM-8),
+//! which upstream only exposes as a Tauri command; see build.rs.
 
 mod drain;
 mod ops;
+
+#[allow(dead_code, clippy::all)]
+mod overhang {
+    include!(concat!(env!("OUT_DIR"), "/overhang.rs"));
+}
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -84,6 +92,21 @@ enum Command {
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Classify overhang regions on a world-space mesh, as the app's
+    /// `scan_overhangs` does, and print the scan as JSON.
+    Overhangs {
+        /// A binary STL, or a positions.bin of f32 triangle vertices.
+        input: std::path::PathBuf,
+        /// Surface angle from horizontal at and below which a face needs support.
+        #[arg(long, default_value_t = 45.0)]
+        angle: f32,
+        /// Footprint mask resolution (the app uses 0.25 mm).
+        #[arg(long, default_value_t = 0.25)]
+        px_mm: f32,
+        /// Whether the print has a raft (only changes the stability report).
+        #[arg(long)]
+        has_raft: bool,
     },
 }
 
@@ -360,11 +383,61 @@ fn main() {
             radius_mm,
             json,
         ),
+        Command::Overhangs {
+            input,
+            angle,
+            px_mm,
+            has_raft,
+        } => overhangs_cmd(&input, angle, px_mm, has_raft),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+/// Classify overhang regions as the app's `scan_overhangs` does; print the scan as JSON.
+fn overhangs_cmd(input: &Path, angle: f32, px_mm: f32, has_raft: bool) -> Result<(), String> {
+    let positions = read_positions(input)?;
+    let (regions, stability) =
+        overhang::overhang_and_stability_from_soup(&positions, angle, px_mm, has_raft);
+    let scan = overhang::OverhangScan { regions, stability };
+    let text = serde_json::to_string(&scan).map_err(|e| format!("serialise overhang scan: {e}"))?;
+    println!("{text}");
+    Ok(())
+}
+
+/// Flat `[x, y, z, ...]` triangle vertices from a binary STL or a positions.bin.
+fn read_positions(path: &std::path::Path) -> Result<Vec<f32>, String> {
+    let data = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let floats = |bytes: &[u8]| -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect()
+    };
+    if path.extension().is_some_and(|e| e == "bin") {
+        if data.len() % 36 != 0 {
+            return Err(format!("{}: not whole triangles", path.display()));
+        }
+        return Ok(floats(&data));
+    }
+    if data.len() < 84 {
+        return Err(format!("{}: too small for a binary STL", path.display()));
+    }
+    let count = u32::from_le_bytes([data[80], data[81], data[82], data[83]]) as usize;
+    if data.len() < 84 + count * 50 {
+        return Err(format!(
+            "{}: not a binary STL (ASCII STL is not supported)",
+            path.display()
+        ));
+    }
+    let mut out = Vec::with_capacity(count * 9);
+    for t in 0..count {
+        let start = 84 + t * 50 + 12;
+        out.extend(floats(&data[start..start + 36]));
+    }
+    Ok(out)
 }
 
 /// Touch a mesh-repair type so the crate is genuinely linked, not just declared.
