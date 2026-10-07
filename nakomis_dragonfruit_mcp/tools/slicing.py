@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import json
 import tempfile
+from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ AA_PRESETS = ("sharp", "balanced", "smooth", "raw")
 
 SUPPORTS_WARNING = (
     "Supports are NOT included: DragonFruit's `scene slice` does not slice supports yet. "
-    "Slice only what can print without them."
+    "Slice only what can print without them, or use auto_support_and_slice."
 )
 
 
@@ -152,7 +153,7 @@ def _preset_id(printer: Printer) -> str | None:
     return section.get("presetId")
 
 
-def _hook(printer: Printer, name: str, fn, *args):
+def call_hook(printer: Printer, name: str, fn, *args):
     """Call a printer plugin's hook; its failure is reported as the plugin's, with context."""
     try:
         return fn(*args)
@@ -259,41 +260,23 @@ def run_slice(
             f"{cli.ts_cli_rust_binary()} is missing: dragonfruit-ts-cli looks for dragonfruit-cli "
             "there. Run scripts/build.sh, which links it to bin/dragonfruit-cli."
         )
-    registry = loader.discover()
-    chosen, origin = loader.get(registry, printer)
-    warnings = list(registry.warnings)
-    warnings += _hook(chosen, "warnings", chosen.warnings)
-
-    def default_out(fmt: str | None) -> Path:
-        suffix = chosen.output_format(fmt) or ".bin"
-        return stl.with_name(f"{stl.stem}-{chosen.name}{suffix}")
-
-    requested_out = Path(out_path).expanduser().resolve() if out_path else None
-    first_out = requested_out or default_out(format)
-    job = _hook(
-        chosen,
-        "prepare",
-        chosen.prepare,
-        SliceJob(
-            stl_path=stl,
-            out_path=first_out,
-            format=format,
-            layer_height=layer_height,
-            material=material_path,
-            aa_preset=aa_preset,
-            options=dict(options or {}),
-        ),
+    plan = plan_slice(
+        stl,
+        printer=printer,
+        format=format,
+        layer_height=layer_height,
+        material_path=material_path,
+        aa_preset=aa_preset,
+        out_path=out_path,
+        options=options,
     )
-    fmt = job.format or chosen.default_format  # a changed format gets a custom profile
-    suffix = chosen.output_format(job.format) or ".bin"
-    if requested_out is None and job.out_path == first_out:
-        job.out_path = default_out(job.format)  # prepare() may have changed the format
-    profile = chosen.effective_profile(fmt)
-    if job.out_path.suffix.lower() != suffix:
-        warnings.append(
-            f"out_path ends {job.out_path.suffix!r} but the printer writes {suffix!r}; "
-            "the file is written in the printer's format regardless"
-        )
+    chosen, origin, job, profile, warnings = (
+        plan.printer,
+        plan.origin,
+        plan.job,
+        plan.profile,
+        plan.warnings,
+    )
     try:
         lo, hi = stl_io.bbox(job.stl_path)
     except stl_io.StlError as e:
@@ -332,7 +315,7 @@ def run_slice(
             args += ["--layer-height", f"{job.layer_height:g}"]
         if job.aa_preset:
             args += ["--aa-preset", job.aa_preset]
-        args += _hook(chosen, "extra_slice_args", chosen.extra_slice_args, job)
+        args += call_hook(chosen, "extra_slice_args", chosen.extra_slice_args, job)
         result = cli.run_ts(args, parse_json=True)
 
     data = _check_slice_output(result)
@@ -340,7 +323,7 @@ def run_slice(
     if not out_file.is_file():
         raise cli.CliError(f"the slicer reported success but {out_file} does not exist")
     run = SliceRun(profile=profile, cli_args=args, result=data)
-    final = _hook(chosen, "postprocess", chosen.postprocess, out_file, job, run)
+    final = call_hook(chosen, "postprocess", chosen.postprocess, out_file, job, run)
     warnings.append(SUPPORTS_WARNING)
     plate_path = plate_bbox = None
     if export_plate_stl:
@@ -352,25 +335,15 @@ def run_slice(
         else:
             plate_path = str(plate)
             plate_bbox = {"min": placed_lo, "max": placed_hi}
-    sidecar = final.with_name(final.name + ".ndfm.json")
-    sidecar.write_text(
-        json.dumps(
-            {
-                "tool": "nakomis-dragonfruit-mcp",
-                "tool_version": _version(),
-                "printer": chosen.name,
-                "profile": {**presets.summary(profile), "basePresetId": _preset_id(chosen)},
-                "layer_height_mm": round(data["layer_height_mm"], 4),
-                "layers": data["layers"],
-                "format": data["format"],
-                "resolution_px": data["resolution_px"],
-                "place_on_plate": place_on_plate,
-                "plate_offset_mm": offset,
-                "plate_stl": {"path": plate_path, "bbox_mm": plate_bbox} if plate_path else None,
-                "supports_included": False,
-            },
-            indent=2,
-        )
+    sidecar = write_sidecar(
+        final,
+        chosen,
+        profile,
+        data,
+        place_on_plate=place_on_plate,
+        offset=offset,
+        plate_path=plate_path,
+        plate_bbox=plate_bbox,
     )
     return SliceResult(
         output_path=str(final),
@@ -394,6 +367,110 @@ def run_slice(
         plate_bbox_mm=plate_bbox,
         warnings=warnings,
     )
+
+
+@dataclass
+class SlicePlan:
+    """The printer, profile and job a slice will run with, before any slicing."""
+
+    printer: Printer
+    origin: str
+    job: SliceJob
+    profile: dict[str, Any]
+    suffix: str
+    warnings: list[str] = field(default_factory=list)
+
+
+def plan_slice(
+    stl: Path,
+    *,
+    printer: str | None,
+    format: str | None,  # noqa: A002
+    layer_height: float | None,
+    material_path: Path | None,
+    aa_preset: str | None,
+    out_path: str | None,
+    options: dict[str, Any] | None,
+    name_tag: str = "",
+) -> SlicePlan:
+    """Choose the printer, run its `prepare` hook and settle the profile and output path.
+
+    Shared by `slice` and `auto_support_and_slice`. The default output is
+    `<stl stem>-<printer><name_tag><ext>` beside the STL.
+    """
+    registry = loader.discover()
+    chosen, origin = loader.get(registry, printer)
+    warnings = list(registry.warnings)
+    warnings += call_hook(chosen, "warnings", chosen.warnings)
+
+    def default_out(fmt: str | None) -> Path:
+        suffix = chosen.output_format(fmt) or ".bin"
+        return stl.with_name(f"{stl.stem}-{chosen.name}{name_tag}{suffix}")
+
+    requested_out = Path(out_path).expanduser().resolve() if out_path else None
+    first_out = requested_out or default_out(format)
+    job = call_hook(
+        chosen,
+        "prepare",
+        chosen.prepare,
+        SliceJob(
+            stl_path=stl,
+            out_path=first_out,
+            format=format,
+            layer_height=layer_height,
+            material=material_path,
+            aa_preset=aa_preset,
+            options=dict(options or {}),
+        ),
+    )
+    fmt = job.format or chosen.default_format  # a changed format gets a custom profile
+    suffix = chosen.output_format(job.format) or ".bin"
+    if requested_out is None and job.out_path == first_out:
+        job.out_path = default_out(job.format)  # prepare() may have changed the format
+    profile = chosen.effective_profile(fmt)
+    if job.out_path.suffix.lower() != suffix:
+        warnings.append(
+            f"out_path ends {job.out_path.suffix!r} but the printer writes {suffix!r}; "
+            "the file is written in the printer's format regardless"
+        )
+    return SlicePlan(chosen, origin, job, profile, suffix, warnings)
+
+
+def write_sidecar(
+    final: Path,
+    printer: Printer,
+    profile: dict[str, Any],
+    data: dict[str, Any],
+    *,
+    place_on_plate: bool,
+    offset: list[float],
+    plate_path: str | None,
+    plate_bbox: dict[str, list[float]] | None,
+    supports: dict[str, Any] | None = None,
+) -> Path:
+    """`<print file>.ndfm.json`: how the file was made (inspect_print reads mirroring here)."""
+    sidecar = final.with_name(final.name + ".ndfm.json")
+    sidecar.write_text(
+        json.dumps(
+            {
+                "tool": "nakomis-dragonfruit-mcp",
+                "tool_version": _version(),
+                "printer": printer.name,
+                "profile": {**presets.summary(profile), "basePresetId": _preset_id(printer)},
+                "layer_height_mm": round(data["layer_height_mm"], 4),
+                "layers": data["layers"],
+                "format": data["format"],
+                "resolution_px": data["resolution_px"],
+                "place_on_plate": place_on_plate,
+                "plate_offset_mm": offset,
+                "plate_stl": {"path": plate_path, "bbox_mm": plate_bbox} if plate_path else None,
+                "supports_included": supports is not None,
+                **({"supports": supports} if supports is not None else {}),
+            },
+            indent=2,
+        )
+    )
+    return sidecar
 
 
 def _version() -> str:

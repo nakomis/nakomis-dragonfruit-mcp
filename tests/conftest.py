@@ -14,6 +14,23 @@ from nakomis_dragonfruit_mcp.printers import loader
 # file and prints the JSON the real command does.
 FAKE_TSX = r"""#!/bin/sh
 echo "$*" >> "$FAKE_LOG"
+case "$1" in
+*autosupport-slice.ts)
+  # Our own script: keep the profile and material it was given, write the print
+  # and print the summary from $FAKE_SUMMARY with the output path filled in.
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out="$2" ;;
+      --printer-json) cp "$2" "$FAKE_LOG.printer" ;;
+      --material) cp "$2" "$FAKE_LOG.material" ;;
+    esac
+    shift
+  done
+  printf data > "$out"
+  sed "s#__OUT__#$out#g" "$FAKE_SUMMARY"
+  exit 0
+  ;;
+esac
 case "$2 $3" in
 "scene list-models") printf '{"models": [{"id": "m1"}]}' ;;
 "scene slice")
