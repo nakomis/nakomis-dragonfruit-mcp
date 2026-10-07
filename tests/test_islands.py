@@ -1,5 +1,6 @@
 import json
 import stat
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -93,7 +94,8 @@ def test_find_islands_positions_and_units(bin_dir, tmp_path, stl):
     assert (only.layer, only.z_mm) == (300, pytest.approx(15.0))
     assert only.x_mm == pytest.approx(2.0)
     assert only.y_mm == pytest.approx(-3.0)
-    assert only.area_mm2 == 4.0  # first-layer area, not the merged one
+    assert only.first_area_mm2 == 4.0  # first-layer area, not the merged one
+    assert only.footprint_mm2 == 4.0
     assert result.bbox_max == [5.0, 5.0, 17.0]
     assert result.warnings == []
 
@@ -107,7 +109,7 @@ def test_find_islands_passes_parameters(bin_dir, tmp_path, stl):
     assert args[args.index("--px-mm") + 1] == "0.05"
     assert args[args.index("--layer-height") + 1] == "0.025"
     assert args[args.index("--buffer") + 1] == "0.3"
-    assert "--json" in args
+    assert "--json" not in args
 
 
 def test_find_islands_truncates_to_largest(bin_dir, tmp_path, stl):
@@ -116,15 +118,22 @@ def test_find_islands_truncates_to_largest(bin_dir, tmp_path, stl):
     result = islands.find_islands(str(stl), max_islands=2)
     assert result.truncated
     assert result.islands_total == 5
-    assert [i.area_mm2 for i in result.islands] == [5.0, 4.0]
+    assert [i.first_area_mm2 for i in result.islands] == [5.0, 4.0]
     assert any("2 largest of 5" in w for w in result.warnings)
 
 
-def test_find_islands_min_area_filters_on_first_layer(bin_dir, tmp_path, stl):
-    found = [island(1, 10, 0.05, merged_area=500.0), island(2, 20, 2.0, cx=50.0)]
+def test_find_islands_min_area_filters_first_area_after_clustering(bin_dir, tmp_path, stl):
+    found = [
+        island(1, 10, 0.05, merged_area=500.0),  # small first layer, huge later: dropped
+        island(2, 20, 2.0, cx=50.0),
+        island(3, 21, 0.4, cx=51.0),  # clusters with 2: kept, and cannot rescue 1
+        island(4, 90, 0.3, cx=80.0),  # alone and under the minimum
+    ]
     setup(bin_dir, tmp_path, found)
     result = islands.find_islands(str(stl), min_area_mm2=1.0)
     assert [i.layer for i in result.islands] == [20]
+    assert result.islands[0].footprint_mm2 == pytest.approx(2.4)
+    assert result.total_area_mm2 == pytest.approx(2.4)
 
 
 def test_find_islands_clusters_a_climbing_tip(bin_dir, tmp_path, stl):
@@ -141,11 +150,39 @@ def test_find_islands_clusters_a_climbing_tip(bin_dir, tmp_path, stl):
     assert result.islands_total == 3
     tip = next(i for i in result.islands if i.layer == 100)
     assert tip.detections == 3
-    assert tip.area_mm2 == pytest.approx(0.05)
+    assert tip.first_area_mm2 == 0.01
+    assert tip.footprint_mm2 == pytest.approx(0.05)
     # Area-weighted: pixel x = (0.01*50 + 0.03*52 + 0.01*50) / 0.05 = 51.2
     assert tip.x_mm == pytest.approx(-5.0 + (51.2 + 0.5) * 0.1)
     unclustered = islands.find_islands(str(stl), cluster_mm=0)
     assert unclustered.islands_total == 5
+
+
+def test_find_islands_slow_ramp_does_not_chain(bin_dir, tmp_path, stl):
+    # A speck every layer, each 0.4 mm (4 px) further along. Measured from the
+    # first speck of a cluster, 0.4 and 0.8 mm join it and 1.2 mm starts another.
+    found = [island(n, 100 + n, 0.01, cx=10.0 + 4 * n) for n in range(6)]
+    setup(bin_dir, tmp_path, found)
+    result = islands.find_islands(str(stl))
+    assert sorted(i.detections for i in result.islands) == [3, 3]
+
+
+def test_find_islands_long_climb_is_bounded_in_layers(bin_dir, tmp_path, stl):
+    found = [island(n, 100 + n, 0.01, cx=50.0) for n in range(25)]
+    setup(bin_dir, tmp_path, found)
+    result = islands.find_islands(str(stl))
+    assert sorted(i.detections for i in result.islands) == [3, 11, 11]
+
+
+def test_find_islands_joins_the_nearest_cluster(bin_dir, tmp_path, stl):
+    found = [
+        island(1, 100, 0.2, cx=50.0),
+        island(2, 100, 0.2, cx=62.0),  # 1.2 mm from the first: its own cluster
+        island(3, 101, 0.01, cx=57.0),  # 0.7 mm from the first, 0.5 mm from the second
+    ]
+    setup(bin_dir, tmp_path, found)
+    by_x = sorted(islands.find_islands(str(stl)).islands, key=lambda i: i.x_mm)
+    assert [i.detections for i in by_x] == [1, 2]
 
 
 def test_find_islands_none_found(bin_dir, tmp_path, stl):
@@ -160,7 +197,7 @@ def test_find_islands_single_pixel_warning(bin_dir, tmp_path, stl):
     setup(bin_dir, tmp_path, [island(1, 10, 0.01), island(2, 40, 2.0, cx=80.0)])
     warnings = islands.find_islands(str(stl)).warnings
     assert len(warnings) == 1
-    assert "1 islands are a single pixel" in warnings[0]
+    assert "1 island is a single pixel" in warnings[0]
 
 
 def test_find_islands_outside_bbox_warning(bin_dir, tmp_path, stl):
@@ -171,21 +208,25 @@ def test_find_islands_outside_bbox_warning(bin_dir, tmp_path, stl):
 def test_find_islands_cleans_up_its_temp_dir(bin_dir, tmp_path, stl, monkeypatch):
     scratch = tmp_path / "scratch"
     scratch.mkdir()
-    monkeypatch.setenv("TMPDIR", str(scratch))
-    setup(bin_dir, tmp_path, [island(1, 10, 1.0)])
+    record = tmp_path / "args.txt"
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    setup(bin_dir, tmp_path, [island(1, 10, 1.0)], record)
     islands.find_islands(str(stl))
+    assert str(scratch) in record.read_text()  # it really did work inside scratch
     assert list(scratch.iterdir()) == []
 
 
 def test_find_islands_cleans_up_on_failure(bin_dir, tmp_path, stl, monkeypatch):
     scratch = tmp_path / "scratch"
     scratch.mkdir()
-    monkeypatch.setenv("TMPDIR", str(scratch))
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
     script = bin_dir / "dragonfruit-cli"
-    script.write_text("#!/bin/sh\necho 'not a binary STL' >&2\nexit 1\n")
+    record = tmp_path / "args.txt"
+    script.write_text(f"#!/bin/sh\necho \"$@\" > {record}\necho 'not a binary STL' >&2\nexit 1\n")
     script.chmod(0o755)
     with pytest.raises(cli.CliError, match="not a binary STL"):
         islands.find_islands(str(stl))
+    assert str(scratch) in record.read_text()
     assert list(scratch.iterdir()) == []
 
 
@@ -218,18 +259,29 @@ def test_find_islands_unexpected_result(bin_dir, tmp_path, stl):
         islands.find_islands(str(stl))
 
 
-def test_find_islands_missing_tracker_state(bin_dir, tmp_path, stl):
-    setup(bin_dir, tmp_path, [island(1, 10, 1.0)])
-    (tmp_path / "fixture" / "tracker-state" / "010.islands.json").unlink()
-    with pytest.raises(cli.CliError, match="010.islands.json"):
-        islands.find_islands(str(stl))
+@pytest.mark.parametrize("snapshot", [None, "[]", "not json", "{}"])
+def test_find_islands_skips_islands_without_a_snapshot(bin_dir, tmp_path, stl, snapshot):
+    setup(bin_dir, tmp_path, [island(1, 10, 1.0), island(2, 20, 2.0, cx=50.0)])
+    state = tmp_path / "fixture" / "tracker-state" / "010.islands.json"
+    state.unlink() if snapshot is None else state.write_text(snapshot)
+    result = islands.find_islands(str(stl))
+    assert [i.layer for i in result.islands] == [20]
+    assert result.warnings == [
+        "1 island was skipped: the scan has no tracker snapshot locating it."
+    ]
 
 
-def test_find_islands_island_missing_from_snapshot(bin_dir, tmp_path, stl):
-    setup(bin_dir, tmp_path, [island(1, 10, 1.0)])
-    (tmp_path / "fixture" / "tracker-state" / "010.islands.json").write_text("[]")
-    with pytest.raises(cli.CliError, match="island 1 missing"):
-        islands.find_islands(str(stl))
+def test_find_islands_zero_area_cluster(bin_dir, tmp_path, stl):
+    setup(bin_dir, tmp_path, [island(1, 10, 0.0, cx=40.0), island(2, 11, 0.0, cx=42.0)])
+    (only,) = islands.find_islands(str(stl)).islands
+    assert only.detections == 2
+    assert only.x_mm == pytest.approx(-5.0 + 41.5 * 0.1)
+
+
+@pytest.mark.parametrize("kwargs", [{"px_mm": float("nan")}, {"cluster_mm": float("inf")}])
+def test_find_islands_rejects_non_finite_parameters(bin_dir, stl, kwargs):
+    with pytest.raises(cli.CliError, match="finite"):
+        islands.find_islands(str(stl), **kwargs)
 
 
 def test_find_islands_schema_change_in_island_entry(bin_dir, tmp_path, stl):
