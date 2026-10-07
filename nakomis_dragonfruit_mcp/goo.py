@@ -3,14 +3,14 @@
 `dragonfruit-cli print inspect` and `slice preview-layer` only open ZIP-based
 archives, so `.goo` is read here. The layout is DragonFruit's own GOO V1.2
 writer's (big-endian; `plugins/elegoo/slicing/rust/goo_layout.rs`), cross-checked
-against Martin's Cthulhu `packages/goo` reader, which is verified on a real
-file from another slicer. Both write the same header and layer definitions.
+against an independent GOO reader verified on a real file from another slicer.
+Both use the same header and layer definitions.
 
 Layer data is `0x55`, runs, then a checksum byte (the bitwise NOT of the sum of
 the run bytes). A run starts with `[TT][SS][CCCC]`: TT 00 black, 01 grey (the
 grey value is the next byte), 11 white; SS says how many extra length bytes
 follow (0-3, big-endian, above the 4 low bits in CCCC). DragonFruit's V1.2
-encoder never writes Cthulhu's "step" runs (TT 10), so those are refused.
+encoder never writes the format's "step" runs (TT 10), so those are refused.
 """
 
 from __future__ import annotations
