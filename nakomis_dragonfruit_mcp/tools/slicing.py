@@ -10,6 +10,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from nakomis_dragonfruit_mcp import cli
+from nakomis_dragonfruit_mcp import stl as stl_io
 from nakomis_dragonfruit_mcp.app import ToolResult, mcp
 from nakomis_dragonfruit_mcp.printers import SliceJob, SliceRun, loader
 
@@ -65,6 +66,16 @@ class SliceResult(ToolResult):
     slice_seconds: float | None
     extra_files: list[str] = Field(
         default_factory=list, description="Written by the printer driver"
+    )
+    plate_offset_mm: list[float] = Field(
+        description="Translation applied to the STL to place it: centre of its XY bounding box "
+        "on the plate centre (0, 0) and its lowest point on the plate (z = 0)"
+    )
+    plate_stl_path: str | None = Field(
+        default=None, description="With export_plate_stl: the model as sliced, without supports"
+    )
+    plate_bbox_mm: dict[str, list[float]] | None = Field(
+        default=None, description="min and max corners of the plate STL, in plate coordinates"
     )
 
 
@@ -128,6 +139,7 @@ def slice(  # noqa: A001  (the tool's name)
     aa_preset: str | None = None,
     out_path: str | None = None,
     options: dict[str, Any] | None = None,
+    export_plate_stl: bool = False,
 ) -> SliceResult:
     """Slice an STL to the printer's own print file, as DragonFruit's app would.
 
@@ -149,6 +161,13 @@ def slice(  # noqa: A001  (the tool's name)
             `<name>-<printer><ext>`.
         options: Free-form options for the printer's own driver; ignored by
             printers that take none.
+        export_plate_stl: Also write the model exactly as it sits on the build
+            plate for this slice (binary STL, mm, Z up, origin at the plate
+            centre, no supports), as `<print file>.plate.stl`. It lines up with
+            the sliced layers. The offset applied and the bounding box are reported.
+
+    The model is placed before slicing: the centre of its XY bounding box on the
+    plate centre and its lowest point at z = 0.
     """
     stl = Path(stl_path).expanduser().resolve()
     if not stl.is_file():
@@ -199,6 +218,11 @@ def slice(  # noqa: A001  (the tool's name)
             f"out_path ends {job.out_path.suffix!r} but the printer writes {suffix!r}; "
             "the file is written in the printer's format regardless"
         )
+    try:
+        lo, hi = stl_io.bbox(job.stl_path)
+    except stl_io.StlError as e:
+        raise cli.CliError(str(e)) from e
+    offset = [-(lo[0] + hi[0]) / 2, -(lo[1] + hi[1]) / 2, -lo[2]]
     job.out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="ndfm-slice-") as tmp:
@@ -207,8 +231,10 @@ def slice(  # noqa: A001  (the tool's name)
         profile_file.write_text(json.dumps(profile))
         scene = work / "scene.voxl"
         cli.run_ts(["scene", "create", "--o", str(scene)])
+        model_id = _add_model(scene, job.stl_path, stl.stem)
         cli.run_ts(
-            ["scene", "add-model", str(scene), "--mesh", str(job.stl_path), "--name", stl.stem]
+            ["scene", "transform-model", str(scene), "--id", model_id]
+            + ["--position", ",".join(repr(v) for v in offset)]
         )
         args = [
             "scene", "slice", str(scene),
@@ -233,6 +259,15 @@ def slice(  # noqa: A001  (the tool's name)
     run = SliceRun(profile=profile, cli_args=args, result=data)
     final = chosen.postprocess(out_file, job, run)
     warnings.append(SUPPORTS_WARNING)
+    plate_path = plate_bbox = None
+    if export_plate_stl:
+        plate = final.with_name(final.name + ".plate.stl")
+        stl_io.write_translated(job.stl_path, plate, (offset[0], offset[1], offset[2]))
+        plate_path = str(plate)
+        plate_bbox = {
+            "min": [lo[i] + offset[i] for i in range(3)],
+            "max": [hi[i] + offset[i] for i in range(3)],
+        }
     return SliceResult(
         output_path=str(final),
         format=data["format"],
@@ -249,6 +284,9 @@ def slice(  # noqa: A001  (the tool's name)
         anti_aliasing=data.get("anti_aliasing"),
         slice_seconds=data.get("wall_s"),
         extra_files=[str(p) for p in run.extra_files],
+        plate_offset_mm=offset,
+        plate_stl_path=plate_path,
+        plate_bbox_mm=plate_bbox,
         warnings=warnings,
     )
 
@@ -260,3 +298,13 @@ def _check_slice_output(result: cli.CliResult) -> dict[str, Any]:
     if not isinstance(data, dict) or not needed <= data.keys():
         raise cli.CliError(f"unexpected `scene slice --json` output: {result.stdout[:200]!r}")
     return data
+
+
+def _add_model(scene: Path, stl: Path, name: str) -> str:
+    """Add the STL to the scene and return its model id."""
+    cli.run_ts(["scene", "add-model", str(scene), "--mesh", str(stl), "--name", name])
+    models = cli.run_ts(["scene", "list-models", str(scene), "--json"], parse_json=True).data
+    try:
+        return models["models"][0]["id"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise cli.CliError("unexpected `scene list-models --json` output") from e

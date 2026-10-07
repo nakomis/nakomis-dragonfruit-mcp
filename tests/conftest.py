@@ -2,6 +2,7 @@
 
 import json
 import stat
+import struct
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from nakomis_dragonfruit_mcp.printers import loader
 FAKE_TSX = r"""#!/bin/sh
 echo "$*" >> "$FAKE_LOG"
 case "$2 $3" in
+"scene list-models") printf '{"models": [{"id": "m1"}]}' ;;
 "scene slice")
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -102,8 +104,18 @@ def isolated_config(tmp_path, monkeypatch):
     monkeypatch.delenv("NDFM_PRINTERS_DIR", raising=False)
 
 
+def write_stl(path, triangles):
+    """A binary STL from [(v0, v1, v2), ...], each vertex an (x, y, z)."""
+    body = b"".join(struct.pack("<12fH", 0, 0, 1, *sum(t, ()), 0) for t in triangles)
+    path.write_bytes(b"\0" * 80 + struct.pack("<I", len(triangles)) + body)
+
+
 @pytest.fixture
 def stl(tmp_path):
+    """Two triangles spanning x 10..14, y 20..28, z 5..9: off-centre and off the plate."""
     path = tmp_path / "model.stl"
-    path.write_bytes(b"\0" * 84)
+    write_stl(
+        path,
+        [((10, 20, 5), (14, 20, 5), (14, 28, 9)), ((10, 20, 5), (14, 28, 9), (10, 28, 9))],
+    )
     return path

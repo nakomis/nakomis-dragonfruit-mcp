@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from nakomis_dragonfruit_mcp import cli
+from nakomis_dragonfruit_mcp import stl as stl_io
 from nakomis_dragonfruit_mcp.tools import slicing
 
 TEST_MODEL = Path(
@@ -57,9 +58,46 @@ def test_slice_default_printer(fake_df, stl):
     assert fake_df.printer_json() == {"presetId": "elegoo-mars-5-ultra-ctb"}
     assert any("Supports are NOT included" in w for w in result.warnings)
     assert result.supports_included is False
-    # create, add-model, slice
-    assert len(fake_df.log.read_text().splitlines()) == 3
+    # create, add-model, list-models, transform-model, slice
+    assert len(fake_df.log.read_text().splitlines()) == 5
     assert "--mesh-dir" in result.cli_args and "--layer-height" not in result.cli_args
+
+
+def test_slice_places_model_on_plate_and_exports_plate_stl(fake_df, stl):
+    result = slicing.slice(str(stl), export_plate_stl=True)
+    assert result.plate_offset_mm == [-12.0, -24.0, -5.0]
+    assert any(
+        "transform-model" in line and "--position -12.0,-24.0,-5.0" in line
+        for line in fake_df.log.read_text().splitlines()
+    )
+    assert result.plate_stl_path == result.output_path + ".plate.stl"
+    assert result.plate_bbox_mm == {"min": [-2.0, -4.0, 0.0], "max": [2.0, 4.0, 4.0]}
+    lo, hi = stl_io.bbox(Path(result.plate_stl_path))
+    assert (lo, hi) == ([-2.0, -4.0, 0.0], [2.0, 4.0, 4.0])
+
+
+def test_slice_without_export_has_no_plate_stl(fake_df, stl):
+    result = slicing.slice(str(stl))
+    assert result.plate_stl_path is None and result.plate_bbox_mm is None
+    assert not Path(result.output_path + ".plate.stl").exists()
+
+
+def test_slice_rejects_ascii_stl(fake_df, tmp_path):
+    ascii_stl = tmp_path / "a.stl"
+    ascii_stl.write_text("solid x\n" + "facet normal 0 0 1\n" * 10 + "endsolid x\n")
+    with pytest.raises(cli.CliError, match="binary STL"):
+        slicing.slice(str(ascii_stl))
+
+
+def test_stl_errors(tmp_path):
+    tiny = tmp_path / "tiny.stl"
+    tiny.write_bytes(b"x")
+    with pytest.raises(stl_io.StlError, match="too small"):
+        stl_io.bbox(tiny)
+    empty = tmp_path / "empty.stl"
+    empty.write_bytes(b"\0" * 84)
+    with pytest.raises(stl_io.StlError, match="no triangles"):
+        stl_io.bbox(empty)
 
 
 def test_slice_passes_options_through(fake_df, stl, tmp_path):
@@ -189,8 +227,10 @@ def test_slice_unexpected_output_schema(fake_df, stl):
 def test_slice_output_missing(fake_df, stl):
     tsx = fake_df.dir / "node_modules" / ".bin" / "tsx"
     tsx.write_text(
-        '#!/bin/sh\necho \'{"output": "/nonexistent/x", "format": ".ctb", "layers": 1,'
-        ' "layer_height_mm": 0.05, "resolution_px": [1, 1]}\'\n'
+        "#!/bin/sh\n"
+        """if [ "$3" = list-models ]; then echo '{"models": [{"id": "m1"}]}'; fi\n"""
+        """if [ "$3" = slice ]; then echo '{"output": "/nonexistent/x", "format": ".ctb", """
+        """"layers": 1, "layer_height_mm": 0.05, "resolution_px": [1, 1]}'; fi\n"""
     )
     with pytest.raises(cli.CliError, match="does not exist"):
         slicing.slice(str(stl))
@@ -234,8 +274,11 @@ def real_model(tmp_path):
 )
 def test_real_slice_of_test_model(real_model, monkeypatch, printer, format, expected):
     # Undo the isolation fixture's HOME change only where the real binaries need nothing from it.
-    result = slicing.slice(str(real_model), printer=printer, format=format)
+    result = slicing.slice(str(real_model), printer=printer, format=format, export_plate_stl=True)
     assert result.format == expected
     assert result.layers == 1405
     assert result.layer_height_mm == 0.05
     assert Path(result.output_path).stat().st_size > 1_000_000
+    # The test model is already centred on x/y and sits on z = 0.
+    assert result.plate_bbox_mm["max"][2] == pytest.approx(70.2033, abs=1e-3)
+    assert result.plate_offset_mm[2] == 0 and abs(result.plate_offset_mm[0]) < 0.01
