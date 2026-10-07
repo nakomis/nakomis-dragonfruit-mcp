@@ -7,6 +7,9 @@ description = "Hollowing and hole punching for nakomis-dragonfruit-mcp, built on
 publish = false
 
 [dependencies]
-dragonfruit-mesh-repair = { path = "../../vendor/dragonfruit/rust/dragonfruit-mesh-repair" }
+# The desktop app builds this crate with `manifold`: exact boolean hole punching and a
+# different hollowing path. Without it the punch is voxelised and the result not watertight.
+dragonfruit-mesh-repair = { path = "../../vendor/dragonfruit/rust/dragonfruit-mesh-repair", features = ["manifold"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }

@@ -30,7 +30,7 @@ jobs:
       - run: uv run pytest
 
   rust:
-    name: Rust (cargo check)
+    name: Rust (cargo test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -41,7 +41,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust/dragonfruit-mcp-tools -> ../../target
-      - run: cargo check --locked --manifest-path rust/dragonfruit-mcp-tools/Cargo.toml
+      # Builds (and so type-checks) the crate, including DragonFruit's `manifold` backend
+      # (cmake and a C++ compiler, both on ubuntu-latest), then runs the unit tests.
+      - run: cargo test --locked --manifest-path rust/dragonfruit-mcp-tools/Cargo.toml
         env:
           CARGO_TARGET_DIR: target
 
