@@ -43,6 +43,9 @@ Plane project `NDFM`. Branches `ndfm-<n>-<slug>`, PR titles end `(NDFM-<n>)`.
 ## Testing
 
 Python: `uv run ruff check . && uv run pytest --cov` (70% minimum coverage).
+The auto-support integration tests also need `NDFM_TEST_STL` (a binary STL that fits the Mars 5 Ultra).
+TypeScript (type-check only): `cd vendor/dragonfruit && node_modules/.bin/tsc -p ../../ts/tsconfig.json`
+(one upstream error about `clipper-lib` types is expected).
 Rust: `cargo test`.
 
 ## Architecture diagrams
