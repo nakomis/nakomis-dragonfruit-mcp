@@ -70,7 +70,7 @@ def test_mesh_info_passes_path_and_json_flag(bin_dir, stl):
     ("kwargs", "fragment"),
     [
         ({"size": (0.04, 0.036, 0.07)}, "metres or inches"),
-        ({"size": (40000.0, 35900.0, 70200.0), "volume": 4.7e13}, "microns"),
+        ({"size": (40000.0, 35900.0, 70200.0), "volume": 4.7e13}, "units"),
         ({"volume": 3.0}, "not a closed solid"),
         ({"size": (40.0, 35.9, 0.0), "volume": 0.0}, "flat"),
         ({"triangles": 0, "volume": 0.0}, "no triangles"),
@@ -99,6 +99,25 @@ def test_mesh_info_missing_file(bin_dir, tmp_path):
 )
 def test_mesh_info_unexpected_schema(bin_dir, stl, payload):
     fake_mesh_cli(bin_dir, payload)
+    with pytest.raises(cli.CliError, match="unexpected"):
+        mesh.mesh_info(str(stl))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {**info(), "volume_mm3": None},
+        {**info(), "volume_mm3": "lots"},
+        {**info(), "triangles": None},
+        {**info(), "vertices": "many"},
+        {**info(), "bbox": {"min": [0, 0, 0], "max": [1, 1, 1], "size": [1, None, 1]}},
+        {**info(), "bbox": {"min": ["a", 0, 0], "max": [1, 1, 1], "size": [1, 1, 1]}},
+        {**info(), "volume_mm3": float("nan")},
+    ],
+)
+def test_mesh_info_bad_values_are_cli_errors(bin_dir, stl, payload):
+    (bin_dir / "dragonfruit-cli").write_text("#!/bin/sh\necho '" + json.dumps(payload) + "'\n")
+    (bin_dir / "dragonfruit-cli").chmod(0o755)
     with pytest.raises(cli.CliError, match="unexpected"):
         mesh.mesh_info(str(stl))
 

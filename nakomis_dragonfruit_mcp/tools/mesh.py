@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from nakomis_dragonfruit_mcp import cli
 from nakomis_dragonfruit_mcp.app import ToolResult, mcp
@@ -49,7 +50,8 @@ def mesh_info(stl_path: str) -> MeshInfo:
     Warns about sizes that suggest the wrong units and volumes that suggest the
     mesh is not a closed solid. Volume is the CLI's signed-volume sum, which
     cannot tell a closed mesh from an open one that happens to integrate sensibly;
-    it does not report watertightness itself.
+    it does not report watertightness itself. The absence of the fill-ratio
+    warning therefore proves nothing about whether the mesh is closed.
     """
     path = Path(stl_path).expanduser()
     if not path.exists():
@@ -64,9 +66,26 @@ def mesh_info(stl_path: str) -> MeshInfo:
     bbox = info["bbox"]
     if not isinstance(bbox, dict) or not {"min", "max", "size"} <= bbox.keys():
         raise cli.CliError(f"unexpected `mesh info` bbox: {bbox!r}")
-    size = _vec(bbox["size"], "size")
-    volume = float(info["volume_mm3"])
-    triangles = int(info["triangles"])
+    # Null, text or non-finite numbers are a schema change too, not a crash.
+    try:
+        size = _vec(bbox["size"], "size")
+        bbox_min = _vec(bbox["min"], "min")
+        bbox_max = _vec(bbox["max"], "max")
+        volume = float(info["volume_mm3"])
+        triangles = int(info["triangles"])
+        vertices = int(info.get("vertices", triangles * 3))
+    except (TypeError, ValueError, ValidationError) as e:
+        raise cli.CliError(f"unexpected `mesh info` values: {e}") from e
+    numbers = [
+        volume,
+        size.x,
+        size.y,
+        size.z,
+        *bbox_min.model_dump().values(),
+        *bbox_max.model_dump().values(),
+    ]
+    if not all(math.isfinite(n) for n in numbers):
+        raise cli.CliError("unexpected `mesh info` values: non-finite number")
 
     warnings = []
     if triangles == 0:
@@ -81,7 +100,7 @@ def mesh_info(stl_path: str) -> MeshInfo:
         elif max(dims) > HUGE_MM:
             warnings.append(
                 f"The model is {max(dims):.0f} mm along one axis: the file may be in "
-                "microns rather than millimetres, and it will not fit any desktop resin printer."
+                "microns or otherwise have the wrong units."
             )
         box = size.x * size.y * size.z
         if box > 0 and volume / box < MIN_FILL_RATIO:
@@ -97,9 +116,9 @@ def mesh_info(stl_path: str) -> MeshInfo:
         path=str(path),
         source=str(info.get("source", "stl")),
         triangles=triangles,
-        vertices=int(info.get("vertices", triangles * 3)),
-        bbox_min=_vec(bbox["min"], "min"),
-        bbox_max=_vec(bbox["max"], "max"),
+        vertices=vertices,
+        bbox_min=bbox_min,
+        bbox_max=bbox_max,
         size_mm=size,
         volume_mm3=volume,
         volume_ml=volume / 1000.0,
