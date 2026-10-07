@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" alt="nakomis-dragonfruit-mcp logo" width="200"></p>
+
 # nakomis-dragonfruit-mcp — headless resin print preparation and slicing with the DragonFruit engine
 
 > **Unofficial.** Not affiliated with or endorsed by the Open Resin Alliance or the
@@ -21,6 +23,7 @@ If you find this useful, please consider buying me a coffee:
 - [Status](#status)
 - [Architecture Diagram](#architecture-diagram)
 - [Repository Layout](#repository-layout)
+- [Building and running](#building-and-running)
 - [Licence](#licence)
 - [Architecture Diagrams](#architecture-diagrams)
 - [Support](#support)
@@ -49,8 +52,23 @@ Supports are out of scope: DragonFruit builds them by hand in its interface.
 
 | Path | Contents |
 |---|---|
+| `nakomis_dragonfruit_mcp/` | The MCP server (Python, FastMCP) |
+| `tests/` | pytest; integration tests run only when `bin/` is built |
+| `rust/dragonfruit-mcp-tools/` | Our Rust tool (hollowing, hole punching), linking DragonFruit's `dragonfruit-mesh-repair` |
+| `vendor/dragonfruit/` | DragonFruit, as a submodule pinned to upstream `dev` |
+| `scripts/build.sh` | Builds `bin/dragonfruit-cli` and `bin/dragonfruit-mcp-tools`, and installs DragonFruit's Node dependencies for `dragonfruit-ts-cli` |
 | `docs/architecture/` | Architecture diagram source (`.drawio`) and generated SVG |
+| `docs/logo.png` | The logo; the other candidates live on the `logo-candidates` branch |
 | `.githooks/` | Pre-commit hook: regenerates diagram SVGs and the README table of contents |
+
+## Building and running
+
+```bash
+git clone --recurse-submodules git@github.com:nakomis/nakomis-dragonfruit-mcp.git
+cd nakomis-dragonfruit-mcp
+scripts/build.sh            # needs cargo and Node; full log in /tmp/ndfm-build.log
+uv run nakomis-dragonfruit-mcp
+```
 
 ## Licence
 

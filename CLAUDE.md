@@ -13,8 +13,24 @@ disclaimer near the top of the README.
 
 | Path | Contents |
 |---|---|
+| `nakomis_dragonfruit_mcp/` | The MCP server (Python, FastMCP) |
+| `tests/` | pytest; integration tests run only when `bin/` is built |
+| `rust/dragonfruit-mcp-tools/` | Our Rust tool (hollowing, hole punching), linking DragonFruit's `dragonfruit-mesh-repair` |
+| `vendor/dragonfruit/` | DragonFruit, as a submodule pinned to upstream `dev` |
+| `scripts/build.sh` | Builds `bin/dragonfruit-cli` and `bin/dragonfruit-mcp-tools`, and installs DragonFruit's Node dependencies for `dragonfruit-ts-cli` |
 | `docs/architecture/` | Architecture diagram source (`.drawio`) and generated SVG |
+| `docs/logo.png` | The logo; the other candidates live on the `logo-candidates` branch |
 | `.githooks/` | Pre-commit hook: regenerates diagram SVGs and the README table of contents |
+
+## Upstream
+
+`vendor/dragonfruit` tracks upstream **`dev`**, not `main`: `main`'s `dragonfruit-cli`
+lags the slicing engine and may not compile. Two CLIs come from it:
+`bin/dragonfruit-cli` (Rust: mesh, islands, slice run, print) and
+`dragonfruit-ts-cli` (`npx tsx scripts/dragonfruit-ts-cli.ts`, run from the
+submodule: scenes, supports, `scene slice`). Reference: `vendor/dragonfruit/docs/reference/cli.md`.
+The TS CLI logs a harmless `[SettingsStore] Failed to load: localStorage...` stack
+trace on start; don't treat it as a failure.
 
 ## Project management
 
