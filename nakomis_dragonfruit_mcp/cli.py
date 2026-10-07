@@ -46,6 +46,14 @@ def find_tsx() -> Path:
     return tsx
 
 
+def ts_cli_rust_binary() -> Path:
+    """Where `dragonfruit-ts-cli` looks for `dragonfruit-cli` (it hardcodes the path).
+
+    `scripts/build.sh` links it to our own build in `bin/`.
+    """
+    return dragonfruit_dir() / "rust" / "dragonfruit-cli" / "target" / "release" / "dragonfruit-cli"
+
+
 def find_binary(name: str) -> Path:
     candidate = bin_dir() / name
     if candidate.is_file() and os.access(candidate, os.X_OK):

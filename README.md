@@ -24,6 +24,7 @@ If you find this useful, please consider buying me a coffee:
 - [Architecture Diagram](#architecture-diagram)
 - [Repository Layout](#repository-layout)
 - [Building and running](#building-and-running)
+- [Printers](#printers)
 - [Licence](#licence)
 - [Architecture Diagrams](#architecture-diagrams)
 - [Support](#support)
@@ -71,6 +72,41 @@ cd nakomis-dragonfruit-mcp
 scripts/build.sh            # needs cargo, Node, cmake and a C++ compiler; full log in /tmp/ndfm-build.log
 uv run nakomis-dragonfruit-mcp
 ```
+
+## Printers
+
+A printer is a DragonFruit printer profile (an official preset id, a custom
+profile JSON, or an app-exported bundle), optionally wrapped by a Python driver
+for real overrides. `list_printers` shows what is available and which plugins
+failed to load; `slice(stl_path, printer=..., format=..., ...)` slices with one.
+Supports are not included yet.
+
+Built in: `mars5ultra` (Elegoo Mars 5 Ultra) and `athena8k` (Concepts3D Athena 8K,
+`.nanodlp`, a `.py` driver that writes a sidecar JSON of how the file was sliced).
+`mars5ultra` defaults to `.goo`: that Mars 5 Ultra is proven to print `.goo`, and a `.goo`
+can be inspected and previewed. `format=".ctb"` gives upstream's `.ctb` v5enc, which
+DragonFruit encrypts and this server cannot read back.
+
+`slice` centres the model on the plate in XY with its lowest point on z=0
+(`place_on_plate=False` slices it as positioned), warns if it does not fit the build
+volume, and writes `<print file>.ndfm.json` recording the printer, profile summary, layer
+height, plate offset and so on. `export_plate_stl=True` also writes the model as it sits on
+the plate. It runs in a worker thread, so a long slice does not block the server.
+
+To add one, drop a file in `$NDFM_PRINTERS_DIR` or
+`~/.config/nakomis-dragonfruit-mcp/printers/` (later directories win a name
+clash, with a warning):
+
+- `my_screen.json`: a DragonFruit profile or `{"presetId": "..."}`; the printer is named `my_screen`.
+- `my_weird_printer.py`: a `Printer` subclass with `name` and `preset_id` or `profile`, and any of
+  `prepare`, `extra_slice_args`, `postprocess` and `warnings` overridden (see `printers/base.py`).
+
+The printer is chosen by the `printer` argument, then `$NDFM_PRINTER`, then
+`printer = "..."` in `~/.config/nakomis-dragonfruit-mcp/config.toml`, then `mars5ultra`.
+
+**A drop-in `.py` file is imported and runs with this server's privileges.** Only those
+directories are scanned; put nothing there you would not run yourself. A plugin that fails
+to load is skipped and reported by `list_printers`.
 
 ## Licence
 

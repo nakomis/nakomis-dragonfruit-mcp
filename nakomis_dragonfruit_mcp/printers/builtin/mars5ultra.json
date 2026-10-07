@@ -1,0 +1,5 @@
+{
+  "description": "Elegoo Mars 5 Ultra. Defaults to .goo: the Mars 5 Ultra prints .goo (verified on firmware V1.5.0), and .goo can be inspected and previewed by this server. format='.ctb' gives upstream's .ctb v5enc, which DragonFruit encrypts and this server cannot read back.",
+  "presetId": "elegoo-mars-5-ultra-ctb",
+  "default_format": ".goo"
+}
