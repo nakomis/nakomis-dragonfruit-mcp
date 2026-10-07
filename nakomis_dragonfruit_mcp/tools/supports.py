@@ -269,7 +269,7 @@ def run_auto_support_and_slice(
         )
 
     job.out_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="ndfm-autosupport-py-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="ndfm-py-autosupport-") as tmp:
         profile_file = Path(tmp) / "printer.json"
         profile_file.write_text(json.dumps(plan.profile))
         args = [
