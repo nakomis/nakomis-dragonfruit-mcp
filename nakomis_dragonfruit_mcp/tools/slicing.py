@@ -299,7 +299,7 @@ def run_slice(
     except stl_io.StlError as e:
         raise cli.CliError(str(e)) from e
     if place_on_plate:
-        offset = [-(lo[0] + hi[0]) / 2, -(lo[1] + hi[1]) / 2, -lo[2]]
+        offset = [-(lo[0] + hi[0]) / 2 + 0.0, -(lo[1] + hi[1]) / 2 + 0.0, -lo[2] + 0.0]  # no -0.0
     else:
         offset = [0.0, 0.0, 0.0]
     placed_lo = [lo[i] + offset[i] for i in range(3)]
