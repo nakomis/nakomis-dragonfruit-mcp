@@ -40,6 +40,12 @@ cargo build --release --manifest-path "$REPO_ROOT/rust/dragonfruit-mcp-tools/Car
 mkdir -p "$REPO_ROOT/bin"
 cp "$CARGO_TARGET_DIR/release/dragonfruit-cli" "$CARGO_TARGET_DIR/release/dragonfruit-mcp-tools" "$REPO_ROOT/bin/"
 
+# dragonfruit-ts-cli (`scene slice`) runs the Rust CLI from a hardcoded path under
+# the submodule's own target/ (git-ignored), not from PATH. Link it to our build.
+TS_CLI_RUST="$DF/rust/dragonfruit-cli/target/release/dragonfruit-cli"
+mkdir -p "$(dirname "$TS_CLI_RUST")"
+ln -sf "$REPO_ROOT/bin/dragonfruit-cli" "$TS_CLI_RUST"
+
 echo "--- Done ---"
 "$REPO_ROOT/bin/dragonfruit-cli" info
 "$REPO_ROOT/bin/dragonfruit-mcp-tools" version
