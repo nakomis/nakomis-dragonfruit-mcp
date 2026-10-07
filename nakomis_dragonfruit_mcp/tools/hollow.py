@@ -12,7 +12,7 @@ from nakomis_dragonfruit_mcp import cli
 from nakomis_dragonfruit_mcp.app import ToolResult, mcp
 
 _HOLLOW_KEYS = {"before", "after", "wall_mm", "voxel_mm", "timing_ms", "warnings"}
-_PUNCH_KEYS = {"before", "after", "holes", "timing_ms", "warnings"}
+_PUNCH_KEYS = {"before", "after", "holes", "cavities_found", "timing_ms", "warnings"}
 
 
 class MeshSummary(BaseModel):
@@ -31,7 +31,10 @@ class Hole(BaseModel):
     z: float
     radius_mm: float
     direction: list[float]
+    axis: str = Field(description='"-z", "+x" and so on for an axis-aligned hole, else "custom"')
     length_mm: float
+    purpose: str = Field(description='"suction relief", "vent", "manual", ...')
+    cavity: int | None = Field(description="Which cavity an automatic hole serves")
     note: str = ""
 
 
@@ -53,6 +56,7 @@ class DrillResult(ToolResult):
     input_path: str
     output_path: str
     holes: list[Hole]
+    cavities_found: int = Field(description="Sealed cavities in the input, before drilling")
     cavities_before: int
     cavities_after: int
     drains: bool = Field(description="True when no sealed cavity is left")
@@ -98,20 +102,31 @@ def _schema(data: Any, keys: set[str], what: str, stdout: str) -> dict[str, Any]
 @mcp.tool()
 def hollow(
     stl_path: str | Path,
-    wall_mm: float = 2.0,
+    wall_mm: float | None = None,
     out_path: str | Path | None = None,
     voxel_mm: float | None = None,
     options_json: str | Path | None = None,
 ) -> HollowResult:
-    """Hollow a model, leaving a sealed cavity inside a wall of `wall_mm`.
+    """Hollow a model, leaving a sealed cavity inside a wall (all lengths in mm).
 
-    Uses DragonFruit's voxel hollowing with the desktop app's defaults (0.65 mm
-    voxels). Parts thinner than twice the wall stay solid. The cavity is sealed, so
-    the result carries a warning until drain holes are added with `drill_holes`.
+    ALWAYS FOLLOW WITH `drill_holes`: the cavity is sealed, so an undrilled print traps
+    uncured resin and suction-cups against the film. The result warns about this until
+    you have drilled.
+
+    Uses DragonFruit's voxel hollowing with the desktop app's defaults: 2.0 mm wall and
+    0.65 mm voxels. Parts thinner than twice the wall stay solid. The output STL is
+    written next to the input as `<name>.hollow.stl` unless `out_path` is given.
+
+    `options_json` is a path to a JSON file of DragonFruit `HollowOptions` in camelCase
+    (for example `{"shellThicknessMm": 2.5, "mode": "cavity"}`). Precedence: `wall_mm`
+    and `voxel_mm` override the file when given; with neither the file's own values (or
+    the app defaults) apply.
     """
     src = _check(Path(stl_path))
     out = _output_path(src, out_path, ".hollow")
-    args = ["hollow", str(src), "-o", str(out), "--wall-mm", f"{wall_mm:g}", "--json"]
+    args = ["hollow", str(src), "-o", str(out), "--json"]
+    if wall_mm is not None:
+        args += ["--wall-mm", f"{wall_mm:g}"]
     if voxel_mm is not None:
         args += ["--voxel-mm", f"{voxel_mm:g}"]
     if options_json is not None:
@@ -140,24 +155,61 @@ def hollow(
 def drill_holes(
     stl_path: str | Path,
     holes: list[dict[str, Any]] | None = None,
-    auto_base: bool = False,
+    auto_drain: bool = False,
     out_path: str | Path | None = None,
     radius_mm: float = 2.0,
+    xy: tuple[float, float] | None = None,
+    down_axis: str = "-z",
 ) -> DrillResult:
-    """Punch drain holes through a (hollowed) model so the cavity can drain.
+    """Punch drain holes through a hollowed model (all lengths in mm).
 
-    Give `holes` as dicts of x, y, z in model millimetres, with optional radius,
-    direction (default straight down) and length (default through everything on
-    the axis), or set `auto_base` to put two holes at the lowest point of the
-    cavity, on opposite sides, for an upright print. Warns if a sealed cavity is
-    left, which would mean the holes missed it.
+    Give exactly one of `holes` or `auto_drain=True`; they are mutually exclusive.
+    Output is written next to the input as `<name>.drilled.stl` unless `out_path` is set.
+
+    `holes`: a list of dicts in model coordinates, e.g.
+    `{"x": 0, "y": -6, "z": 3, "radius": 2, "direction": [0, 0, -1], "length": 4}`.
+    x, y, z is where the hole starts (put it inside the cavity); `radius` defaults to
+    `radius_mm`; `direction` (default straight down) runs from the start towards the
+    outside; `length` defaults to straight through everything on the axis. Unknown keys
+    are an error.
+
+    `auto_drain=True` places holes for a bottom-up MSLA print, where the part hangs from
+    the build plate. Checklist it follows, and what you must still check:
+    - The cavity end nearest the plate (the base, -Z, printed first) closes first as a
+      cup opening towards the film, so peeling it pulls suction. A hole through the floor
+      at that end is the essential suction relief ("suction relief" in the result).
+    - A second hole at the far end, through the roof ("vent"), lets air in as liquid
+      drains and lets IPA be flushed through.
+    - Every separate cavity gets its own pair: compare `cavities_found` with the holes.
+    - Holes are `radius_mm` (default 2, so 4 mm across; keep at least 2 to 3 mm across).
+    - They go where the skin is flat and square to the hole, clear of detail with a
+      margin of at least 1 mm around the footprint (so away from text and edges), by
+      the shortest vertical path through the wall. Base, crown and back are preferred
+      because they are rarely seen, but the tool only judges flatness: look at where
+      `holes` say they exit.
+    - It cannot see supports or the raft. If the base has supports, pass `xy` (the
+      position across the down axis: x, y for -z) to move the holes clear of them, and
+      keep them at least radius + 1 mm inside the base outline.
+    - If no clear vertical path exists it falls back to a horizontal pair through the
+      side wall and says so in `warnings`; rough skin gets a vertical hole with a
+      warning. Read the warnings.
+    `down_axis` says which way the plate is (default "-z"; also "+z", "+/-x", "+/-y").
+
+    Warns, with the count, if any sealed cavity is left.
     """
-    if bool(holes) == auto_base:
-        raise cli.CliError("give either `holes` or `auto_base=True`, not both or neither")
+    if bool(holes) == auto_drain:
+        raise cli.CliError("give either `holes` or `auto_drain=True`, not both or neither")
+    if xy is not None and not auto_drain:
+        raise cli.CliError("`xy` only applies with `auto_drain=True`")
     src = _check(Path(stl_path))
     out = _output_path(src, out_path, ".drilled")
     args = ["punch", str(src), "-o", str(out), "--radius-mm", f"{radius_mm:g}", "--json"]
-    args += ["--auto-base"] if auto_base else ["--holes", json.dumps(holes)]
+    if auto_drain:
+        args += ["--auto-drain", "--down-axis", down_axis]
+        if xy is not None:
+            args += ["--xy", f"{xy[0]:g}", f"{xy[1]:g}"]
+    else:
+        args += ["--holes", json.dumps(holes)]
     result = cli.run(cli.MCP_TOOLS, args, parse_json=True)
     data = _schema(result.data, _PUNCH_KEYS, "punch", result.stdout)
     before, after = _summary(data["before"]), _summary(data["after"])
@@ -165,6 +217,7 @@ def drill_holes(
         input_path=str(src),
         output_path=str(out),
         holes=[Hole(**h) for h in data["holes"]],
+        cavities_found=data["cavities_found"],
         cavities_before=before.cavities,
         cavities_after=after.cavities,
         drains=after.cavities == 0,

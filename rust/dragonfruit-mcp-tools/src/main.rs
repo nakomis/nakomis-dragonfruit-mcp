@@ -2,6 +2,7 @@
 //! punching (NDFM-6), both calling DragonFruit's mesh-repair crate the way its
 //! desktop app does.
 
+mod drain;
 mod ops;
 
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use dragonfruit_mesh_repair::io::load_mesh_from_path;
-use dragonfruit_mesh_repair::HollowOptions;
+use dragonfruit_mesh_repair::{HollowMode, HollowOptions};
 use serde_json::{json, Value};
 
 use ops::{Hole, PlacedHole};
@@ -37,8 +38,8 @@ enum Command {
         /// Voxel size in mm; smaller is finer and slower (the app's default is 0.65).
         #[arg(long)]
         voxel_mm: Option<f32>,
-        /// JSON file of DragonFruit HollowOptions (camelCase), applied first;
-        /// --wall-mm and --voxel-mm override it.
+        /// JSON file of DragonFruit HollowOptions (camelCase, e.g. shellThicknessMm),
+        /// applied first; --wall-mm and --voxel-mm override it when given.
         #[arg(long)]
         options_json: Option<PathBuf>,
         /// Print the report as JSON.
@@ -55,14 +56,29 @@ enum Command {
         /// {x, y, z, radius?, direction?, length?} in model millimetres.
         #[arg(
             long,
-            conflicts_with = "auto_base",
-            required_unless_present = "auto_base"
+            conflicts_with = "auto_drain",
+            required_unless_present = "auto_drain"
         )]
         holes: Option<String>,
-        /// Place two drain holes at the lowest point of the cavity.
+        /// Place a suction-relief hole through the floor and a vent through the roof of
+        /// every cavity (vertical, along the down axis), falling back to a horizontal
+        /// pair where there is no clear vertical path.
         #[arg(long)]
-        auto_base: bool,
-        /// Hole radius in mm, for --auto-base and holes without their own (the app's default is 2.0).
+        auto_drain: bool,
+        /// Which way is down, towards the build plate: -z (default), +z, -x, +x, -y, +y.
+        #[arg(long, default_value = "-z", allow_hyphen_values = true)]
+        down_axis: String,
+        /// Pin the vertical holes at this position across the down axis (mm, in x/y/z
+        /// order of the two remaining axes), e.g. to keep clear of supports.
+        #[arg(
+            long,
+            num_args = 2,
+            value_names = ["A", "B"],
+            allow_negative_numbers = true,
+            requires = "auto_drain"
+        )]
+        xy: Option<Vec<f32>>,
+        /// Hole radius in mm, for --auto-drain and holes without their own (the app's default is 2.0).
         #[arg(long, default_value_t = ops::DEFAULT_HOLE_RADIUS_MM)]
         radius_mm: f32,
         /// Print the report as JSON.
@@ -145,14 +161,17 @@ fn hollow_cmd(
     let write_ms = ms(t);
 
     let mut warnings: Vec<String> = Vec::new();
-    if outcome.report.removed_voxels == 0 || after.cavities == 0 {
-        warnings.push(
-            "no cavity was created: the model is thinner than twice the wall everywhere, or the wall is too thick".into(),
-        );
-    } else {
-        warnings.push(
-            "the cavity is sealed: uncured resin is trapped and the print can suction-cup; run punch to add drain holes".into(),
-        );
+    // Only the cavity modes leave a sealed void; infill and open-face shells are another story.
+    if options.mode == HollowMode::Cavity {
+        if outcome.report.removed_voxels == 0 || after.cavities == 0 {
+            warnings.push(
+                "no cavity was created: the model is thinner than twice the wall everywhere, or the wall is too thick".into(),
+            );
+        } else {
+            warnings.push(
+                "the cavity is sealed: uncured resin is trapped and the print can suction-cup; run drill_holes (punch --auto-drain) to add drain holes".into(),
+            );
+        }
     }
     if !before.watertight {
         warnings.push(format!(
@@ -218,7 +237,9 @@ fn punch_cmd(
     input: &Path,
     output: &Path,
     holes_arg: Option<&str>,
-    auto_base: bool,
+    auto_drain: bool,
+    down_axis: &str,
+    xy: Option<&[f32]>,
     radius_mm: f32,
     as_json: bool,
 ) -> Result<(), String> {
@@ -234,13 +255,19 @@ fn punch_cmd(
     let mut analyse_ms = ms(t);
 
     let mut warnings: Vec<String> = Vec::new();
-    let placed: Vec<PlacedHole> = if auto_base {
-        let (holes, w) = ops::auto_base_holes(&mesh, radius_mm)?;
-        warnings.extend(w);
-        holes
+    let mut cavities_found = before.cavities;
+    let placed: Vec<PlacedHole> = if auto_drain {
+        let axis = drain::Axis::parse(down_axis)?;
+        let xy = xy.map(|v| [v[0], v[1]]);
+        let found = drain::auto_drain_holes(&mesh, radius_mm, axis, xy)?;
+        cavities_found = found.cavities;
+        warnings.extend(found.warnings);
+        found.holes
     } else {
         let holes = parse_holes(holes_arg.unwrap_or("[]"))?;
-        ops::resolve_holes(&mesh, &holes, radius_mm)
+        let (placed, w) = ops::resolve_holes(&mesh, &holes, radius_mm);
+        warnings.extend(w);
+        placed
     };
     if placed.is_empty() {
         return Err("no holes to punch".into());
@@ -256,23 +283,14 @@ fn punch_cmd(
     write(&outcome.mesh, output)?;
     let write_ms = ms(t);
 
-    // The manifold boolean can add more triangles than it removes, so judge by the mesh.
-    if after.triangles == before.triangles && (after.volume_mm3 - before.volume_mm3).abs() < 1e-6 {
-        warnings.push("the punch changed nothing: the holes may miss the model".into());
-    }
-    if before.cavities > 0 && after.cavities >= before.cavities {
-        warnings
-            .push("a sealed cavity remains: the holes did not connect it to the outside".into());
-    }
-    if !after.watertight {
-        warnings.push("the punched mesh is not watertight".into());
-    }
+    warnings.extend(ops::punch_warnings(&before, &after));
 
     let saved = before.volume_ml - after.volume_ml;
     let report = json!({
         "input": input,
         "output": output,
-        "auto_base": auto_base,
+        "auto_drain": auto_drain,
+        "cavities_found": cavities_found,
         "holes": placed,
         "before": before,
         "after": after,
@@ -327,14 +345,18 @@ fn main() {
             input,
             output,
             holes,
-            auto_base,
+            auto_drain,
+            down_axis,
+            xy,
             radius_mm,
             json,
         } => punch_cmd(
             &input,
             &output,
             holes.as_deref(),
-            auto_base,
+            auto_drain,
+            &down_axis,
+            xy.as_deref(),
             radius_mm,
             json,
         ),

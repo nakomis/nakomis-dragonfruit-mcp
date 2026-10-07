@@ -13,3 +13,7 @@ dragonfruit-mesh-repair = { path = "../../vendor/dragonfruit/rust/dragonfruit-me
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+# Pinned directly, and to the version upstream locks: 0.1.8 / manifold-csg-sys 3.5.x do
+# not compile (see dragonfruit-organic-cut's Cargo.toml). Without this a fresh lock
+# resolves to the newest and the build breaks. Needs cmake and a C++ compiler.
+manifold-csg = { version = "=0.1.4", default-features = false }

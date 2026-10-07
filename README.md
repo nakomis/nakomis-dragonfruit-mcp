@@ -40,7 +40,9 @@ Early days. The repository is scaffolded; the tools are being built. Planned too
   Elegoo Mars 5 Ultra, `.nanodlp` for the Concepts3D Athena 8K, and anything else
   you add as a plugin)
 - `preview_layer` and `inspect_print`: check the sliced output
-- `hollow` and `drill_holes`
+- `hollow` and `drill_holes`: hollow a model to save resin, then drill a suction-relief
+  hole through each cavity's floor and a vent through its roof so it can drain
+  (always follow `hollow` with `drill_holes`)
 
 Supports are out of scope: DragonFruit builds them by hand in its interface.
 
@@ -66,7 +68,7 @@ Supports are out of scope: DragonFruit builds them by hand in its interface.
 ```bash
 git clone --recurse-submodules git@github.com:nakomis/nakomis-dragonfruit-mcp.git
 cd nakomis-dragonfruit-mcp
-scripts/build.sh            # needs cargo and Node; full log in /tmp/ndfm-build.log
+scripts/build.sh            # needs cargo, Node, cmake and a C++ compiler; full log in /tmp/ndfm-build.log
 uv run nakomis-dragonfruit-mcp
 ```
 
