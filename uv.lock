@@ -509,6 +509,7 @@ name = "nakomis-dragonfruit-mcp"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "mcp", extra = ["cli"] },
     { name = "pydantic" },
 ]
@@ -522,6 +523,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.30,<2" },
     { name = "pydantic", specifier = ">=2.7" },
 ]

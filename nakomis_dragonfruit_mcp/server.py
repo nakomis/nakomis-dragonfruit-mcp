@@ -13,7 +13,7 @@ dropped. The tools themselves live in `nakomis_dragonfruit_mcp/tools/`.
 from __future__ import annotations
 
 from nakomis_dragonfruit_mcp.app import mcp
-from nakomis_dragonfruit_mcp.tools import engine  # noqa: F401  (registers its tools)
+from nakomis_dragonfruit_mcp.tools import engine, printer  # noqa: F401  (register their tools)
 
 
 def main() -> None:

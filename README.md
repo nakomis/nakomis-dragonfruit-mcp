@@ -24,6 +24,7 @@ If you find this useful, please consider buying me a coffee:
 - [Architecture Diagram](#architecture-diagram)
 - [Repository Layout](#repository-layout)
 - [Building and running](#building-and-running)
+- [Printer control](#printer-control)
 - [Licence](#licence)
 - [Architecture Diagrams](#architecture-diagrams)
 - [Support](#support)
@@ -69,6 +70,37 @@ cd nakomis-dragonfruit-mcp
 scripts/build.sh            # needs cargo and Node; full log in /tmp/ndfm-build.log
 uv run nakomis-dragonfruit-mcp
 ```
+
+## Printer control
+
+`printer_status` (read-only) and `send_to_printer` talk to the Mars 5 Ultra **by way
+of [Cthulhu](https://github.com/nakomis/cthulhu)**, Martin's print server, never to
+the printer directly: Cthulhu owns the SDCP connection and its quirks.
+
+| Variable | Meaning |
+|---|---|
+| `CTHULHU_URL` | Default `https://cthulhu.home.nakomis.com` |
+| `CTHULHU_CLIENT_CERT`, `CTHULHU_CLIENT_KEY` | PEM paths of the mTLS client certificate Leia's nginx requires (no API key). Required for https URLs; an unset or missing path is a clear error |
+| `CTHULHU_UPLOAD_TIMEOUT_S` | Default 3600; the printer takes roughly 100 KB/s over WiFi |
+
+`send_to_printer(print_path, start=False, confirm=None)` uploads a `.goo` or `.ctb`
+and returns once the printer has verified and listed the file. Safety rules, enforced
+in code:
+
+- By default it only uploads. Nothing prints.
+- Starting needs `start=True` **and** `confirm="Martin said go"`, which the caller may
+  pass only when Martin has explicitly said to start that print in the current session.
+  Without the exact phrase the call is refused before anything is uploaded.
+- The printer must be connected, idle (or showing a finished or stopped print) and
+  error-free, checked before uploading and again just before starting. Uploads are
+  refused during a print.
+- The result states what is printing (file, layers, layer height, estimated time) and
+  the printer's status as observed after starting; `started` is true only if the print
+  was actually seen to begin. Resin volume is not in `.goo`/`.ctb` headers, so it
+  comes from the slice results instead.
+
+Tests run against a fake Cthulhu (`httpx.MockTransport`); nothing contacts a real
+server or printer.
 
 ## Licence
 
