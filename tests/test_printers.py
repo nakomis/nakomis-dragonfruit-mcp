@@ -28,7 +28,7 @@ def test_builtins_load():
     registry = loader.discover()
     assert {"mars5ultra", "athena8k"} <= registry.printers.keys()
     assert registry.failures == []
-    assert registry.printers["mars5ultra"].route == "json"
+    assert registry.printers["mars5ultra"].route == "py"
     assert registry.printers["athena8k"].route == "py"
 
 
