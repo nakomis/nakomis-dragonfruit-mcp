@@ -45,6 +45,9 @@ _REQUIRED_KEYS = {
 }
 
 
+# How much newer the STL may be than its holes sidecar before the pair looks mismatched.
+_STALE_SIDECAR_S = 5.0
+
 # What a hole needs to be a keep-out zone (the `<stl>.holes.json` records `drill_holes` writes).
 _HOLE_NUMBERS = ("x", "y", "z", "radius_mm", "length_mm")
 
@@ -258,7 +261,8 @@ def _load_holes(
                 f"{sidecar.name} was written for {Path(recorded).name}, not {stl.name}: "
                 "check that its holes belong to this STL"
             )
-        if stl.stat().st_mtime > sidecar.stat().st_mtime:
+        # drill_holes writes the STL, then the sidecar: a second or two apart is not staleness.
+        if stl.stat().st_mtime > sidecar.stat().st_mtime + _STALE_SIDECAR_S:
             warnings.append(
                 f"{stl.name} is newer than {sidecar.name}: the holes may not match this STL"
             )

@@ -320,6 +320,14 @@ def test_sidecar_for_another_stl_or_older_than_the_stl_warns(fake_env, stl):
     assert any("model.stl is newer than model.stl.holes.json" in w for w in warnings)
 
 
+def test_an_stl_written_just_before_its_sidecar_is_not_stale(fake_env, stl):
+    sidecar = stl.with_name(stl.name + ".holes.json")
+    sidecar.write_text(json.dumps({"holes": [BASE_HOLE]}))
+    stamp = sidecar.stat().st_mtime
+    os.utime(stl, (stamp + 2, stamp + 2))
+    assert not any("is newer than" in w for w in run(stl).warnings)
+
+
 def test_internal_islands_are_skipped_unless_asked(fake_env, stl):
     fake_env.summary.write_text(
         json.dumps(
