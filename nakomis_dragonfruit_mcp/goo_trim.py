@@ -19,7 +19,9 @@ byte-for-byte; the header and end marker are kept.
 from __future__ import annotations
 
 import os
+import shutil
 import struct
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -66,7 +68,7 @@ def _box(lit: np.ndarray, h: int, w: int) -> tuple[slice, slice] | None:
 
 
 def trim_islands(src: Path, dst: Path) -> TrimReport:
-    """Write `src` to `dst` with every unsupported region removed."""
+    """Write `src` to `dst` with every unsupported region removed; never overwrites `dst`."""
     header = goo.read_header(src)
     w, h = header.resolution_x, header.resolution_y
     data = src.read_bytes()
@@ -107,16 +109,20 @@ def trim_islands(src: Path, dst: Path) -> TrimReport:
             pieces.append(data[off : off + goo.LAYER_DEF_BYTES + 4 + len(raw) + 2])
     report.layers_changed = len(report.by_layer)
     tail = END_MARKER if data.endswith(END_MARKER) else b""
-    tmp = dst.with_name(dst.name + ".tmp")
+    # A temp file of our own, published with link(): it refuses if dst has
+    # appeared meanwhile (another run, or anything else), so nothing is overwritten.
+    fd, tmp_name = tempfile.mkstemp(dir=dst.parent, prefix=dst.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
     try:
-        with tmp.open("wb") as f:
+        with os.fdopen(fd, "wb") as f:
             f.write(data[:first])
             for piece in pieces:
                 f.write(piece)
             f.write(tail)
             f.flush()
             os.fsync(f.fileno())
-        tmp.replace(dst)
+        shutil.copymode(src, tmp)
+        os.link(tmp, dst)
     finally:
         tmp.unlink(missing_ok=True)
     return report

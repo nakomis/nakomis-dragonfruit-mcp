@@ -43,9 +43,10 @@ def run(print_path: str, out_path: str | None, pixel_um: float, verify: bool) ->
     dst = Path(out_path).expanduser() if out_path else src.with_suffix(".trimmed.goo")
     if dst.exists():
         raise cli.CliError(f"{dst} already exists; pass another out_path or remove it first")
-    if dst.resolve() == src.resolve():
-        raise cli.CliError("out_path must differ from print_path")
-    report = goo_trim.trim_islands(src, dst)
+    try:
+        report = goo_trim.trim_islands(src, dst)
+    except FileExistsError as e:
+        raise cli.CliError(f"{dst} appeared while trimming; nothing was overwritten") from e
     layer_mm = goo.read_header(src).layer_height_mm
     worst = sorted(report.by_layer, key=lambda r: -r[2])[:10]
     result = TrimResult(

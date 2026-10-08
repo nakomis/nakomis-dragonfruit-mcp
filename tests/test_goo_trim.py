@@ -100,7 +100,7 @@ BRIDGE = (12, 22, 14, 32)  # joins the block's area to the dot's
 
 @pytest.fixture
 def island_goo(tmp_path):
-    """Layer 1 a block; 2 adds a floating dot; 3 the dot alone; 4 the dot bridged to the block."""
+    """Layer 1 a block; 2 and 3 add a floating dot; 4 bridges the dot to the block."""
     path = tmp_path / "isl.goo"
     make_goo(
         path,
@@ -162,6 +162,36 @@ def test_trim_keeps_grey_edges_of_held_cores_and_drops_lone_grey(tmp_path):
     px = pixels_of(out, 2)
     assert (px[5:15, 15] == 90).all()
     assert not px[25:27, 35:37].any() and not px[25:27, 2:4].any()
+
+
+def test_trim_never_overwrites_and_cleans_up(island_goo, tmp_path):
+    out = tmp_path / "out.goo"
+    out.write_bytes(b"someone else's file")
+    with pytest.raises(FileExistsError):
+        goo_trim.trim_islands(island_goo, out)
+    assert out.read_bytes() == b"someone else's file"
+    assert [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"] == []
+
+
+def test_trim_keeps_the_source_permissions(island_goo, tmp_path):
+    island_goo.chmod(0o640)
+    out = tmp_path / "out.goo"
+    goo_trim.trim_islands(island_goo, out)
+    assert out.stat().st_mode & 0o777 == 0o640
+
+
+def test_tool_reports_a_file_that_appears_mid_run(island_goo, tmp_path, monkeypatch):
+    out = tmp_path / "late.goo"
+    real = goo_trim.trim_islands
+
+    def racing(src, dst):
+        dst.write_bytes(b"arrived first")
+        return real(src, dst)
+
+    monkeypatch.setattr(goo_trim, "trim_islands", racing)
+    with pytest.raises(cli.CliError, match="appeared while trimming"):
+        asyncio.run(trim.trim_islands(str(island_goo), str(out)))
+    assert out.read_bytes() == b"arrived first"
 
 
 def test_trim_drops_everything_after_a_blank_layer(tmp_path):
