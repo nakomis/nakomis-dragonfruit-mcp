@@ -19,6 +19,8 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 MAGIC_VERSIONS = (b"V1.2", b"V3.0")
 V5_VERSION = b"V5.1"  # little-endian, partitioned layers: a different container, not read here
 # A sane screen: no side over this, and no more pixels than this (a hostile header could
@@ -190,3 +192,43 @@ def decode_layer(data: bytes, width: int, height: int) -> bytes:
     if pixel != total:
         raise GooError(f"layer decodes to {pixel} pixels, expected {total}")
     return bytes(out)
+
+
+MAX_RUN = (1 << 28) - 1  # 4 length bits + 3 extra bytes
+
+
+def encode_layer(pixels: bytes | bytearray | memoryview) -> bytes:
+    """Row-major 8-bit grey pixels as layer data: the inverse of `decode_layer`.
+
+    Writes DragonFruit's V1.2 layout (no step runs), each run with the fewest
+    length bytes that hold it, so a DragonFruit layer re-encodes byte-for-byte.
+    """
+    p = np.frombuffer(pixels, np.uint8)
+    if p.size == 0:
+        raise GooError("a layer needs at least one pixel")
+    starts = np.r_[0, np.flatnonzero(p[1:] != p[:-1]) + 1]
+    lengths = np.diff(np.r_[starts, p.size]).astype(np.int64)
+    values = p[starts].astype(np.int64)
+    if (lengths > MAX_RUN).any():
+        # Split over-long runs into MAX_RUN pieces plus the remainder.
+        pieces = -(-lengths // MAX_RUN)
+        values = np.repeat(values, pieces)
+        full = np.repeat(lengths, pieces)
+        first = np.r_[0, np.cumsum(pieces)[:-1]]
+        lengths = np.full(full.size, MAX_RUN, np.int64)
+        lengths[first + pieces - 1] = full[first] - MAX_RUN * (pieces - 1)
+    kind = np.where(values == 0, 0, np.where(values == 255, 3, 1))
+    extra = np.searchsorted([16, 1 << 12, 1 << 20], lengths, side="right")
+    grey = kind == 1
+    size = 1 + grey + extra
+    at = np.r_[0, np.cumsum(size)[:-1]]
+    out = np.zeros(int(size.sum()), np.uint8)
+    out[at] = (kind << 6) | (extra << 4) | (lengths & 0x0F)
+    out[at[grey] + 1] = values[grey]
+    high = lengths >> 4
+    after = at + 1 + grey
+    for k in (1, 2, 3):  # length bytes above the low 4 bits, big-endian
+        has = extra >= k
+        out[after[has] + k - 1] = (high[has] >> (8 * (extra[has] - k))) & 0xFF
+    checksum = ~int(out.sum(dtype=np.int64)) & 0xFF
+    return b"\x55" + out.tobytes() + bytes([checksum])
