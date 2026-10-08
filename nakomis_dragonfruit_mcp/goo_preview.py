@@ -81,9 +81,12 @@ def write_previews(
                 )
             )
 
-        for at, size in ((SMALL_AT, SMALL), (BIG_AT, BIG)):
+        # Both converted before either is written, so a failure leaves the
+        # file as it was rather than with one new preview and one old.
+        slots = [(at, _rgb565(image, size, bg)) for at, size in ((SMALL_AT, SMALL), (BIG_AT, BIG))]
+        for at, data in slots:
             f.seek(at)
-            f.write(_rgb565(image, size, bg))
+            f.write(data)
 
 
 def has_preview_slots(path: Path) -> bool:
