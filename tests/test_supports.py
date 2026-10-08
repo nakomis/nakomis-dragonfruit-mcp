@@ -182,6 +182,13 @@ def test_overhangs_off_with_a_lift_warns_about_the_base(fake_env, stl):
     assert not any("lowest layer" in w for w in run(stl).warnings)
 
 
+@pytest.mark.parametrize("angle", [20, 75])
+def test_overhang_angle_at_the_apps_limits_is_accepted(fake_env, stl, angle):
+    run(stl, overhang_angle_deg=angle)
+    args = script_args(fake_env)
+    assert json.loads(args[args.index("--settings") + 1]) == {"overhangSelfSupportAngleDeg": angle}
+
+
 @pytest.mark.parametrize("angle", [19.9, 75.1, 0, 90])
 def test_overhang_angle_outside_the_apps_range_is_refused(fake_env, stl, angle):
     with pytest.raises(ValueError, match="between 20 and 75"):
