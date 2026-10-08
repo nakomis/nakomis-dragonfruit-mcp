@@ -16,6 +16,7 @@ disclaimer near the top of the README.
 | `nakomis_dragonfruit_mcp/` | The MCP server (Python, FastMCP) |
 | `tests/` | pytest; integration tests run only when `bin/` is built |
 | `rust/dragonfruit-mcp-tools/` | Our Rust tool (hollowing, hole punching, `overhangs`), linking DragonFruit's `dragonfruit-mesh-repair`; `build.rs` borrows the app's `src-tauri/src/overhang.rs` minus its Tauri command |
+| `accel/goo-trim/` | Optional Rust backend for `trim_islands` (`bin/goo-trim`, built by `scripts/build-accel.sh`, not `build.sh`); output must stay byte-identical to `goo_trim.py`. Chosen by `NDFM_TRIM_BACKEND` or the tool's `backend` argument |
 | `ts/` | Our TS scripts (`autosupport-slice.ts`), run by `cli.run_ts(script=...)` with DragonFruit's tsconfig and `NODE_PATH` at its node_modules |
 | `vendor/dragonfruit/` | DragonFruit, as a submodule pinned to upstream `dev` |
 | `scripts/build.sh` | Builds `bin/dragonfruit-cli` and `bin/dragonfruit-mcp-tools`, and installs DragonFruit's Node dependencies for `dragonfruit-ts-cli` |
@@ -46,7 +47,8 @@ Python: `uv run ruff check . && uv run pytest --cov` (70% minimum coverage).
 The auto-support integration tests also need `NDFM_TEST_STL` (a binary STL that fits the Mars 5 Ultra).
 TypeScript (type-check only): `cd vendor/dragonfruit && node_modules/.bin/tsc -p ../../ts/tsconfig.json`
 (one upstream error about `clipper-lib` types is expected).
-Rust: `cargo test`.
+Rust: `cargo test` (in `rust/dragonfruit-mcp-tools` and `accel/goo-trim`; the latter's
+`tests/real_file.rs` re-encodes every layer of `NDFM_TEST_GOO` when set).
 
 ## Architecture diagrams
 

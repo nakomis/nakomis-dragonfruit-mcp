@@ -21,6 +21,7 @@ If you find this useful, please consider buying me a coffee:
 <!-- toc -->
 
 - [Status](#status)
+  * [Optional Rust backend for `trim_islands`](#optional-rust-backend-for-trim_islands)
 - [Architecture Diagram](#architecture-diagram)
 - [Repository Layout](#repository-layout)
 - [Building and running](#building-and-running)
@@ -60,6 +61,41 @@ Early days. The repository is scaffolded; the tools are being built. Planned too
   changed layers byte-compatibly with DragonFruit, and verifies the result
   (NDFM-20)
 
+### Optional Rust backend for `trim_islands`
+
+`accel/goo-trim` is a native port of `trim_islands` and its island check. It
+writes the same file byte for byte, much faster. It is optional, separate from
+`scripts/build.sh`, and needs only cargo:
+
+```bash
+scripts/build-accel.sh      # builds bin/goo-trim
+```
+
+Pick the backend with `NDFM_TRIM_BACKEND` in the server's environment: `python`
+(the default), `rust`, or `auto` (rust when `bin/goo-trim` is built, python
+otherwise). The tool's `backend` parameter overrides it for one call, and the
+result's `backend` field says which ran. Asking for `rust` when the binary isn't
+built is an error, not a silent fallback.
+
+The binary also runs on its own:
+
+```bash
+bin/goo-trim trim print.goo print.trimmed.goo --verify   # JSON report on stdout
+bin/goo-trim islands print.trimmed.goo                   # {"islands": [[layer, pixels], ...]}
+```
+
+Measured on the gyroid lantern (960 full-screen layers of 8520x4320, 337 MB,
+678 layers changed) on a 16-core Mac:
+
+| | Python | Rust |
+|---|---|---|
+| `trim` + verify | about 237 s | 4.7-5.3 s |
+| `trim` alone | | 3.5 s |
+| island check alone | 88 s | 1.2 s |
+
+The Rust output was compared with `cmp` against the Python's on that file and on
+the test fixtures: identical.
+
 Supports: upstream has no headless command for them, so `ts/autosupport-slice.ts`
 runs the app's own placement and support export under Node, and
 `dragonfruit-mcp-tools overhangs` runs the app's overhang scan (a Tauri command
@@ -80,6 +116,8 @@ differ slightly from the GUI's and between runs. Check a print before trusting i
 | `rust/dragonfruit-mcp-tools/` | Our Rust tool (hollowing, hole punching, overhang scan), linking DragonFruit's `dragonfruit-mesh-repair` |
 | `ts/` | Our TypeScript scripts, run under DragonFruit's tsx against its own modules (auto-supports) |
 | `vendor/dragonfruit/` | DragonFruit, as a submodule pinned to upstream `dev` |
+| `accel/goo-trim/` | Optional Rust backend for `trim_islands` (see above) |
+| `scripts/build-accel.sh` | Builds `bin/goo-trim` |
 | `scripts/build.sh` | Builds `bin/dragonfruit-cli` and `bin/dragonfruit-mcp-tools`, and installs DragonFruit's Node dependencies for `dragonfruit-ts-cli` |
 | `docs/architecture/` | Architecture diagram source (`.drawio`) and generated SVG |
 | `docs/logo.png` | The logo; the other candidates live on the `logo-candidates` branch |

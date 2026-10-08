@@ -13,6 +13,12 @@ from nakomis_dragonfruit_mcp.tools import trim
 W, H = 40, 30
 
 
+@pytest.fixture(autouse=True)
+def _python_backend_by_default(monkeypatch):
+    """Whatever the shell says, these tests choose their backend explicitly."""
+    monkeypatch.delenv(trim.BACKEND_ENV, raising=False)
+
+
 def frame(*boxes, grey=None):
     """A W x H layer with white boxes (r0, r1, c0, c1) and optional grey boxes (box, value)."""
     a = np.zeros((H, W), np.uint8)
@@ -237,3 +243,127 @@ def test_fast_decoder_matches_the_run_by_run_one(seed):
     data = goo.encode_layer(pixels)
     assert goo.decode_layer(data, len(pixels), 1) == goo._decode_slowly(data, len(pixels), 1)
     assert goo.decode_layer(data, len(pixels), 1) == pixels
+
+
+# --- the backend switch -----------------------------------------------------------
+
+
+def _no_binary(monkeypatch):
+    def missing(name):
+        raise cli.CliError(f"{name} not found")
+
+    monkeypatch.setattr(cli, "find_binary", missing)
+
+
+def _fake_binary(monkeypatch):
+    monkeypatch.setattr(cli, "find_binary", lambda name: Path("/fake") / name)
+
+
+def test_backend_defaults_to_python_even_when_built(monkeypatch):
+    _fake_binary(monkeypatch)
+    assert trim.choose_backend(None) == "python"
+
+
+def test_backend_env_and_parameter(monkeypatch):
+    _fake_binary(monkeypatch)
+    monkeypatch.setenv(trim.BACKEND_ENV, "rust")
+    assert trim.choose_backend(None) == "rust"
+    assert trim.choose_backend("python") == "python"  # the parameter wins
+    monkeypatch.setenv(trim.BACKEND_ENV, " Auto ")
+    assert trim.choose_backend(None) == "rust"
+
+
+def test_backend_auto_falls_back_but_rust_insists(monkeypatch):
+    _no_binary(monkeypatch)
+    assert trim.choose_backend("auto") == "python"
+    with pytest.raises(cli.CliError, match="build-accel.sh"):
+        trim.choose_backend("rust")
+    monkeypatch.setenv(trim.BACKEND_ENV, "rust")
+    with pytest.raises(cli.CliError, match="build-accel.sh"):
+        trim.choose_backend(None)
+
+
+def test_backend_unknown_is_refused():
+    with pytest.raises(cli.CliError, match="unknown trim backend"):
+        trim.choose_backend("fortran")
+
+
+def test_tool_reports_the_python_backend(island_goo):
+    result = asyncio.run(trim.trim_islands(str(island_goo), backend="python"))
+    assert result.backend == "python" and result.regions_dropped == 2
+
+
+def test_tool_maps_the_rust_output(island_goo, tmp_path, monkeypatch):
+    _fake_binary(monkeypatch)
+    calls = []
+
+    def fake_run(binary, args, *, parse_json=False, timeout=0):
+        calls.append((binary, args))
+        data = {
+            "layers": 4,
+            "layers_changed": 2,
+            "regions_dropped": 2,
+            "pixels_dropped": 32,
+            "by_layer": [[2, 1, 16], [3, 1, 16]],
+            "islands_left": 3,
+            "largest_island_left_px": 40,
+        }
+        return cli.CliResult(exe=Path(binary), args=args, stdout="", stderr="", data=data)
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    out = tmp_path / "r.goo"
+    result = asyncio.run(trim.trim_islands(str(island_goo), str(out), backend="rust"))
+    assert calls == [("goo-trim", ["trim", str(island_goo), str(out), "--verify"])]
+    assert result.backend == "rust" and result.worst_layers == [[2, 1, 16], [3, 1, 16]]
+    assert (result.islands_left, result.largest_island_left_px) == (3, 40)
+    assert result.warnings and "40 px" in result.warnings[0]
+
+
+def test_tool_maps_a_rust_file_that_appears_mid_run(island_goo, tmp_path, monkeypatch):
+    _fake_binary(monkeypatch)
+
+    def fake_run(binary, args, **kw):
+        raise cli.CliError(
+            "goo-trim exited 1: goo-trim: x already exists (appeared while trimming)"
+        )
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    with pytest.raises(cli.CliError, match="appeared while trimming; nothing was overwritten"):
+        asyncio.run(trim.trim_islands(str(island_goo), str(tmp_path / "x.goo"), backend="rust"))
+
+
+def _goo_trim_built() -> bool:
+    try:
+        cli.find_binary(trim.GOO_TRIM)
+    except cli.CliError:
+        return False
+    return True
+
+
+def _fixtures(tmp_path: Path, island: Path) -> list[Path]:
+    grey = tmp_path / "grey.goo"
+    edge = ((5, 15, 15, 16), 90)
+    make_goo(
+        grey,
+        [frame(BLOCK), frame(BLOCK, grey=[edge, ((25, 27, 35, 37), 200), ((25, 27, 2, 4), 40)])],
+        width=W,
+        height=H,
+    )
+    blank = tmp_path / "blank.goo"
+    make_goo(blank, [frame(), frame(BLOCK, DOT), frame(), frame(BLOCK)], width=W, height=H)
+    return [island, grey, blank]
+
+
+@pytest.mark.skipif(not _goo_trim_built(), reason="run scripts/build-accel.sh to build goo-trim")
+def test_rust_matches_python_byte_for_byte(island_goo, tmp_path):
+    for src in _fixtures(tmp_path, island_goo):
+        py_out, rs_out = tmp_path / f"{src.stem}.py.goo", tmp_path / f"{src.stem}.rs.goo"
+        py = trim.run(str(src), str(py_out), 18.0, True, backend="python")
+        rs = trim.run(str(src), str(rs_out), 18.0, True, backend="rust")
+        assert rs_out.read_bytes() == py_out.read_bytes(), src.name
+        assert rs.backend == "rust" and py.backend == "python"
+        assert rs.model_dump(exclude={"backend", "output_path"}) == py.model_dump(
+            exclude={"backend", "output_path"}
+        ), src.name
+        islands = cli.run(trim.GOO_TRIM, ["islands", str(src)], parse_json=True).data["islands"]
+        assert [tuple(i) for i in islands] == goo_trim.find_islands(src, workers=1), src.name
