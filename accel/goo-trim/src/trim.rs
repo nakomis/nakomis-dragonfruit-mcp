@@ -216,8 +216,10 @@ pub fn trim_file(src: &Path, dst: &Path) -> Result<Report, String> {
         };
         let report = trim_layers(&file, &g, tx);
         let written = w.join().map_err(|_| "the writer panicked".to_string())?;
-        let report = report?;
+        // A failed writer makes trim_layers fail too, with only "the writer
+        // stopped"; its own error (a full disk, say) is the one worth showing.
         written?;
+        let report = report?;
         let mode = fs::metadata(src).map_err(|e| e.to_string())?.permissions();
         fs::set_permissions(&tmp, mode).map_err(|e| format!("cannot copy permissions: {e}"))?;
         // link() refuses if dst has appeared meanwhile, so nothing is overwritten.
