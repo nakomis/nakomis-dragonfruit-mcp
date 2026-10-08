@@ -263,14 +263,9 @@ fn holes_sidecar_path(output: &Path) -> std::path::PathBuf {
     name.into()
 }
 
-/// Write the holes next to the STL, in the STL's own coordinates (mm): each hole's
-/// start point and the direction it runs outwards through the wall.
-fn write_holes_sidecar(
-    path: &Path,
-    holes: &[PlacedHole],
-    input: &Path,
-    output: &Path,
-) -> Result<(), String> {
+/// Write the holes to `path`, in the STL's own coordinates (mm): each hole's start
+/// point and the direction it runs outwards through the wall.
+fn write_holes_sidecar(path: &Path, holes: &[PlacedHole], output: &Path) -> Result<(), String> {
     let list: Vec<_> = holes
         .iter()
         .map(|h| {
@@ -285,9 +280,46 @@ fn write_holes_sidecar(
             })
         })
         .collect();
-    let doc = json!({"holes": list, "source_stl": output, "input_stl": input});
+    let doc = json!({"holes": list, "source_stl": output});
     let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Write the STL and its holes sidecar so that a failure never leaves a mismatched pair:
+/// the sidecar goes to a temp file first (failing here touches nothing that exists), the
+/// STL is replaced atomically, and only then is the sidecar renamed into place. If that
+/// last rename fails the new STL is removed rather than left without its record.
+fn write_outputs(
+    mesh: &dragonfruit_mesh_repair::IndexedMesh,
+    output: &Path,
+    sidecar: &Path,
+    holes: &[PlacedHole],
+) -> Result<(), String> {
+    let mut tmp_name = sidecar.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_name);
+    let remove = |p: &Path| -> String {
+        match std::fs::remove_file(p) {
+            Ok(()) => String::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => format!("; also could not remove {}: {e}", p.display()),
+        }
+    };
+    if let Err(e) = write_holes_sidecar(&tmp, holes, output) {
+        return Err(format!("{e}{}", remove(&tmp)));
+    }
+    if let Err(e) = write(mesh, output) {
+        return Err(format!("{e}{}", remove(&tmp)));
+    }
+    if let Err(e) = std::fs::rename(&tmp, sidecar) {
+        return Err(format!(
+            "cannot move the holes sidecar into place at {}: {e}{}{}",
+            sidecar.display(),
+            remove(&tmp),
+            remove(output)
+        ));
+    }
+    Ok(())
 }
 
 fn punch_cmd(
@@ -331,43 +363,21 @@ fn punch_cmd(
     }
 
     let t = Instant::now();
-    let outcome = ops::punch(mesh, &placed);
+    let outcome = ops::punch(mesh.clone(), &placed);
     let punch_ms = ms(t);
     let t = Instant::now();
     let after = ops::stats(&outcome.mesh);
     analyse_ms += ms(t);
     let t = Instant::now();
-    let checks = drain::verify_holes(&outcome.mesh, &placed);
+    let checks = drain::verify_holes(&mesh, &outcome.mesh, &placed);
     let verify_ms = ms(t);
     let t = Instant::now();
-    write(&outcome.mesh, output)?;
     let sidecar = holes_sidecar_path(output);
-    if let Err(e) = write_holes_sidecar(&sidecar, &placed, input, output) {
-        // An STL without its record of the holes is not left behind.
-        let _ = std::fs::remove_file(output);
-        return Err(e);
-    }
+    write_outputs(&outcome.mesh, output, &sidecar, &placed)?;
     let write_ms = ms(t);
 
     warnings.extend(ops::punch_warnings(&before, &after));
-    for (h, c) in placed.iter().zip(&checks) {
-        if !c.checked {
-            warnings.push(format!(
-                "hole {} ({}) is not axis-aligned, so its opening was not verified",
-                c.hole, h.purpose
-            ));
-        } else if c.min_open_fraction < drain::CHECK_MIN_OPEN_FRACTION {
-            warnings.push(format!(
-                "hole {} ({}, {:.1} mm across) narrows to {:.1} mm2 of open section ({:.0}% of its disc) {:.1} mm along the axis from its start; it may clog or trap resin there",
-                c.hole,
-                h.purpose,
-                2.0 * h.radius_mm,
-                c.min_open_area_mm2,
-                100.0 * c.min_open_fraction,
-                c.at_mm
-            ));
-        }
-    }
+    warnings.extend(drain::hole_warnings(&placed, &checks));
 
     let saved = before.volume_ml - after.volume_ml;
     let report = json!({
@@ -583,6 +593,39 @@ mod tests {
             "area {}",
             steep[0].area_mm2
         );
+    }
+
+    #[test]
+    fn a_sidecar_that_cannot_be_written_leaves_an_existing_output_alone() {
+        let dir = std::env::temp_dir().join(format!("ndfm15-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (stl, sidecar) = (dir.join("a.stl"), dir.join("a.stl.holes.json"));
+        std::fs::write(&stl, b"good stl").unwrap();
+        std::fs::write(&sidecar, b"good sidecar").unwrap();
+        // The temp file's name is taken by a directory, so it cannot be created.
+        std::fs::create_dir(dir.join("a.stl.holes.json.tmp")).unwrap();
+        let mesh = dragonfruit_mesh_repair::IndexedMesh::default();
+        let err = crate::write_outputs(&mesh, &stl, &sidecar, &[]).unwrap_err();
+        assert!(err.contains("cannot write"), "{err}");
+        assert_eq!(std::fs::read(&stl).unwrap(), b"good stl");
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"good sidecar");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_good_write_leaves_the_pair_and_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("ndfm15-pair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (stl, sidecar) = (dir.join("b.stl"), dir.join("b.stl.holes.json"));
+        let mesh = dragonfruit_mesh_repair::IndexedMesh::default();
+        crate::write_outputs(&mesh, &stl, &sidecar, &[]).unwrap();
+        assert!(stl.is_file() && sidecar.is_file());
+        assert!(!dir.join("b.stl.holes.json.tmp").exists());
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert_eq!(doc["holes"], serde_json::json!([]));
+        assert_eq!(doc["source_stl"], serde_json::json!(stl));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

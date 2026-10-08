@@ -51,6 +51,7 @@ HOLE_CHECK = {
     "min_open_area_mm2": 10.18,
     "min_open_fraction": 1.0,
     "at_mm": -0.1,
+    "exits_skin": True,
 }
 PUNCH_REPORT = {
     "before": _stats(17.5, cavities=1, shells=2),
@@ -205,11 +206,32 @@ def test_drill_needs_exactly_one_of_holes_or_auto_drain(bin_dir, stl, kwargs):
         hollow_tools.drill_holes(stl, **kwargs)
 
 
-def test_drill_missing_sidecar_is_an_error(bin_dir, stl):
+def test_drill_missing_sidecar_is_an_error_and_removes_the_stl(bin_dir, stl):
     report = {**PUNCH_REPORT, "holes_sidecar": str(stl.with_name("nope.holes.json"))}
     _fake_tools(bin_dir, report)
+    out = stl.with_name("model.drilled.stl")
+    out.write_bytes(b"as if the binary had written it")
     with pytest.raises(cli.CliError, match="did not write"):
         hollow_tools.drill_holes(stl, auto_drain=True)
+    assert not out.exists()
+
+
+def test_drill_paths_are_absolute(bin_dir, stl, monkeypatch):
+    _fake_tools(bin_dir, _punch_report(stl))
+    monkeypatch.chdir(stl.parent)
+    result = hollow_tools.drill_holes("model.stl", auto_drain=True, out_path="rel/out.stl")
+    assert Path(result.input_path).is_absolute()
+    assert Path(result.output_path).is_absolute()
+    assert result.output_path == str(stl.parent / "rel" / "out.stl")
+
+
+def test_drill_hole_that_stops_short_is_reported(bin_dir, stl):
+    short = {**HOLE_CHECK, "exits_skin": False}
+    warning = "hole 0 (vent) stops short of the outer skin (5.0 mm long)"
+    _fake_tools(bin_dir, _punch_report(stl, hole_checks=[short], warnings=[warning]))
+    result = hollow_tools.drill_holes(stl, auto_drain=True)
+    assert not result.hole_checks[0].exits_skin
+    assert result.warnings == [warning]
 
 
 def test_drill_constriction_warning_is_passed_on(bin_dir, stl):
@@ -284,6 +306,7 @@ def test_real_binary_hollow_then_drill_a_cube(tmp_path):
     # A flat cube cavity needs no extension, and the holes open at full width.
     assert all(h.extension_mm == 0.0 for h in drilled.holes)
     assert all(c.checked and c.min_open_fraction > 0.95 for c in drilled.hole_checks)
+    assert all(c.exits_skin for c in drilled.hole_checks)
     sidecar = json.loads(Path(drilled.holes_sidecar).read_text())
     assert drilled.holes_sidecar == drilled.output_path + ".holes.json"
     assert sidecar["source_stl"] == drilled.output_path
@@ -315,6 +338,7 @@ def test_real_binary_on_the_test_model(tmp_path):
     vent = next(h for h in drilled.holes if h.purpose == "vent")
     assert vent.extension_mm > 1.0
     assert all(c.checked and c.min_open_fraction > 0.9 for c in drilled.hole_checks)
+    assert all(c.exits_skin for c in drilled.hole_checks)
 
 
 def test_tools_are_registered_with_the_server():
