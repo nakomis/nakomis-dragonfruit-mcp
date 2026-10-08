@@ -183,6 +183,9 @@ pub struct PlacedHole {
     pub purpose: String,
     /// Which cavity (index into the mesh's shells) an automatic hole serves.
     pub cavity: Option<usize>,
+    /// How far an automatic hole's start was pushed into the cavity (mm) so its full
+    /// diameter opens into the void.
+    pub extension_mm: f32,
     pub note: String,
 }
 
@@ -302,6 +305,7 @@ pub fn resolve_holes(
                 length_mm,
                 purpose: "manual".into(),
                 cavity: None,
+                extension_mm: 0.0,
                 note: "as requested".into(),
             }
         })

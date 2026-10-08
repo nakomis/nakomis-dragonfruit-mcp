@@ -256,6 +256,72 @@ fn parse_holes(arg: &str) -> Result<Vec<Hole>, String> {
     serde_json::from_value(value).map_err(|e| format!("invalid holes JSON: {e}"))
 }
 
+/// `<out.stl>.holes.json`, the machine-readable record of where the holes are.
+fn holes_sidecar_path(output: &Path) -> std::path::PathBuf {
+    let mut name = output.as_os_str().to_owned();
+    name.push(".holes.json");
+    name.into()
+}
+
+/// Write the holes to `path`, in the STL's own coordinates (mm): each hole's start
+/// point and the direction it runs outwards through the wall.
+fn write_holes_sidecar(path: &Path, holes: &[PlacedHole], output: &Path) -> Result<(), String> {
+    let list: Vec<_> = holes
+        .iter()
+        .map(|h| {
+            json!({
+                "x": h.x, "y": h.y, "z": h.z,
+                "radius_mm": h.radius_mm,
+                "direction": h.direction,
+                "axis": h.axis,
+                "length_mm": h.length_mm,
+                "purpose": h.purpose,
+                "cavity": h.cavity,
+            })
+        })
+        .collect();
+    let doc = json!({"holes": list, "source_stl": output});
+    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Write the STL and its holes sidecar so that a failure never leaves a mismatched pair:
+/// the sidecar goes to a temp file first (failing here touches nothing that exists), the
+/// STL is replaced atomically, and only then is the sidecar renamed into place. If that
+/// last rename fails the new STL is removed rather than left without its record.
+fn write_outputs(
+    mesh: &dragonfruit_mesh_repair::IndexedMesh,
+    output: &Path,
+    sidecar: &Path,
+    holes: &[PlacedHole],
+) -> Result<(), String> {
+    let mut tmp_name = sidecar.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_name);
+    let remove = |p: &Path| -> String {
+        match std::fs::remove_file(p) {
+            Ok(()) => String::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => format!("; also could not remove {}: {e}", p.display()),
+        }
+    };
+    if let Err(e) = write_holes_sidecar(&tmp, holes, output) {
+        return Err(format!("{e}{}", remove(&tmp)));
+    }
+    if let Err(e) = write(mesh, output) {
+        return Err(format!("{e}{}", remove(&tmp)));
+    }
+    if let Err(e) = std::fs::rename(&tmp, sidecar) {
+        return Err(format!(
+            "cannot move the holes sidecar into place at {}: {e}{}{}",
+            sidecar.display(),
+            remove(&tmp),
+            remove(output)
+        ));
+    }
+    Ok(())
+}
+
 fn punch_cmd(
     input: &Path,
     output: &Path,
@@ -297,16 +363,21 @@ fn punch_cmd(
     }
 
     let t = Instant::now();
-    let outcome = ops::punch(mesh, &placed);
+    let outcome = ops::punch(mesh.clone(), &placed);
     let punch_ms = ms(t);
     let t = Instant::now();
     let after = ops::stats(&outcome.mesh);
     analyse_ms += ms(t);
     let t = Instant::now();
-    write(&outcome.mesh, output)?;
+    let checks = drain::verify_holes(&mesh, &outcome.mesh, &placed);
+    let verify_ms = ms(t);
+    let t = Instant::now();
+    let sidecar = holes_sidecar_path(output);
+    write_outputs(&outcome.mesh, output, &sidecar, &placed)?;
     let write_ms = ms(t);
 
     warnings.extend(ops::punch_warnings(&before, &after));
+    warnings.extend(drain::hole_warnings(&placed, &checks));
 
     let saved = before.volume_ml - after.volume_ml;
     let report = json!({
@@ -315,11 +386,13 @@ fn punch_cmd(
         "auto_drain": auto_drain,
         "cavities_found": cavities_found,
         "holes": placed,
+        "hole_checks": checks,
+        "holes_sidecar": sidecar,
         "before": before,
         "after": after,
         "volume_removed_ml": saved,
         "crate_report": outcome.report,
-        "timing_ms": {"load": load_ms, "punch": punch_ms, "analyse": analyse_ms, "write": write_ms, "total": ms(total)},
+        "timing_ms": {"load": load_ms, "punch": punch_ms, "verify": verify_ms, "analyse": analyse_ms, "write": write_ms, "total": ms(total)},
         "warnings": warnings,
     });
     emit(&report, as_json, || {
@@ -519,6 +592,47 @@ mod tests {
             (steep[0].area_mm2 - 400.0).abs() < 1.0,
             "area {}",
             steep[0].area_mm2
+        );
+    }
+
+    #[test]
+    fn a_sidecar_that_cannot_be_written_leaves_an_existing_output_alone() {
+        let dir = std::env::temp_dir().join(format!("ndfm15-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (stl, sidecar) = (dir.join("a.stl"), dir.join("a.stl.holes.json"));
+        std::fs::write(&stl, b"good stl").unwrap();
+        std::fs::write(&sidecar, b"good sidecar").unwrap();
+        // The temp file's name is taken by a directory, so it cannot be created.
+        std::fs::create_dir(dir.join("a.stl.holes.json.tmp")).unwrap();
+        let mesh = dragonfruit_mesh_repair::IndexedMesh::default();
+        let err = crate::write_outputs(&mesh, &stl, &sidecar, &[]).unwrap_err();
+        assert!(err.contains("cannot write"), "{err}");
+        assert_eq!(std::fs::read(&stl).unwrap(), b"good stl");
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"good sidecar");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_good_write_leaves_the_pair_and_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("ndfm15-pair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (stl, sidecar) = (dir.join("b.stl"), dir.join("b.stl.holes.json"));
+        let mesh = dragonfruit_mesh_repair::IndexedMesh::default();
+        crate::write_outputs(&mesh, &stl, &sidecar, &[]).unwrap();
+        assert!(stl.is_file() && sidecar.is_file());
+        assert!(!dir.join("b.stl.holes.json.tmp").exists());
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert_eq!(doc["holes"], serde_json::json!([]));
+        assert_eq!(doc["source_stl"], serde_json::json!(stl));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_sidecar_sits_beside_the_stl_with_its_full_name() {
+        assert_eq!(
+            crate::holes_sidecar_path(std::path::Path::new("/tmp/a/logo.drilled.stl")),
+            std::path::Path::new("/tmp/a/logo.drilled.stl.holes.json")
         );
     }
 }

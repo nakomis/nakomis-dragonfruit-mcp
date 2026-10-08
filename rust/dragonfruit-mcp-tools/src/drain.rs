@@ -11,15 +11,35 @@ use std::collections::HashMap;
 
 use dragonfruit_mesh_repair::{IndexedMesh, Vec3};
 
-use crate::ops::{axis_name, ray_hits, ray_tri, PlacedHole, Shells, EXIT_MARGIN_MM};
+use crate::ops::{axis_name, inside_skin, ray_hits, ray_tri, PlacedHole, Shells, EXIT_MARGIN_MM};
 
 /// Cavities below this fraction of the biggest one are voxel crumbs, not worth a hole.
 const CAVITY_CRUMB_FRACTION: f64 = 0.01;
 /// How far into the cavity (along the hole) a hole starts, so it begins in the void.
 const START_INSET_MM: f32 = 0.3;
+/// A hole's start is pushed further into the cavity until the cavity is wider than the
+/// hole's disc plus this margin all round, so the full diameter breaks into open space
+/// (a dome narrowing to an apex would otherwise give a slit), by at most `EXTEND_MAX_MM`.
+const FULL_WIDTH_MARGIN_MM: f32 = 0.25;
+const EXTEND_STEP_MM: f32 = 0.25;
+const EXTEND_MAX_MM: f32 = 10.0;
+/// Verification samples the hole's disc at this fraction of its radius ...
+const CHECK_RADIUS_FRACTION: f32 = 0.9;
+/// ... on a grid of this pitch, at stations this far apart along the axis.
+const CHECK_GRID_MM: f32 = 0.2;
+const CHECK_STEP_MM: f32 = 0.25;
+/// The first station is this far behind the hole's start, inside the cavity.
+const CHECK_LEAD_MM: f32 = 0.1;
+/// A hole whose narrowest section opens less than this fraction of the sampled disc is
+/// reported as constricted.
+pub const CHECK_MIN_OPEN_FRACTION: f32 = 0.9;
 /// Candidate positions are taken from this band at the cavity's extreme end.
 const CANDIDATE_BAND_MM: f32 = 3.0;
 const CANDIDATE_CELL_MM: f32 = 1.0;
+/// Interior candidates are on a grid at least this coarse.
+const GRID_MIN_STEP_MM: f32 = 1.0;
+/// Score per mm a grid point lies from the nearest cavity-vertex candidate.
+const GRID_PULL: f32 = 0.5;
 const MAX_CANDIDATES: usize = 300;
 /// How picky a placement is. The skin under the hole footprint (and a margin around it)
 /// may vary only so much in depth, or the hole would break through on a slope or on
@@ -101,6 +121,9 @@ impl Axis {
     }
 }
 
+fn bounds(it: impl Iterator<Item = f32>) -> (f32, f32) {
+    it.fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)))
+}
 fn v3(p: [f32; 3]) -> Vec3 {
     Vec3::new(p[0], p[1], p[2])
 }
@@ -200,6 +223,12 @@ struct Candidate {
     dir: [f32; 3],
     exit_mm: f32,
     spread_mm: f32,
+    /// How far the start was pushed into the cavity beyond the usual inset.
+    extension_mm: f32,
+    /// Whether the cavity at the start fully contains the hole's disc.
+    full_width: bool,
+    /// From the interior grid rather than at a cavity vertex.
+    grid: bool,
     score: f32,
     strictness: &'static str,
 }
@@ -226,6 +255,49 @@ impl Placer<'_> {
         let m = self.cols.mesh;
         let n = m.tri_normal(hit.1 as u32);
         Some((hit.0, n.x * dir[0] + n.y * dir[1] + n.z * dir[2]))
+    }
+
+    /// Whether `p` is in the void of cavity `cav`: the first wall of that cavity met
+    /// along `dir` is one the ray runs into the material through (normals point into
+    /// the void), not one it leaves the material through.
+    fn in_cavity(&self, cav: usize, p: [f32; 3], dir: [f32; 3]) -> bool {
+        self.cols
+            .hits(p, dir)
+            .into_iter()
+            .find(|h| self.shells.triangle_shell[h.1] == cav)
+            .is_some_and(|h| !h.2)
+    }
+
+    /// Whether the cavity contains the hole's whole disc (plus margin) at `p`.
+    fn disc_in_cavity(&self, cav: usize, p: [f32; 3], dir: [f32; 3]) -> bool {
+        let (ia, ib) = self.axis.plane();
+        if !self.in_cavity(cav, p, dir) {
+            return false;
+        }
+        let ring = self.radius + FULL_WIDTH_MARGIN_MM;
+        (0..16).all(|i| {
+            let ang = 0.1 + i as f32 * std::f32::consts::FRAC_PI_8;
+            let mut q = p;
+            q[ia] += ring * ang.cos();
+            q[ib] += ring * ang.sin();
+            self.in_cavity(cav, q, dir)
+        })
+    }
+
+    /// Move `start` back into the cavity (against `dir`) until the disc fits, at most
+    /// `EXTEND_MAX_MM`. Returns the new start, the extra depth, and whether it fits;
+    /// if it never does, the start is left where it was.
+    fn extend(&self, cav: usize, start: [f32; 3], dir: [f32; 3]) -> ([f32; 3], f32, bool) {
+        let inward = [-dir[0], -dir[1], -dir[2]];
+        let steps = (EXTEND_MAX_MM / EXTEND_STEP_MM) as usize;
+        for i in 0..=steps {
+            let s = i as f32 * EXTEND_STEP_MM;
+            let p = add(start, inward, s);
+            if self.disc_in_cavity(cav, p, dir) {
+                return (p, s, true);
+            }
+        }
+        (start, 0.0, false)
     }
 
     /// Try a hole at column (`a`, `b`) at one end of cavity `cav`.
@@ -256,6 +328,7 @@ impl Placer<'_> {
         let surface = surface.ok_or("the column does not cross the cavity")?;
         let on_surface = add(origin, up, surface.0);
         let start = add(on_surface, up, inset);
+        let (start, extension_mm, full_width) = self.extend(cav, start, dir);
         let (exit_mm, squareness) = self.exit(start, dir).ok_or("no way out of the skin")?;
         if squareness < self.strict.squareness {
             return Err("the skin there is not square to the hole".into());
@@ -286,7 +359,13 @@ impl Placer<'_> {
             dir,
             exit_mm,
             spread_mm: spread,
-            score: exit_mm + 2.0 * spread + 0.3 * off_extreme,
+            extension_mm,
+            full_width,
+            grid: false,
+            // The wall is measured from the usual start, not the extended one, so a hole
+            // that has to go deeper to open up is not marked down for it and the
+            // candidates are ranked as they were before the extension existed.
+            score: (exit_mm - extension_mm) + 2.0 * spread + 0.3 * off_extreme,
             strictness: self.strict.name,
         })
     }
@@ -317,6 +396,7 @@ fn placed(
         length_mm: length,
         purpose: purpose.into(),
         cavity: Some(cav),
+        extension_mm: c.extension_mm,
         note,
     }
 }
@@ -396,8 +476,9 @@ pub fn auto_drain_holes(
 
         let best = |end: End| -> Result<Candidate, String> {
             let extreme = if end == End::Low { h_min } else { h_max };
-            let spots: Vec<(f32, f32)> = match xy {
-                Some([a, b]) => vec![(a, b)],
+            // (a, b, pull): `pull` is Some for interior grid points.
+            let spots: Vec<(f32, f32, Option<f32>)> = match xy {
+                Some([a, b]) => vec![(a, b, None)],
                 None => {
                     // Per 1 mm cell, the vertex closest to the extreme, within the band.
                     let mut cells: HashMap<(i32, i32), (f32, f32, f32)> = HashMap::new();
@@ -418,10 +499,37 @@ pub fn auto_drain_holes(
                     let mut v: Vec<_> = cells.into_iter().collect();
                     v.sort_by_key(|x| x.0);
                     let stride = v.len().div_ceil(MAX_CANDIDATES).max(1);
-                    v.into_iter()
+                    let mut spots: Vec<(f32, f32, Option<f32>)> = v
+                        .into_iter()
                         .step_by(stride)
-                        .map(|(_, (a, b, _))| (a + JITTER[0], b + JITTER[1]))
-                        .collect()
+                        .map(|(_, (a, b, _))| (a + JITTER[0], b + JITTER[1], None))
+                        .collect();
+                    let vertex_spots: Vec<(f32, f32)> = spots.iter().map(|s| (s.0, s.1)).collect();
+                    // Vertices sit on the cavity's edges and corners, where the hole's
+                    // disc would half miss the void, so a coarse grid over its footprint
+                    // is the second choice (columns that miss the cavity are rejected
+                    // cheaply). A grid point is marked down by its distance from the
+                    // nearest vertex spot, so it hugs the cavity's outline, away from
+                    // the middle of a flat face, as the vertices did.
+                    let (a0, a1) = bounds(pts.iter().map(|p| p.0));
+                    let (b0, b1) = bounds(pts.iter().map(|p| p.1));
+                    let step = ((a1 - a0) * (b1 - b0) / MAX_CANDIDATES as f32)
+                        .sqrt()
+                        .max(GRID_MIN_STEP_MM);
+                    let mut a = a0 + step / 2.0;
+                    while a < a1 {
+                        let mut b = b0 + step / 2.0;
+                        while b < b1 {
+                            let near = vertex_spots
+                                .iter()
+                                .map(|v| ((v.0 - a).powi(2) + (v.1 - b).powi(2)).sqrt())
+                                .fold(f32::MAX, f32::min);
+                            spots.push((a + JITTER[0], b + JITTER[1], Some(GRID_PULL * near)));
+                            b += step;
+                        }
+                        a += step;
+                    }
+                    spots
                 }
             };
             let mut reason = String::from("no candidate position");
@@ -430,10 +538,22 @@ pub fn auto_drain_holes(
                 let placer = placer(strict);
                 let mut why: HashMap<String, usize> = HashMap::new();
                 let mut best: Option<Candidate> = None;
-                for &(a, b) in &spots {
+                for &(a, b, pull) in &spots {
+                    // Grid points are for clean skin only: on rough skin they would
+                    // accept a pointed tip a vertex search never offered.
+                    if pull.is_some() && strict.name != STRICT.name {
+                        continue;
+                    }
                     match placer.evaluate(cav, a, b, end, extreme) {
-                        Ok(c) => {
-                            if best.as_ref().is_none_or(|x| c.score < x.score) {
+                        Ok(mut c) => {
+                            c.grid = pull.is_some();
+                            c.score += pull.unwrap_or(0.0);
+                            // Full width first, then cavity vertices, then the score.
+                            let rank = |c: &Candidate| (!c.full_width, c.grid);
+                            if best
+                                .as_ref()
+                                .is_none_or(|x| (rank(&c), c.score) < (rank(x), x.score))
+                            {
                                 best = Some(c);
                             }
                         }
@@ -465,14 +585,29 @@ pub fn auto_drain_holes(
                             "cavity {cav}: the {purpose} hole is vertical but exits on rough skin (no flat spot within reach); check it is not on a visible face or detail"
                         ));
                     }
+                    if !c.full_width {
+                        out.warnings.push(format!(
+                            "cavity {cav}: the {purpose} hole could not be started where the cavity is wide enough for its full {:.1} mm diameter (searched {EXTEND_MAX_MM} mm into the cavity); it may open only a narrow slit",
+                            2.0 * radius_mm
+                        ));
+                    }
                     out.holes.push(placed(
                         c,
                         radius_mm,
                         cav,
                         purpose,
                         format!(
-                            "cavity {cav} ({volume_ml:.1} ml): through the {what}; {:.1} mm of wall, skin flat within {:.2} mm",
-                            c.exit_mm, c.spread_mm
+                            "cavity {cav} ({volume_ml:.1} ml): through the {what}; {:.1} mm of wall, skin flat within {:.2} mm{}",
+                            c.exit_mm,
+                            c.spread_mm,
+                            if c.extension_mm > 0.0 {
+                                format!(
+                                    "; started {:.2} mm further into the cavity so the full diameter opens",
+                                    c.extension_mm
+                                )
+                            } else {
+                                String::new()
+                            }
                         ),
                         c.exit_mm + EXIT_MARGIN_MM,
                     ));
@@ -572,10 +707,159 @@ fn horizontal_pair(
             length_mm: d + EXIT_MARGIN_MM,
             purpose: format!("{purpose} (horizontal fallback)"),
             cavity: Some(cav),
+            extension_mm: 0.0,
             note: format!("cavity {cav}: {d:.1} mm from the hole start to the outside"),
         }
     })
     .collect())
+}
+
+/// What was measured across a punched hole.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HoleCheck {
+    /// Index into the holes as punched.
+    pub hole: usize,
+    /// Whether the hole could be checked (axis-aligned holes only).
+    pub checked: bool,
+    /// The hole's nominal area, pi r^2.
+    pub hole_area_mm2: f32,
+    /// Open area of the narrowest section along the axis, within a disc of 0.9 r. In
+    /// practice this is the neck where the cavity meets the hole's end cap: past it the
+    /// hole is a cut cylinder, open by construction.
+    pub min_open_area_mm2: f32,
+    /// The same as a fraction of the 0.9 r disc's area (the "neck open fraction").
+    pub min_open_fraction: f32,
+    /// Where along the axis (mm from the hole's start, negative behind it) that section is.
+    pub at_mm: f32,
+    /// Whether the hole's end, and a ring of 0.9 r round it, lies outside the original
+    /// model's outer skin: false means the hole stops short of the outside.
+    pub exits_skin: bool,
+}
+
+/// Warnings for holes whose neck is constricted, which stop short of the skin, or which
+/// could not be measured.
+pub fn hole_warnings(holes: &[PlacedHole], checks: &[HoleCheck]) -> Vec<String> {
+    let mut w = Vec::new();
+    for (h, c) in holes.iter().zip(checks) {
+        if !c.checked {
+            w.push(format!(
+                "hole {} ({}) is not axis-aligned, so its opening and exit were not verified",
+                c.hole, h.purpose
+            ));
+            continue;
+        }
+        if c.min_open_fraction < CHECK_MIN_OPEN_FRACTION {
+            w.push(format!(
+                "hole {} ({}, {:.1} mm across): the neck where it meets the cavity is only {:.1} mm2 open ({:.0}% of the 0.9 r disc) {:.1} mm from its start; it may clog or trap resin there",
+                c.hole,
+                h.purpose,
+                2.0 * h.radius_mm,
+                c.min_open_area_mm2,
+                100.0 * c.min_open_fraction,
+                c.at_mm
+            ));
+        }
+        if !c.exits_skin {
+            w.push(format!(
+                "hole {} ({}) stops short of the outer skin ({:.1} mm long): it does not open to the outside",
+                c.hole, h.purpose, h.length_mm
+            ));
+        }
+    }
+    w
+}
+
+/// Slice the punched mesh with planes perpendicular to each axis-aligned hole's axis,
+/// from just behind the hole's start to its end, and find the narrowest open
+/// cross-section (a grid of points over a disc of 0.9 r at each station, open unless the
+/// first surface met along the hole direction is one the ray leaves material through).
+/// Because the punch cuts a cylinder, only the neck at the start is a real test; a hole
+/// started at a cavity's very apex shows up there as a small fraction. Separately,
+/// `exits_skin` tests, against the ORIGINAL mesh, that the hole's end is outside the
+/// outer skin.
+pub fn verify_holes(
+    original: &IndexedMesh,
+    mesh: &IndexedMesh,
+    holes: &[PlacedHole],
+) -> Vec<HoleCheck> {
+    let original_shells = Shells::of(original);
+    let mut columns: HashMap<usize, Columns> = HashMap::new();
+    holes
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let unchecked = HoleCheck {
+                hole: i,
+                checked: false,
+                hole_area_mm2: std::f32::consts::PI * h.radius_mm * h.radius_mm,
+                min_open_area_mm2: 0.0,
+                min_open_fraction: 0.0,
+                at_mm: 0.0,
+                exits_skin: false,
+            };
+            let Some(k) = (0..3).find(|&k| (h.direction[k].abs() - 1.0).abs() < 1e-4) else {
+                return unchecked;
+            };
+            let axis = Axis {
+                k,
+                sign: h.direction[k],
+            };
+            let cols = columns.entry(k).or_insert_with(|| Columns::new(mesh, axis));
+            let (ia, ib) = axis.plane();
+            let reach = CHECK_RADIUS_FRACTION * h.radius_mm;
+            let n = (reach / CHECK_GRID_MM).ceil() as i32;
+            let mut disc = Vec::new();
+            for gx in -n..=n {
+                for gy in -n..=n {
+                    let (dx, dy) = (gx as f32 * CHECK_GRID_MM, gy as f32 * CHECK_GRID_MM);
+                    if dx * dx + dy * dy <= reach * reach {
+                        disc.push((dx + JITTER[0], dy + JITTER[1]));
+                    }
+                }
+            }
+            // From just behind the start: the opening of the hole's end cap into the
+            // cavity is the first (and for a dome apex the narrowest) cross-section.
+            let stations = (h.length_mm / CHECK_STEP_MM) as usize;
+            let mut worst = (usize::MAX, 0.0_f32);
+            for st in 0..=stations {
+                let s = st as f32 * CHECK_STEP_MM - CHECK_LEAD_MM;
+                let centre = add([h.x, h.y, h.z], h.direction, s);
+                let open = disc
+                    .iter()
+                    .filter(|(dx, dy)| {
+                        let mut p = centre;
+                        p[ia] += dx;
+                        p[ib] += dy;
+                        !cols.hits(p, h.direction).first().is_some_and(|x| x.2)
+                    })
+                    .count();
+                if open < worst.0 {
+                    worst = (open, s);
+                }
+            }
+            let fraction = worst.0 as f32 / disc.len() as f32;
+            let end = add([h.x, h.y, h.z], h.direction, h.length_mm);
+            let exits_skin = std::iter::once((0.0, 0.0))
+                .chain((0..8).map(|i| {
+                    let ang = i as f32 * std::f32::consts::FRAC_PI_4;
+                    (reach * ang.cos(), reach * ang.sin())
+                }))
+                .all(|(dx, dy)| {
+                    let mut p = end;
+                    p[ia] += dx;
+                    p[ib] += dy;
+                    !inside_skin(original, &original_shells, v3(p))
+                });
+            HoleCheck {
+                checked: true,
+                exits_skin,
+                min_open_area_mm2: fraction * std::f32::consts::PI * reach * reach,
+                min_open_fraction: fraction,
+                at_mm: worst.1,
+                ..unchecked
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -744,5 +1028,293 @@ mod tests {
             .iter()
             .all(|h| h.purpose.contains("horizontal fallback")));
         assert!(drain.holes.iter().all(|h| h.direction[2] == 0.0));
+    }
+
+    /// A 40 mm cube with a sealed cavity of revolution about the vertical line through
+    /// (20, 20), from a profile of (radius, z) points running from the floor centre up to
+    /// the roof centre. `flip` mirrors it top to bottom.
+    fn revolved_cavity(profile: &[(f32, f32)], flip: bool) -> IndexedMesh {
+        let n = 32u32;
+        let mut positions = Vec::new();
+        let mut rows: Vec<Vec<u32>> = Vec::new();
+        for &(r, z) in profile {
+            let z = if flip { 40.0 - z } else { z };
+            let count = if r == 0.0 { 1 } else { n };
+            let mut row = Vec::new();
+            for i in 0..count {
+                let a = i as f32 * std::f32::consts::TAU / n as f32;
+                row.push(positions.len() as u32);
+                positions.push(Vec3::new(20.0 + r * a.cos(), 20.0 + r * a.sin(), z));
+            }
+            rows.push(row);
+        }
+        let mut triangles = Vec::new();
+        for w in rows.windows(2) {
+            for i in 0..n as usize {
+                let j = (i + 1) % n as usize;
+                let (a0, a1) = (w[0][i % w[0].len()], w[0][j % w[0].len()]);
+                let (b0, b1) = (w[1][i % w[1].len()], w[1][j % w[1].len()]);
+                if a0 != a1 {
+                    triangles.push([a0, a1, b1]);
+                }
+                if b0 != b1 {
+                    triangles.push([a0, b1, b0]);
+                }
+            }
+        }
+        // Normals into the void (a cavity), whichever way the winding came out.
+        let mut volume = 0.0;
+        for t in &triangles {
+            let (a, b, c) = (
+                positions[t[0] as usize],
+                positions[t[1] as usize],
+                positions[t[2] as usize],
+            );
+            volume += a.dot(b.cross(c));
+        }
+        if volume > 0.0 {
+            for t in &mut triangles {
+                t.swap(1, 2);
+            }
+        }
+        merge(vec![
+            cube(40.0),
+            IndexedMesh {
+                positions,
+                triangles,
+            },
+        ])
+    }
+
+    /// Flat floor at z = 8 (10 mm radius), vertical wall to z = 22, then a cone narrowing
+    /// to an apex at z = 32: its radius is `32 - z`, so it is wider than any hole of
+    /// radius R once `R + FULL_WIDTH_MARGIN_MM` below the apex.
+    fn dome_cavity(flip: bool) -> IndexedMesh {
+        revolved_cavity(
+            &[
+                (0.0, 8.0),
+                (10.0, 8.0),
+                (10.0, 22.0),
+                (7.5, 24.5),
+                (5.0, 27.0),
+                (2.5, 29.5),
+                (0.0, 32.0),
+            ],
+            flip,
+        )
+    }
+
+    /// A 10 mm-radius chamber (z 8 to 12) under a 1.5 mm-radius neck rising `neck` mm to
+    /// a flat roof: too narrow for any 2 mm hole until the chamber.
+    fn necked_cavity(neck: f32) -> IndexedMesh {
+        let top = 12.0 + neck;
+        revolved_cavity(
+            &[
+                (0.0, 8.0),
+                (10.0, 8.0),
+                (10.0, 12.0),
+                (1.5, 12.0),
+                (1.5, top),
+                (0.0, top),
+            ],
+            false,
+        )
+    }
+
+    fn hole_at(start: [f32; 3], direction: [f32; 3], length_mm: f32) -> PlacedHole {
+        PlacedHole {
+            x: start[0],
+            y: start[1],
+            z: start[2],
+            radius_mm: 2.0,
+            direction,
+            axis: axis_name(direction),
+            length_mm,
+            purpose: "manual".into(),
+            cavity: None,
+            extension_mm: 0.0,
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_hole_at_the_apex_of_a_dome_is_a_narrow_slit() {
+        // The old placement: 0.3 mm below the apex, where the cone is 0.6 mm wide.
+        let mesh = dome_cavity(false);
+        let hole = hole_at([20.0, 20.0, 31.7], [0.0, 0.0, 1.0], 9.3);
+        let punched = punch(mesh.clone(), &[hole.clone()]).mesh;
+        let check = &verify_holes(&mesh, &punched, &[hole])[0];
+        assert!(check.checked);
+        assert!(check.min_open_fraction < 0.2, "{check:?}");
+    }
+
+    #[test]
+    fn dome_roof_vent_starts_deep_enough_to_open_the_full_diameter() {
+        let mesh = dome_cavity(false);
+        let drain = auto_drain_holes(&mesh, 2.0, z_down(), None).unwrap();
+        assert_eq!(drain.holes.len(), 2, "{:?}", drain.warnings);
+        assert!(drain.warnings.is_empty(), "{:?}", drain.warnings);
+        let vent = drain.holes.iter().find(|h| h.purpose == "vent").unwrap();
+        // The cone's radius is 32 - z, so it holds the disc (hole radius + margin) from
+        // that far below the apex; the search steps in 0.25 mm, so within one step of it.
+        let needed = 32.0 - (2.0 + FULL_WIDTH_MARGIN_MM);
+        assert!(
+            vent.z <= needed + 1e-3 && vent.z > needed - EXTEND_STEP_MM - 1e-3,
+            "z {} needed {needed}",
+            vent.z
+        );
+        assert!(
+            vent.extension_mm > 1.5 && vent.extension_mm < 3.0,
+            "{}",
+            vent.extension_mm
+        );
+        // The floor is flat, so the suction hole needs no extension.
+        let relief = drain
+            .holes
+            .iter()
+            .find(|h| h.purpose == "suction relief")
+            .unwrap();
+        assert_eq!(relief.extension_mm, 0.0);
+        let punched = punch(mesh.clone(), &drain.holes).mesh;
+        assert_eq!(stats(&punched).cavities, 0);
+        for check in verify_holes(&mesh, &punched, &drain.holes) {
+            assert!(check.checked);
+            assert!(check.exits_skin, "{check:?}");
+            assert!(check.min_open_fraction > 0.95, "{check:?}");
+            // pi (0.9 * 2)^2 = 10.2 mm2 sampled, of the hole's 12.6.
+            assert!(check.min_open_area_mm2 > 9.5, "{check:?}");
+            assert!((check.hole_area_mm2 - 12.566).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn dome_floor_suction_hole_also_opens_the_full_diameter() {
+        let mesh = dome_cavity(true);
+        let drain = auto_drain_holes(&mesh, 2.0, z_down(), None).unwrap();
+        let relief = drain
+            .holes
+            .iter()
+            .find(|h| h.purpose == "suction relief")
+            .unwrap();
+        // Mirrored: the apex is at z = 8 and the start must sit at or above z = 10.25.
+        assert!(
+            relief.z >= 10.25 - 1e-3 && relief.z < 11.5,
+            "z {}",
+            relief.z
+        );
+        assert!(relief.extension_mm > 1.5, "{}", relief.extension_mm);
+        let punched = punch(mesh.clone(), &drain.holes).mesh;
+        assert_eq!(stats(&punched).cavities, 0);
+        for check in verify_holes(&mesh, &punched, &drain.holes) {
+            assert!(check.min_open_fraction > 0.95, "{check:?}");
+        }
+    }
+
+    #[test]
+    fn a_cavity_too_narrow_for_the_hole_warns() {
+        // A 3 mm-wide cavity can never hold a 4 mm hole.
+        let mesh = merge(vec![
+            cube(40.0),
+            cuboid([18.5, 18.5, 10.0], [21.5, 21.5, 30.0], true),
+        ]);
+        let drain = auto_drain_holes(&mesh, 2.0, z_down(), None).unwrap();
+        assert!(
+            drain.warnings.iter().any(|w| w.contains("full 4.0 mm")),
+            "{:?}",
+            drain.warnings
+        );
+        let punched = punch(mesh.clone(), &drain.holes).mesh;
+        assert!(verify_holes(&mesh, &punched, &drain.holes)
+            .iter()
+            .all(|c| c.checked));
+    }
+
+    #[test]
+    fn a_hole_that_stops_short_of_the_skin_is_reported() {
+        let mesh = dome_cavity(false);
+        // From z = 28 inside the cone's throat, 5 mm long: ends at z = 33, inside the
+        // roof (the top face is at 40).
+        let short = hole_at([20.0, 20.0, 28.0], [0.0, 0.0, 1.0], 5.0);
+        let punched = punch(mesh.clone(), &[short.clone()]).mesh;
+        let checks = verify_holes(&mesh, &punched, &[short.clone()]);
+        // The cylinder is cut and open as far as it goes ...
+        assert!(checks[0].min_open_fraction > 0.95, "{:?}", checks[0]);
+        // ... but it does not come out.
+        assert!(!checks[0].exits_skin);
+        let warnings = hole_warnings(&[short], &checks);
+        assert!(
+            warnings.iter().any(|w| w.contains("stops short")),
+            "{warnings:?}"
+        );
+        // Long enough to come out 1 mm beyond the top face: no warning.
+        let long = hole_at([20.0, 20.0, 28.0], [0.0, 0.0, 1.0], 13.0);
+        let punched = punch(mesh.clone(), &[long.clone()]).mesh;
+        let checks = verify_holes(&mesh, &punched, &[long.clone()]);
+        assert!(checks[0].exits_skin);
+        assert!(hole_warnings(&[long], &checks).is_empty());
+    }
+
+    #[test]
+    fn a_constricted_neck_makes_a_warning() {
+        let mesh = dome_cavity(false);
+        let hole = hole_at([20.0, 20.0, 31.7], [0.0, 0.0, 1.0], 9.3);
+        let punched = punch(mesh.clone(), &[hole.clone()]).mesh;
+        let checks = verify_holes(&mesh, &punched, &[hole.clone()]);
+        let warnings = hole_warnings(&[hole], &checks);
+        assert!(warnings.iter().any(|w| w.contains("neck")), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_flat_topped_cavity_keeps_its_holes_in_the_corners() {
+        // As before the extension: holes hug the cavity's corners (the vertices), not the
+        // middle of its flat face, with the disc just inside the walls.
+        let mesh = two_cavities();
+        let drain = auto_drain_holes(&mesh, 2.0, z_down(), None).unwrap();
+        let lo_fit = 2.0 + FULL_WIDTH_MARGIN_MM;
+        for h in drain.holes.iter().filter(|h| h.x < 20.0) {
+            // First cavity: x 6..16, y 12..28.
+            let dx = (h.x - 6.0).min(16.0 - h.x);
+            let dy = (h.y - 12.0).min(28.0 - h.y);
+            assert!(
+                (lo_fit..lo_fit + 1.0).contains(&dx) && (lo_fit..lo_fit + 1.0).contains(&dy),
+                "hole at ({}, {})",
+                h.x,
+                h.y
+            );
+            assert_eq!(h.extension_mm, 0.0);
+        }
+    }
+
+    #[test]
+    fn the_extension_is_capped() {
+        // The column is pinned to the neck: free to choose, the search would rather
+        // come out through the chamber's ceiling.
+        // A 6 mm neck is climbed out of (the chamber is 5.7 mm below the vent's start)...
+        let mesh = necked_cavity(6.0);
+        let drain = auto_drain_holes(&mesh, 2.0, z_down(), Some([20.01, 20.01])).unwrap();
+        let vent = drain.holes.iter().find(|h| h.purpose == "vent").unwrap();
+        assert!(
+            vent.extension_mm > 5.5 && vent.extension_mm < 6.5,
+            "{}",
+            vent.extension_mm
+        );
+        assert!(
+            drain.warnings.iter().all(|w| !w.contains("full")),
+            "{:?}",
+            drain.warnings
+        );
+        // ... but a 14 mm neck is beyond the 10 mm cap: no extension, and a warning.
+        let mesh = necked_cavity(14.0);
+        let drain = auto_drain_holes(&mesh, 2.0, z_down(), Some([20.01, 20.01])).unwrap();
+        let vent = drain.holes.iter().find(|h| h.purpose == "vent").unwrap();
+        assert_eq!(vent.extension_mm, 0.0);
+        assert!(
+            drain
+                .warnings
+                .iter()
+                .any(|w| w.contains("vent") && w.contains("searched 10 mm")),
+            "{:?}",
+            drain.warnings
+        );
     }
 }

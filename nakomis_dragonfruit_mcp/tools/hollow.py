@@ -12,7 +12,16 @@ from nakomis_dragonfruit_mcp import cli
 from nakomis_dragonfruit_mcp.app import ToolResult, mcp
 
 _HOLLOW_KEYS = {"before", "after", "wall_mm", "voxel_mm", "timing_ms", "warnings"}
-_PUNCH_KEYS = {"before", "after", "holes", "cavities_found", "timing_ms", "warnings"}
+_PUNCH_KEYS = {
+    "before",
+    "after",
+    "holes",
+    "hole_checks",
+    "holes_sidecar",
+    "cavities_found",
+    "timing_ms",
+    "warnings",
+}
 
 
 class MeshSummary(BaseModel):
@@ -35,7 +44,35 @@ class Hole(BaseModel):
     length_mm: float
     purpose: str = Field(description='"suction relief", "vent", "manual", ...')
     cavity: int | None = Field(description="Which cavity an automatic hole serves")
+    extension_mm: float = Field(
+        default=0.0,
+        description="How far an automatic hole's start was pushed into the cavity so that its "
+        "full diameter breaks into open space (a dome narrowing to an apex needs this)",
+    )
     note: str = ""
+
+
+class HoleCheck(BaseModel):
+    """What was measured on the drilled mesh: the neck's open fraction, and whether it exits."""
+
+    hole: int = Field(description="Index into `holes`")
+    checked: bool = Field(description="False for a hole not along an axis, which is not measured")
+    hole_area_mm2: float = Field(description="The hole's nominal area, pi r^2")
+    min_open_area_mm2: float = Field(
+        description="Open area of the narrowest cross-section, within a disc of 0.9 r. This is "
+        "the neck where the cavity meets the hole's end cap: past it the hole is a cut cylinder, "
+        "open by construction"
+    )
+    min_open_fraction: float = Field(
+        description="The neck open fraction: that area as a fraction of the 0.9 r disc"
+    )
+    at_mm: float = Field(
+        description="Where along the hole, from its start (negative is behind it), that is"
+    )
+    exits_skin: bool = Field(
+        description="Whether the hole's end, and a ring of 0.9 r round it, is outside the "
+        "original model's outer skin; false means the hole stops short of the outside"
+    )
 
 
 class HollowResult(ToolResult):
@@ -56,6 +93,15 @@ class DrillResult(ToolResult):
     input_path: str
     output_path: str
     holes: list[Hole]
+    hole_checks: list[HoleCheck] = Field(
+        description="Per hole: the cap/neck open fraction (the narrowest cross-section, from "
+        "slicing the drilled mesh across the hole's axis) and whether it exits the outer skin; "
+        "a neck below 90% open, or a hole that stops short, also adds a warning"
+    )
+    holes_sidecar: str = Field(
+        description="`<output>.holes.json`: the holes (start point, direction, radius, length, "
+        "purpose, cavity) in the output STL's own coordinates, for tools that act on them"
+    )
     cavities_found: int = Field(description="Sealed cavities in the input, before drilling")
     cavities_before: int
     cavities_after: int
@@ -78,12 +124,12 @@ def _summary(raw: dict[str, Any]) -> MeshSummary:
 
 def _output_path(stl_path: Path, out_path: str | Path | None, suffix: str) -> Path:
     if out_path is not None:
-        return Path(out_path).expanduser()
+        return Path(out_path).expanduser().absolute()
     return stl_path.with_name(f"{stl_path.stem}{suffix}.stl")
 
 
 def _check(stl_path: Path) -> Path:
-    path = stl_path.expanduser()
+    path = stl_path.expanduser().absolute()
     if not path.is_file():
         raise cli.CliError(f"model not found: {path}")
     return path
@@ -195,6 +241,26 @@ def drill_holes(
       warning. Read the warnings.
     `down_axis` says which way the plate is (default "-z"; also "+z", "+/-x", "+/-y").
 
+    Each automatic hole starts inside the cavity, far enough that the cavity's width there
+    contains the hole's full diameter (`extension_mm` says how far it moved; capped at 10 mm,
+    with a warning if the cavity is too narrow). Placement otherwise prefers the same spots as
+    without the extension (cavity vertices nearest the extreme, then, only for cavities whose
+    vertices are all corners, interior points hugging the outline, on clean skin only).
+
+    `hole_checks` says exactly what was measured on the drilled mesh, per axis-aligned hole:
+    - the cap/neck open fraction: the open area of the narrowest cross-section, which is where
+      the cavity meets the hole's end cap (past that the hole is a cut cylinder, open by
+      construction), as a fraction of a disc of 0.9 of the hole's radius; below 90% warns;
+    - `exits_skin`: whether the hole's end and a ring round it lie outside the original
+      model's outer skin; a hole that stops short of the outside warns.
+    Holes not along an axis are not measured, and say so in a warning.
+
+    Also writes `<output>.holes.json` beside the STL (absolute path in `holes_sidecar`):
+    `{"holes": [{x, y, z, radius_mm, direction, axis, length_mm, purpose, cavity}],
+    "source_stl": <output STL>}` in the STL's own coordinates, x, y, z being where each hole
+    starts and `direction` pointing outwards through the wall. The sidecar is written to a
+    temp file and renamed after the STL, so a failure never leaves a mismatched pair.
+
     Warns, with the count, if any sealed cavity is left.
     """
     if bool(holes) == auto_drain:
@@ -212,11 +278,19 @@ def drill_holes(
         args += ["--holes", json.dumps(holes)]
     result = cli.run(cli.MCP_TOOLS, args, parse_json=True)
     data = _schema(result.data, _PUNCH_KEYS, "punch", result.stdout)
+    if not Path(data["holes_sidecar"]).is_file():
+        # Same policy as the binary: an STL without its record of the holes is not left.
+        out.unlink(missing_ok=True)
+        raise cli.CliError(
+            f"dragonfruit-mcp-tools did not write {data['holes_sidecar']}; removed {out}"
+        )
     before, after = _summary(data["before"]), _summary(data["after"])
     return DrillResult(
         input_path=str(src),
         output_path=str(out),
         holes=[Hole(**h) for h in data["holes"]],
+        hole_checks=[HoleCheck(**c) for c in data["hole_checks"]],
+        holes_sidecar=data["holes_sidecar"],
         cavities_found=data["cavities_found"],
         cavities_before=before.cavities,
         cavities_after=after.cavities,
