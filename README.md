@@ -60,6 +60,15 @@ Early days. The repository is scaffolded; the tools are being built. Planned too
   print file's own layers (cured core touching the held core below), re-encodes
   changed layers byte-compatibly with DragonFruit, and verifies the result
   (NDFM-20)
+- Preview pictures: `slice` and `auto_support_and_slice` render the model into
+  every `.goo` they write, so the printer's screen and print servers show what
+  the file holds rather than a placeholder: a three-quarter view, the model in
+  magenta and (for `auto_support_and_slice`) its supports and raft in blue, as
+  Chitubox shows them. `dragonfruit-mcp-tools render` draws it with a software
+  rasteriser (no display or GPU, so it works on a headless box) in under a
+  second for a few million triangles. `previews=False` skips it; a render that
+  fails is a warning, never a failed slice; `previews_written` reports it
+  (NDFM-14)
 
 ### Optional Rust backend for `trim_islands`
 
@@ -103,6 +112,17 @@ upstream). The third island family the app uses, mesh minima, isn't run, and
 the overhang scan isn't fully deterministic upstream, so support counts can
 differ slightly from the GUI's and between runs. Check a print before trusting it.
 
+Previews can also be rendered by hand:
+
+```bash
+bin/dragonfruit-mcp-tools render --stl print.goo.supported.stl --out preview.png \
+    --split <model_triangles>     # first N triangles magenta, the rest blue
+```
+
+`--azimuth` (default -35, from the front-left), `--elevation` (28), `--fov`
+(25; 0 is orthographic), `--size` (580), `--crease` (50 degrees) and the
+`--model-rgb`/`--support-rgb`/`--background` colours adjust it.
+
 ## Architecture Diagram
 
 ![Architecture](docs/architecture/nakomis-dragonfruit-mcp.svg)
@@ -113,7 +133,7 @@ differ slightly from the GUI's and between runs. Check a print before trusting i
 |---|---|
 | `nakomis_dragonfruit_mcp/` | The MCP server (Python, FastMCP) |
 | `tests/` | pytest; integration tests run only when `bin/` is built |
-| `rust/dragonfruit-mcp-tools/` | Our Rust tool (hollowing, hole punching, overhang scan), linking DragonFruit's `dragonfruit-mesh-repair` |
+| `rust/dragonfruit-mcp-tools/` | Our Rust tool (hollowing, hole punching, overhang scan, preview rendering), linking DragonFruit's `dragonfruit-mesh-repair` |
 | `ts/` | Our TypeScript scripts, run under DragonFruit's tsx against its own modules (auto-supports) |
 | `vendor/dragonfruit/` | DragonFruit, as a submodule pinned to upstream `dev` |
 | `accel/goo-trim/` | Optional Rust backend for `trim_islands` (see above) |

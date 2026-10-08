@@ -15,7 +15,7 @@ disclaimer near the top of the README.
 |---|---|
 | `nakomis_dragonfruit_mcp/` | The MCP server (Python, FastMCP) |
 | `tests/` | pytest; integration tests run only when `bin/` is built |
-| `rust/dragonfruit-mcp-tools/` | Our Rust tool (hollowing, hole punching, `overhangs`), linking DragonFruit's `dragonfruit-mesh-repair`; `build.rs` borrows the app's `src-tauri/src/overhang.rs` minus its Tauri command |
+| `rust/dragonfruit-mcp-tools/` | Our Rust tool (hollowing, hole punching, `overhangs`, `render` for `.goo` preview pictures), linking DragonFruit's `dragonfruit-mesh-repair`; `build.rs` borrows the app's `src-tauri/src/overhang.rs` minus its Tauri command |
 | `accel/goo-trim/` | Optional Rust backend for `trim_islands` (`bin/goo-trim`, built by `scripts/build-accel.sh`, not `build.sh`); output must stay byte-identical to `goo_trim.py`. Chosen by `NDFM_TRIM_BACKEND` or the tool's `backend` argument |
 | `ts/` | Our TS scripts (`autosupport-slice.ts`), run by `cli.run_ts(script=...)` with DragonFruit's tsconfig and `NODE_PATH` at its node_modules |
 | `vendor/dragonfruit/` | DragonFruit, as a submodule pinned to upstream `dev` |
