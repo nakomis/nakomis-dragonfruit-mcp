@@ -286,6 +286,8 @@ async def auto_support_and_slice(
     export_plate_stl: bool = False,
     export_supported_stl: bool = False,
     fast_islands: bool = False,
+    overhangs: bool = True,
+    overhang_angle_deg: float | None = None,
     keep_out_holes: bool = True,
     holes: list[dict[str, Any]] | None = None,
     support_internal_islands: bool = False,
@@ -310,6 +312,17 @@ async def auto_support_and_slice(
     so isolated low points can be missed. `fast_islands` uses a coarser voxel
     scan (quicker, finds fewer small islands). `density` scales supports per
     area (2 = twice as many). `raft` adds the app's default solid raft.
+
+    Overhangs: a down-facing surface counts as overhang when it is flatter than
+    `overhang_angle_deg` from horizontal (the app's self-support angle: default
+    45, range 20-75; lower gives fewer overhang supports). `overhangs=False`
+    skips the overhang family entirely, leaving only voxel islands: for
+    self-supporting shapes such as gyroid lattices, whose saddles read as
+    overhangs and would otherwise collect supports all over (NDFM-21). It also
+    drops a lifted model's base supports (the voxel family doesn't see the lowest
+    layer as an island), so pair it with `lift_mm=0`; a lifted call warns. On a
+    gyroid lattice even 20 degrees still flags the saddles (775 contacts vs ~940).
+    `islands_by_source` shows what each family found.
 
     Holes: a drilled STL has a `<stl>.holes.json` beside it (written by
     `drill_holes`); when that exists, supports keep clear of every hole it lists.
@@ -365,6 +378,8 @@ async def auto_support_and_slice(
         export_plate_stl=export_plate_stl,
         export_supported_stl=export_supported_stl,
         fast_islands=fast_islands,
+        overhangs=overhangs,
+        overhang_angle_deg=overhang_angle_deg,
         keep_out_holes=keep_out_holes,
         holes=holes,
         support_internal_islands=support_internal_islands,
@@ -389,6 +404,8 @@ def run_auto_support_and_slice(
     export_plate_stl: bool = False,
     export_supported_stl: bool = False,
     fast_islands: bool = False,
+    overhangs: bool = True,
+    overhang_angle_deg: float | None = None,
     keep_out_holes: bool = True,
     holes: list[dict[str, Any]] | None = None,
     support_internal_islands: bool = False,
@@ -404,6 +421,9 @@ def run_auto_support_and_slice(
         raise ValueError("lift_mm must not be negative")
     if layer_height is not None and layer_height <= 0:
         raise ValueError("layer_height must be positive")
+    if overhang_angle_deg is not None and not 20 <= overhang_angle_deg <= 75:
+        # The app's own range (AUTO_SUPPORT_CONSTRAINTS); it would clamp silently.
+        raise ValueError("overhang_angle_deg must be between 20 and 75 (the app's range)")
     if aa_preset is not None and aa_preset not in slicing.AA_PRESETS:
         raise ValueError(f"aa_preset must be one of {', '.join(slicing.AA_PRESETS)}")
     material_path = None
@@ -417,6 +437,14 @@ def run_auto_support_and_slice(
             format = "." + format
 
     zones, zone_source, hole_warnings = _load_holes(stl_path, stl, holes, keep_out_holes)
+    if not overhangs and (lift_mm is None or lift_mm > 0):
+        # Measured on the gyroid lantern: its flat base was found only by the
+        # overhang family, so with it off a lifted model got no supports at all.
+        hole_warnings.append(
+            "overhangs=False with a lift: the voxel family doesn't treat the model's "
+            "lowest layer as an island, so a flat base may get no supports. Use it with "
+            "lift_mm=0 (the model on the plate), or check the contacts"
+        )
 
     plan = slicing.plan_slice(
         stl,
@@ -468,6 +496,11 @@ def run_auto_support_and_slice(
             args += ["--density", f"{density:g}"]
         if fast_islands:
             args.append("--coarse-islands")
+        if not overhangs:
+            args.append("--no-overhangs")
+        if overhang_angle_deg is not None:
+            settings = {"overhangSelfSupportAngleDeg": overhang_angle_deg}
+            args += ["--settings", json.dumps(settings, separators=(",", ":"))]
         if support_internal_islands:
             args.append("--support-internal-islands")
         if zones:

@@ -35,7 +35,7 @@
  *   tsx autosupport-slice.ts --stl <in.stl> [--out <out.ctb>] --cli <dragonfruit-cli> [--tools <dragonfruit-mcp-tools>]
  *     --printer-json <profile.json> [--material <material.json>] [--layer-height N]
  *     [--aa-preset sharp|balanced|smooth|raw] [--lift-mm 7] [--density 1] [--raft solid|line|off]
- *     [--settings <json>] [--coarse-islands] [--px-mm 0.05] [--supported-stl <out.stl>] [--plate-stl <out.stl>] [--job-dir <dir>]
+ *     [--settings <json>] [--coarse-islands] [--no-overhangs] [--px-mm 0.05] [--supported-stl <out.stl>] [--plate-stl <out.stl>] [--job-dir <dir>]
  *     [--keep-out <holes.json>] [--support-internal-islands] [--probe-points <json>] [--no-slice] [--verbose]
  *
  * `--supported-stl` writes model, supports and raft as sliced; `--plate-stl` the
@@ -43,6 +43,9 @@
  * `--job-dir` keeps the engine's input (positions.bin, job.json) for inspection;
  * with `--no-slice` it writes them without slicing. `--coarse-islands` trades
  * island detail for speed (the bench's resolution rather than the app panel's).
+ * `--no-overhangs` skips the overhang family, leaving only the voxel islands:
+ * for self-supporting shapes such as lattices, whose saddles read as overhangs.
+ * The overhang angle is `--settings '{"overhangSelfSupportAngleDeg": N}'`.
  * Existing output files are overwritten.
  *
  * `--keep-out` names a JSON file of drilled holes in the STL's own frame
@@ -147,6 +150,7 @@ interface Options {
     settings: Partial<AutoSupportSettings>;
     pxMm: number | null;
     coarseIslands: boolean;
+    overhangs: boolean;
     supportedStl: string | null;
     plateStl: string | null;
     jobDir: string | null;
@@ -173,6 +177,7 @@ function parseArgs(argv: string[]): Options {
         settings: {},
         pxMm: null,
         coarseIslands: false,
+        overhangs: true,
         supportedStl: null,
         plateStl: null,
         jobDir: null,
@@ -209,6 +214,7 @@ function parseArgs(argv: string[]): Options {
         else if (arg === '--settings') options.settings = JSON.parse(value()) as Partial<AutoSupportSettings>;
         else if (arg === '--px-mm') options.pxMm = number();
         else if (arg === '--coarse-islands') options.coarseIslands = true;
+        else if (arg === '--no-overhangs') options.overhangs = false;
         else if (arg === '--supported-stl') options.supportedStl = resolve(value());
         else if (arg === '--plate-stl') options.plateStl = resolve(value());
         else if (arg === '--job-dir') options.jobDir = resolve(value());
@@ -702,7 +708,9 @@ async function main(): Promise<void> {
     const selfSupportAngleDeg = options.settings.overhangSelfSupportAngleDeg
         ?? createDefaultSettings().autoSupport.overhangSelfSupportAngleDeg;
     let overhangIslands: DetectedIsland[] = [];
-    if (options.tools) {
+    if (!options.overhangs) {
+        // Asked for: self-supporting shapes (lattices) whose saddles read as overhangs.
+    } else if (options.tools) {
         overhangIslands = await time('overhangs_ms', () => scanOverhangs(
             options.tools!,
             geometry.getAttribute('position').array as Float32Array,

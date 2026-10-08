@@ -125,7 +125,15 @@ def test_default_arguments(fake_env, stl):
     assert args[args.index("--raft") + 1] == "solid"
     assert args[args.index("--cli") + 1].endswith("/bin/dragonfruit-cli")
     assert args[args.index("--tools") + 1].endswith("/bin/dragonfruit-mcp-tools")
-    for flag in ("--material", "--lift-mm", "--density", "--supported-stl", "--coarse-islands"):
+    for flag in (
+        "--material",
+        "--lift-mm",
+        "--density",
+        "--supported-stl",
+        "--coarse-islands",
+        "--no-overhangs",
+        "--settings",
+    ):
         assert flag not in args
 
 
@@ -159,6 +167,32 @@ def test_options_are_passed_through(fake_env, stl, tmp_path):
     # .ctb is the preset's own format: the preset reference goes through unchanged.
     assert fake_env.printer_json() == {"presetId": "elegoo-mars-5-ultra-ctb"}
     assert result.output_path == str(out)
+
+
+def test_overhang_options_are_passed_through(fake_env, stl):
+    run(stl, overhangs=False, overhang_angle_deg=30)
+    args = script_args(fake_env)
+    assert "--no-overhangs" in args
+    assert json.loads(args[args.index("--settings") + 1]) == {"overhangSelfSupportAngleDeg": 30}
+
+
+def test_overhangs_off_with_a_lift_warns_about_the_base(fake_env, stl):
+    assert any("lowest layer" in w for w in run(stl, overhangs=False).warnings)
+    assert not any("lowest layer" in w for w in run(stl, overhangs=False, lift_mm=0).warnings)
+    assert not any("lowest layer" in w for w in run(stl).warnings)
+
+
+@pytest.mark.parametrize("angle", [20, 75])
+def test_overhang_angle_at_the_apps_limits_is_accepted(fake_env, stl, angle):
+    run(stl, overhang_angle_deg=angle)
+    args = script_args(fake_env)
+    assert json.loads(args[args.index("--settings") + 1]) == {"overhangSelfSupportAngleDeg": angle}
+
+
+@pytest.mark.parametrize("angle", [19.9, 75.1, 0, 90])
+def test_overhang_angle_outside_the_apps_range_is_refused(fake_env, stl, angle):
+    with pytest.raises(ValueError, match="between 20 and 75"):
+        run(stl, overhang_angle_deg=angle)
 
 
 def test_plate_stl_uses_slices_frame(fake_env, stl):
@@ -434,6 +468,14 @@ def test_real_job_splits_model_from_supports(tmp_path):
     assert (job_dir / "positions.bin").stat().st_size == 36 * data["total_triangles"]
     assert data["support_triangles"] > 0
     assert data["output"] is None
+
+
+@pytest.mark.integration
+@needs_pipeline
+def test_real_no_overhangs_leaves_only_voxel_islands(tmp_path):
+    data = _run_script(tmp_path, "--no-slice", "--coarse-islands", "--no-overhangs")
+    assert data["islands_by_source"].get("overhang", 0) == 0
+    assert "no --tools" not in " ".join(data["warnings"])
 
 
 @pytest.mark.integration
