@@ -225,3 +225,15 @@ def test_tool_refuses_non_goo(tmp_path):
     other.write_bytes(b"not a goo file at all")
     with pytest.raises(cli.CliError, match="not a GOO"):
         asyncio.run(trim.trim_islands(str(other)))
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_fast_decoder_matches_the_run_by_run_one(seed):
+    rng = np.random.default_rng(seed)
+    runs = rng.integers(1, 5000, 300)
+    runs[::17] = rng.integers(1 << 20, 1 << 21, len(runs[::17]))  # three length bytes
+    values = rng.choice([0, 255, 1, 128, 254], 300)
+    pixels = np.repeat(values, runs).astype(np.uint8).tobytes()
+    data = goo.encode_layer(pixels)
+    assert goo.decode_layer(data, len(pixels), 1) == goo._decode_slowly(data, len(pixels), 1)
+    assert goo.decode_layer(data, len(pixels), 1) == pixels
