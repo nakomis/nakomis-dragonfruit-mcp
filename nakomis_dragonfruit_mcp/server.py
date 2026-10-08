@@ -21,6 +21,7 @@ from nakomis_dragonfruit_mcp.tools import (  # noqa: F401
     printfile,
     slicing,
     supports,
+    trim,
 )
 
 

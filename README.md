@@ -53,6 +53,12 @@ Early days. The repository is scaffolded; the tools are being built. Planned too
   (NDFM-8; see below). Keeps supports out of drilled holes: reads
   `<stl>.holes.json` (or a `holes` list) and keeps contacts and shafts clear of
   each hole's radius + 1 mm (NDFM-16)
+- `trim_islands`: remove every region of a sliced `.goo` that has nothing cured
+  beneath it, which would otherwise peel off as a flake in the vat. Open lattices
+  and cut edges are full of tiny ones that mesh-level checks miss. Works on the
+  print file's own layers (cured core touching the held core below), re-encodes
+  changed layers byte-compatibly with DragonFruit, and verifies the result
+  (NDFM-20)
 
 Supports: upstream has no headless command for them, so `ts/autosupport-slice.ts`
 runs the app's own placement and support export under Node, and
