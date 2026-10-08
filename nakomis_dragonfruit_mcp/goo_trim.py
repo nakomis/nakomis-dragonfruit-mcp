@@ -22,11 +22,12 @@ import os
 import shutil
 import struct
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import cv2
 import numpy as np
-from scipy import ndimage
 
 from nakomis_dragonfruit_mcp import goo
 from nakomis_dragonfruit_mcp.goo_motion import END_MARKER, _layer_definitions
@@ -35,7 +36,27 @@ CORE = 128  # grey at or above this cures through; fainter edge pixels barely do
 TOUCH_PX = 2  # a core this close to the held core below rests on it
 HUG_PX = 3  # grey this close to a held core is its anti-aliased edge
 MARGIN_PX = 8
-EIGHT = np.ones((3, 3), bool)
+# OpenCV's dilate with a 3x3 cross, iterated, is scipy's default binary_dilation
+# (identical output, measured on real layers) at a fraction of the cost.
+CROSS = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+
+def _dilate(mask: np.ndarray, iterations: int) -> np.ndarray:
+    return cv2.dilate(mask.view(np.uint8), CROSS, iterations=iterations).view(bool)
+
+
+def _label(mask: np.ndarray) -> tuple[np.ndarray, int]:
+    """8-connected components: (labels, count), labels 1..count."""
+    count, labels = cv2.connectedComponents(mask.view(np.uint8), connectivity=8, ltype=cv2.CV_32S)
+    return labels, count - 1
+
+
+def _touching(labels: np.ndarray, count: int, mask: np.ndarray) -> np.ndarray:
+    """Lookup table over labels: True for each label with a pixel in `mask`."""
+    lut = np.zeros(count + 1, bool)
+    lut[labels[mask]] = True
+    lut[0] = False
+    return lut
 
 
 @dataclass
@@ -87,13 +108,13 @@ def trim_islands(src: Path, dst: Path) -> TrimReport:
         a = full[box]  # a view: blanking it blanks the layer
         core = a >= CORE
         if held is not None:
-            below = ndimage.binary_dilation(held[box], iterations=TOUCH_PX)
-            labels, count = ndimage.label(core, structure=EIGHT)
-            touching = np.unique(labels[core & below])
-            core = np.isin(labels, touching[touching > 0])
-            drop = (a > 0) & ~ndimage.binary_dilation(core, iterations=HUG_PX)
+            below = _dilate(held[box], TOUCH_PX)
+            labels, count = _label(core)
+            lut = _touching(labels, count, core & below)
+            core = lut[labels]
+            drop = (a > 0) & ~_dilate(core, HUG_PX)
             if drop.any():
-                regions = count - int((touching > 0).sum())
+                regions = count - int(lut.sum())
                 report.by_layer.append((n, regions, int(drop.sum())))
                 report.regions_dropped += regions
                 report.pixels_dropped += int(drop.sum())
@@ -128,22 +149,55 @@ def trim_islands(src: Path, dst: Path) -> TrimReport:
     return report
 
 
-def find_islands(path: Path) -> list[tuple[int, int]]:
-    """(layer, pixels) for every cured core with no cured core within TOUCH_PX below."""
+def _layer_table(path: Path) -> list[tuple[int, int]]:
+    """(data offset, size) of every layer, read once without loading the file."""
+    header = goo.read_header(path)
+    table, off = [], header.layer_table_offset
+    with path.open("rb") as f:
+        for _ in range(header.layers):
+            f.seek(off + goo.LAYER_DEF_BYTES)
+            size = struct.unpack(">I", f.read(4))[0]
+            table.append((off + goo.LAYER_DEF_BYTES + 4, size))
+            off += goo.LAYER_DEF_BYTES + 4 + size + 2
+    return table
+
+
+def _islands_in(path: Path, table: list[tuple[int, int]], first: int, last: int, w: int, h: int):
+    """find_islands for layers first..last (1-based), reading layer first-1 for support."""
+    found: list[tuple[int, int]] = []
+    below = None
+    with path.open("rb") as f:
+        for n in range(max(first - 1, 1), last + 1):
+            start, size = table[n - 1]
+            f.seek(start)
+            core = np.frombuffer(goo.decode_layer(f.read(size), w, h), np.uint8).reshape(h, w)
+            core = core >= CORE
+            if below is not None and n >= first:
+                box = _box(core | below, h, w)
+                if box is not None:
+                    c = core[box]
+                    labels, count = _label(c)
+                    touching = _touching(labels, count, c & _dilate(below[box], TOUCH_PX))
+                    sizes = np.bincount(labels.ravel(), minlength=count + 1)
+                    found += [(n, int(sizes[k])) for k in range(1, count + 1) if not touching[k]]
+            below = core
+    return found
+
+
+def find_islands(path: Path, workers: int | None = None) -> list[tuple[int, int]]:
+    """(layer, pixels) for every cured core with no cured core within TOUCH_PX below.
+
+    Each layer needs only itself and the one below, so ranges of layers are
+    checked in parallel processes; `workers=1` runs in this process.
+    """
     header = goo.read_header(path)
     w, h = header.resolution_x, header.resolution_y
-    found: list[tuple[int, int]] = []
-    below: np.ndarray | None = None
-    for n, (_, raw) in enumerate(_layers(path.read_bytes(), path), 1):
-        core = np.frombuffer(goo.decode_layer(raw, w, h), np.uint8).reshape(h, w) >= CORE
-        if below is not None:
-            box = _box(core | below, h, w)
-            if box is not None:
-                c = core[box]
-                support = ndimage.binary_dilation(below[box], iterations=TOUCH_PX)
-                labels, count = ndimage.label(c, structure=EIGHT)
-                touching = set(np.unique(labels[c & support]).tolist())
-                sizes = np.bincount(labels.ravel(), minlength=count + 1)
-                found += [(n, int(sizes[k])) for k in range(1, count + 1) if k not in touching]
-        below = core
-    return found
+    table = _layer_table(path)
+    workers = workers or min(os.cpu_count() or 1, 8)
+    step = -(-header.layers // (workers * 4))  # a few chunks per worker evens out the load
+    ranges = [(a, min(a + step - 1, header.layers)) for a in range(2, header.layers + 1, step)]
+    if workers == 1 or len(ranges) <= 1:
+        return [i for a, b in ranges for i in _islands_in(path, table, a, b, w, h)]
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        jobs = [pool.submit(_islands_in, path, table, a, b, w, h) for a, b in ranges]
+        return [i for job in jobs for i in job.result()]
