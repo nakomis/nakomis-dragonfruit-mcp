@@ -50,7 +50,9 @@ Early days. The repository is scaffolded; the tools are being built. Planned too
   is checked by slicing the drilled mesh, and is recorded in `<output>.holes.json`
 - `auto_support_and_slice`: DragonFruit's own auto-supports and raft, sliced
   into the print, with the same printer, format and material options as `slice`
-  (NDFM-8; see below)
+  (NDFM-8; see below). Keeps supports out of drilled holes: reads
+  `<stl>.holes.json` (or a `holes` list) and keeps contacts and shafts clear of
+  each hole's radius + 1 mm (NDFM-16)
 
 Supports: upstream has no headless command for them, so `ts/autosupport-slice.ts`
 runs the app's own placement and support export under Node, and

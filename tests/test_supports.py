@@ -217,6 +217,159 @@ def test_the_tool_runs_off_the_event_loop(fake_env, stl):
     assert result.contacts == 286
 
 
+KEEP_OUT_RESULT = {
+    "hole": 0, "purpose": "suction_relief", "start_plate_mm": [-14.2, -9.8, 7.1],
+    "exit_plate_mm": [-14.2, -9.8, 3.5],
+    "t_range_mm": [-2.0, 6.6], "islands_inside_internal": ["v3"],
+    "direction": [0, 0, -1], "keep_out_radius_mm": 3.0, "blocked_triangles": 41,
+    "islands_inside": [], "contacts_removed": 1, "supports_removed": 2, "lost_coverage": [],
+}  # fmt: skip
+
+BASE_HOLE = {
+    "x": -2.193, "y": -5.822, "z": 2.619, "radius_mm": 2.0,
+    "direction": [0, 0, -1], "axis": "z", "length_mm": 3.6,
+    "purpose": "suction_relief", "cavity": 0,
+}  # fmt: skip
+
+
+def keep_out_args(fake_env) -> dict:
+    return json.loads(Path(f"{fake_env.log}.keepout").read_text())
+
+
+def test_no_holes_file_means_no_keep_out(fake_env, stl):
+    result = run(stl)
+    assert "--keep-out" not in script_args(fake_env)
+    assert result.keep_out is None
+
+
+def test_holes_sidecar_is_passed_in_the_stl_frame(fake_env, stl):
+    stl.with_name(stl.name + ".holes.json").write_text(
+        json.dumps({"holes": [BASE_HOLE], "source_stl": "model.stl"})
+    )
+    fake_env.summary.write_text(
+        json.dumps({**SUMMARY, "keep_out": {"source": "x", "holes": [KEEP_OUT_RESULT]}})
+    )
+    result = run(stl)
+    args = script_args(fake_env)
+    assert "--keep-out" in args
+    # Untransformed: the script applies the plate translation, as it does to the model.
+    sent = keep_out_args(fake_env)["holes"][0]
+    assert (sent["x"], sent["y"], sent["z"]) == (-2.193, -5.822, 2.619)
+    assert sent["radius_mm"] == 2.0 and sent["direction"] == [0, 0, -1] and sent["length_mm"] == 3.6
+    assert result.keep_out.source == str(stl.with_name(stl.name + ".holes.json"))
+    assert result.keep_out.holes[0].supports_removed == 2
+
+
+def test_holes_argument_overrides_the_sidecar(fake_env, stl):
+    stl.with_name(stl.name + ".holes.json").write_text(json.dumps({"holes": [BASE_HOLE]}))
+    other = {**BASE_HOLE, "x": 9.5, "radius_mm": 1.5}
+    fake_env.summary.write_text(
+        json.dumps({**SUMMARY, "keep_out": {"source": "x", "holes": [KEEP_OUT_RESULT]}})
+    )
+    result = run(stl, holes=[other])
+    sent = keep_out_args(fake_env)["holes"]
+    assert len(sent) == 1 and sent[0]["x"] == 9.5 and sent[0]["radius_mm"] == 1.5
+    assert result.keep_out.source == "the holes argument"
+
+
+def test_keep_out_can_be_switched_off(fake_env, stl):
+    stl.with_name(stl.name + ".holes.json").write_text(json.dumps({"holes": [BASE_HOLE]}))
+    run(stl, keep_out_holes=False)
+    assert "--keep-out" not in script_args(fake_env)
+    run(stl, keep_out_holes=False, holes=[BASE_HOLE])
+    assert all("--keep-out" not in ln for ln in fake_env.log.read_text().splitlines())
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {**BASE_HOLE, "radius_mm": 0},
+        {**BASE_HOLE, "direction": [0, 0, 0]},
+        {"x": 1},
+        {**BASE_HOLE, "x": True},
+        {**BASE_HOLE, "z": float("nan")},
+        {**BASE_HOLE, "length_mm": float("inf")},
+        {**BASE_HOLE, "direction": [0, 0, False]},
+        {**BASE_HOLE, "length_mm": -1},
+    ],
+)
+def test_bad_holes_raise_before_any_work(fake_env, stl, bad):
+    with pytest.raises(cli.CliError, match="the holes argument: hole 0"):
+        run(stl, holes=[bad])
+    assert not fake_env.log.exists()
+
+
+def test_bad_sidecar_hole_error_names_the_file(fake_env, stl):
+    sidecar = stl.with_name(stl.name + ".holes.json")
+    sidecar.write_text(json.dumps({"holes": [{**BASE_HOLE, "radius_mm": -1}]}))
+    with pytest.raises(cli.CliError, match=rf"{sidecar.name}: hole 0"):
+        run(stl)
+
+
+def test_sidecar_for_another_stl_or_older_than_the_stl_warns(fake_env, stl):
+    sidecar = stl.with_name(stl.name + ".holes.json")
+    sidecar.write_text(json.dumps({"holes": [BASE_HOLE], "source_stl": "/elsewhere/other.stl"}))
+    stamp = stl.stat().st_mtime + 100
+    os.utime(sidecar, (stamp, stamp))
+    warnings = run(stl).warnings
+    assert any("was written for other.stl, not model.stl" in w for w in warnings)
+    assert not any("is newer than" in w for w in warnings)
+    os.utime(sidecar, (stamp - 1000, stamp - 1000))
+    os.utime(stl, (stamp, stamp))
+    warnings = run(stl).warnings
+    assert any("model.stl is newer than model.stl.holes.json" in w for w in warnings)
+
+
+def test_an_stl_written_just_before_its_sidecar_is_not_stale(fake_env, stl):
+    sidecar = stl.with_name(stl.name + ".holes.json")
+    sidecar.write_text(json.dumps({"holes": [BASE_HOLE]}))
+    stamp = sidecar.stat().st_mtime
+    os.utime(stl, (stamp + 2, stamp + 2))
+    assert not any("is newer than" in w for w in run(stl).warnings)
+
+
+def test_internal_islands_are_skipped_unless_asked(fake_env, stl):
+    fake_env.summary.write_text(
+        json.dumps(
+            {
+                **SUMMARY,
+                "islands_detected": 20,
+                "islands_internal": 6,
+                "islands_internal_skipped": 6,
+            }
+        )
+    )
+    result = run(stl)
+    assert "--support-internal-islands" not in script_args(fake_env)
+    assert (result.islands_detected, result.islands_internal_skipped) == (20, 6)
+    run(stl, support_internal_islands=True)
+    assert "--support-internal-islands" in fake_env.log.read_text().splitlines()[-1]
+
+
+def test_keep_out_totals_and_zone_extent_are_mapped(fake_env, stl):
+    totals = {
+        "entities_before": 500, "entities_after": 380, "entities_removed_total": 120,
+        "dangling_removed": 3, "residual_in_zone": 0,
+    }  # fmt: skip
+    fake_env.summary.write_text(
+        json.dumps({**SUMMARY, "keep_out": {"holes": [KEEP_OUT_RESULT], **totals}})
+    )
+    result = run(stl, holes=[BASE_HOLE])
+    assert result.keep_out.entities_removed_total == 120 and result.keep_out.dangling_removed == 3
+    hole = result.keep_out.holes[0]
+    assert hole.exit_plate_mm == [-14.2, -9.8, 3.5] and hole.t_range_mm == [-2.0, 6.6]
+    assert hole.islands_inside_internal == ["v3"]
+
+
+def test_a_broken_holes_file_raises(fake_env, stl):
+    stl.with_name(stl.name + ".holes.json").write_text("{nope")
+    with pytest.raises(cli.CliError, match="not readable JSON"):
+        run(stl)
+    stl.with_name(stl.name + ".holes.json").write_text('{"holes": 3}')
+    with pytest.raises(cli.CliError, match="'holes' list"):
+        run(stl)
+
+
 def _real_pipeline_available() -> bool:
     if TEST_STL is None or not TEST_STL.exists():
         return False
@@ -306,3 +459,113 @@ def test_real_refuses_a_print_taller_than_the_printer(tmp_path):
 def test_real_script_refuses_an_extension_the_printer_does_not_write(tmp_path):
     with pytest.raises(cli.CliError, match="writes .ctb files"):
         _run_script(tmp_path, "--out", str(tmp_path / "x.goo"))
+
+
+def _probe(tmp_path: Path, hole: dict, points: list[list[float]]) -> dict:
+    """The script's own containment answers for plate-frame points, for one hole."""
+    holes = tmp_path / "probe-holes.json"
+    holes.write_text(json.dumps({"holes": [hole]}))
+    return _run_script(
+        tmp_path, "--keep-out", str(holes), "--probe-points", json.dumps(points), "--no-slice"
+    )["zones"][0]
+
+
+@pytest.mark.integration
+@needs_pipeline
+def test_real_zone_is_anchored_on_the_skin_exit(tmp_path):
+    from nakomis_dragonfruit_mcp import stl as stl_io
+
+    lo, hi = stl_io.bbox(TEST_STL)
+    # The plate shift, pinned from the bounding box: XY centre to the origin, lowest point to 7 mm.
+    shift = [-(lo[0] + hi[0]) / 2, -(lo[1] + hi[1]) / 2, 7.0 - lo[2]]
+    # A hole starting 8 mm inside along +z-down: exit 8 mm from the start (a vent-like record).
+    hole = {
+        "x": 1.0, "y": 2.0, "z": 30.0, "radius_mm": 2.0, "direction": [0, 0, -1], "length_mm": 8.0,
+    }  # fmt: skip
+
+    def at(t: float, radial: float = 0.0) -> list[float]:
+        # t along the bore from the start (direction -z), radial offset along +x, in the plate frame
+        return [1.0 + shift[0] + radial, 2.0 + shift[1], 30.0 + shift[2] - t]
+
+    inside = {"exit +2": at(10), "exit": at(8), "t=4.1": at(4.1), "t=11 (end)": at(10.99),
+              "radius 2.9": at(8, 2.9)}  # fmt: skip
+    outside = {"deep in the cavity, 5 mm before the start": at(-5), "start": at(0),
+               "t=3.9, just short of the zone": at(3.9), "t=11.1, past the end": at(11.1),
+               "radius 3.1": at(8, 3.1)}  # fmt: skip
+    zone = _probe(tmp_path, hole, [*inside.values(), *outside.values()])
+    assert zone["contains"] == [True] * len(inside) + [False] * len(outside)
+    assert zone["radius_mm"] == 3.0
+    assert zone["t_range_mm"] == [4.0, 11.0]
+    assert zone["exit_plate_mm"] == pytest.approx(at(8), abs=1e-3)
+    # A start near its exit: the zone reaches no further than 2 mm behind the start.
+    near = _probe(tmp_path, {**hole, "length_mm": 1.0}, [at(-1.9), at(-2.1)])
+    assert near["t_range_mm"] == [-2.0, 4.0] and near["contains"] == [True, False]
+
+
+def _support_triangles_in_bore(
+    supported_stl: Path, model_triangles: int, zone: dict, radius: float
+):
+    """Support triangles with a sampled point inside the bore (computed independently)."""
+    import struct
+
+    import numpy as np
+
+    raw = supported_stl.read_bytes()
+    count = struct.unpack("<I", raw[80:84])[0]
+    layout = np.dtype([("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")])
+    tris = np.frombuffer(raw[84 : 84 + 50 * count], dtype=layout)["v"][model_triangles:]
+    start = np.array(zone["start_plate_mm"])
+    d = np.array(zone["direction"])
+    t0, t1 = zone["t_range_mm"]
+    end_a, end_b = start + d * t0, start + d * t1
+    lo = np.minimum(end_a, end_b) - radius
+    hi = np.maximum(end_a, end_b) + radius
+    near = tris[(tris.max(axis=1) >= lo).all(axis=1) & (tris.min(axis=1) <= hi).all(axis=1)]
+    hits = 0
+    for tri in near:
+        for i in range(3):
+            for f in np.linspace(0, 1, 40):
+                point = tri[i] + (tri[(i + 1) % 3] - tri[i]) * f
+                t = float((point - start) @ d)
+                radial = float(np.linalg.norm(point - start - t * d))
+                if t0 <= t <= t1 and radial <= radius:
+                    hits += 1
+                    break
+            else:
+                continue
+            break
+    return hits
+
+
+@pytest.mark.integration
+@needs_pipeline
+def test_real_keep_out_leaves_nothing_inside_the_bore(tmp_path):
+    plain = _run_script(tmp_path, "--no-slice", "--coarse-islands")
+    assert plain["keep_out"] is None
+    # A hole whose exit is at an island's contact (the plate shift undone), starting
+    # 3 mm back along the bore, like a drilled hole with its start inside the part.
+    shift = plain["plate_transform"]["translate_mm"]
+    contact = plain["island_list"][0]["contact"]
+    hole = {
+        "x": contact[0] - shift[0], "y": contact[1] - shift[1], "z": contact[2] - shift[2] + 3.0,
+        "radius_mm": 2.0, "direction": [0, 0, -1], "length_mm": 3.0, "purpose": "test",
+    }  # fmt: skip
+    holes = tmp_path / "holes.json"
+    holes.write_text(json.dumps({"holes": [hole]}))
+    supported = tmp_path / "supported.stl"
+    data = _run_script(
+        tmp_path, "--no-slice", "--coarse-islands", "--keep-out", str(holes),
+        "--supported-stl", str(supported),
+    )  # fmt: skip
+    report = data["keep_out"]["holes"][0]
+    # The zone sits where the model went on the plate, anchored on the exit.
+    assert report["exit_plate_mm"] == pytest.approx(contact, abs=1e-3)
+    assert report["t_range_mm"] == [-1.0, 6.0]
+    assert report["blocked_triangles"] > 0
+    assert data["contacts"] > 0
+    totals = data["keep_out"]
+    assert totals["entities_removed_total"] == totals["entities_before"] - totals["entities_after"]
+    # The script's own re-probe of the committed supports, then an independent look
+    # at the support triangles that were exported: nothing inside the bore itself.
+    assert totals["residual_in_zone"] == 0
+    assert _support_triangles_in_bore(supported, data["model_triangles"], report, 2.0) == 0

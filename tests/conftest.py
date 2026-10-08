@@ -23,6 +23,7 @@ case "$1" in
       --out) out="$2" ;;
       --printer-json) cp "$2" "$FAKE_LOG.printer" ;;
       --material) cp "$2" "$FAKE_LOG.material" ;;
+      --keep-out) cp "$2" "$FAKE_LOG.keepout" ;;
     esac
     shift
   done

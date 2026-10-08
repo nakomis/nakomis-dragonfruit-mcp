@@ -36,7 +36,7 @@
  *     --printer-json <profile.json> [--material <material.json>] [--layer-height N]
  *     [--aa-preset sharp|balanced|smooth|raw] [--lift-mm 7] [--density 1] [--raft solid|line|off]
  *     [--settings <json>] [--coarse-islands] [--px-mm 0.05] [--supported-stl <out.stl>] [--plate-stl <out.stl>] [--job-dir <dir>]
- *     [--no-slice] [--verbose]
+ *     [--keep-out <holes.json>] [--support-internal-islands] [--probe-points <json>] [--no-slice] [--verbose]
  *
  * `--supported-stl` writes model, supports and raft as sliced; `--plate-stl` the
  * model alone in the same plate frame (centred, lifted), to line up with a layer.
@@ -44,6 +44,25 @@
  * with `--no-slice` it writes them without slicing. `--coarse-islands` trades
  * island detail for speed (the bench's resolution rather than the app panel's).
  * Existing output files are overwritten.
+ *
+ * `--keep-out` names a JSON file of drilled holes in the STL's own frame
+ * (`{"holes": [{x, y, z, radius_mm, direction, length_mm, ...}]}`, as
+ * `drill_holes` records them; `length_mm` runs from the start point to where the
+ * bore leaves the skin). Each becomes a keep-out cylinder (radius + 1 mm) round
+ * the hole's axis, anchored on that exit: from 4 mm back along the bore to 3 mm
+ * past the exit. DragonFruit's support blockers (the "nogo" paint that candidate
+ * generation and the grid lattice honour) are set on every model triangle
+ * touching a cylinder, so no contact lands there; then any support whose
+ * contact or shaft still enters one (a trunk leaning in from outside) is removed
+ * with `removeSupportEntity`, which takes its dependants with it, and shafts
+ * left holding nothing are removed in turn. The summary's `keep_out` section
+ * counts all of it, per hole.
+ *
+ * Islands whose contact faces a sealed cavity are skipped before placement
+ * (hollow interiors are not supported in normal resin practice, and the only
+ * way to reach them is a trunk up through the drain hole) unless
+ * `--support-internal-islands`. `--probe-points` takes `[[x, y, z], ...]` in the
+ * plate frame, prints which keep-out zones contain each, and exits.
  *
  * Prints one JSON summary on stdout; everything else goes to stderr.
  */
@@ -60,9 +79,10 @@ import { initializeBVH, accelerateGeometry } from '@/utils/bvh';
 import { createDefaultSettings } from '@/supports/Settings/types';
 import { setSettings } from '@/supports/Settings/state';
 import { clearHistory } from '@/history/historyStore';
-import { getSnapshot, resetKickstandsInState, resetStore } from '@/supports/state';
+import { getSnapshot, removeSupportEntity, resetKickstandsInState, resetStore } from '@/supports/state';
 import { registerSupportHistoryHandlers } from '@/supports/history/useSupportHistoryHandlers';
 import { setModelMesh } from '@/supports/autoSupport/meshStore';
+import { deleteSupportBlockers, setSupportBlockedTriangles } from '@/supports/autoSupport/supportBlockers';
 import { commitAutoPlacePlan } from '@/supports/autoSupport/autoPlace';
 import { resolvedSizingBandsForRun } from '@/supports/autoSupport/parameterSizing';
 import {
@@ -130,6 +150,9 @@ interface Options {
     supportedStl: string | null;
     plateStl: string | null;
     jobDir: string | null;
+    keepOut: string | null;
+    supportInternalIslands: boolean;
+    probePoints: number[][] | null;
     slice: boolean;
     verbose: boolean;
 }
@@ -153,6 +176,9 @@ function parseArgs(argv: string[]): Options {
         supportedStl: null,
         plateStl: null,
         jobDir: null,
+        keepOut: null,
+        supportInternalIslands: false,
+        probePoints: null,
         slice: true,
         verbose: false,
     };
@@ -186,6 +212,9 @@ function parseArgs(argv: string[]): Options {
         else if (arg === '--supported-stl') options.supportedStl = resolve(value());
         else if (arg === '--plate-stl') options.plateStl = resolve(value());
         else if (arg === '--job-dir') options.jobDir = resolve(value());
+        else if (arg === '--keep-out') options.keepOut = resolve(value());
+        else if (arg === '--support-internal-islands') options.supportInternalIslands = true;
+        else if (arg === '--probe-points') options.probePoints = JSON.parse(value()) as number[][];
         else if (arg === '--no-slice') options.slice = false;
         else if (arg === '--verbose') options.verbose = true;
         else throw new Error(`unknown argument "${arg}"`);
@@ -303,6 +332,239 @@ function countCommitted(): { byType: Record<string, number>; contacts: number; r
     return { byType, contacts, roots: Object.keys(state.roots ?? {}).length };
 }
 
+/** Margin round a hole's opening that supports must keep clear of, mm. */
+const KEEP_OUT_MARGIN_MM = 1;
+/**
+ * The zone is anchored on the hole's exit through the skin, E = start + dir *
+ * length_mm: it reaches this far back along the bore (into the wall and the
+ * cavity side of it) and this far past E (outside the part). A hole's start may
+ * lie well inside a cavity, so the zone never reaches further in than that, and
+ * never further than KEEP_OUT_BEHIND_START_MM behind the start itself.
+ */
+const KEEP_OUT_INWARD_OF_EXIT_MM = 4;
+const KEEP_OUT_OUTWARD_OF_EXIT_MM = 3;
+const KEEP_OUT_BEHIND_START_MM = 2;
+
+interface HoleSpec {
+    x: number;
+    y: number;
+    z: number;
+    radius_mm: number;
+    direction: [number, number, number];
+    /** From the start point, along `direction`, to where the bore leaves the skin. */
+    length_mm: number;
+    purpose?: string;
+}
+
+/** A hole's keep-out cylinder in the plate frame. */
+class KeepOutZone {
+    readonly start: THREE.Vector3;
+    readonly dir: THREE.Vector3;
+    readonly exit: THREE.Vector3;
+    /** The cylinder runs from `t = tMin` to `t = tMax` along `dir` from `start`. */
+    readonly tMin: number;
+    readonly tMax: number;
+    readonly radius: number;
+    /** Bounding box of the whole cylinder, for cheap rejection. */
+    readonly box: THREE.Box3;
+
+    constructor(readonly index: number, readonly spec: HoleSpec, shift: THREE.Vector3) {
+        this.start = new THREE.Vector3(spec.x, spec.y, spec.z).add(shift);
+        this.dir = new THREE.Vector3(...spec.direction).normalize();
+        this.exit = this.start.clone().addScaledVector(this.dir, spec.length_mm);
+        this.tMin = Math.max(-KEEP_OUT_BEHIND_START_MM, spec.length_mm - KEEP_OUT_INWARD_OF_EXIT_MM);
+        this.tMax = spec.length_mm + KEEP_OUT_OUTWARD_OF_EXIT_MM;
+        this.radius = spec.radius_mm + KEEP_OUT_MARGIN_MM;
+        this.box = new THREE.Box3()
+            .setFromPoints([this.start.clone().addScaledVector(this.dir, this.tMin), this.start.clone().addScaledVector(this.dir, this.tMax)])
+            .expandByScalar(this.radius);
+    }
+
+    contains(x: number, y: number, z: number): boolean {
+        const dx = x - this.start.x;
+        const dy = y - this.start.y;
+        const dz = z - this.start.z;
+        const t = dx * this.dir.x + dy * this.dir.y + dz * this.dir.z;
+        if (t < this.tMin || t > this.tMax) return false;
+        const px = dx - t * this.dir.x;
+        const py = dy - t * this.dir.y;
+        const pz = dz - t * this.dir.z;
+        return px * px + py * py + pz * pz <= this.radius * this.radius;
+    }
+
+    /** Whether the straight run a to b enters the cylinder (sampled at most ~0.25 mm apart). */
+    touchesSegment(a: THREE.Vector3, b: THREE.Vector3): boolean {
+        const steps = Math.max(1, Math.ceil(a.distanceTo(b) / 0.25));
+        for (let i = 0; i <= steps; i++) {
+            const f = i / steps;
+            if (this.contains(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.z + (b.z - a.z) * f)) return true;
+        }
+        return false;
+    }
+}
+
+function parseHoles(path: string): HoleSpec[] {
+    const raw = JSON.parse(readFileSync(path, 'utf-8')) as { holes?: unknown };
+    if (!raw || !Array.isArray(raw.holes)) throw new Error(`${path}: expected {"holes": [...]}`);
+    return raw.holes.map((entry, i) => {
+        const h = entry as Partial<HoleSpec>;
+        const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+        if (!finite(h.x) || !finite(h.y) || !finite(h.z) || !finite(h.radius_mm) || h.radius_mm <= 0
+            || !finite(h.length_mm) || !Array.isArray(h.direction) || h.direction.length !== 3 || !h.direction.every(finite)
+            || Math.hypot(...(h.direction as number[])) === 0) {
+            throw new Error(`${path}: hole ${i} needs numeric x, y, z, radius_mm > 0, length_mm and a non-zero direction [dx, dy, dz]`);
+        }
+        return h as HoleSpec;
+    });
+}
+
+/**
+ * Indices of the model triangles that touch any zone: a vertex, an edge
+ * crossing it, or the centroid. Per-zone counts, then the union. A triangle
+ * whose bounding box misses a zone's is rejected before any sampling.
+ */
+function triangleIndicesInZones(positions: Float32Array, zones: KeepOutZone[]): { perZone: number[]; all: Set<number> } {
+    const perZone = zones.map(() => 0);
+    const all = new Set<number>();
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    const centroid = new THREE.Vector3();
+    const box = new THREE.Box3();
+    for (let t = 0; t < positions.length / 9; t++) {
+        a.fromArray(positions, t * 9);
+        b.fromArray(positions, t * 9 + 3);
+        c.fromArray(positions, t * 9 + 6);
+        box.makeEmpty().expandByPoint(a).expandByPoint(b).expandByPoint(c);
+        centroid.copy(a).add(b).add(c).divideScalar(3);
+        zones.forEach((zone, k) => {
+            if (!zone.box.intersectsBox(box)) return;
+            if (zone.contains(a.x, a.y, a.z) || zone.contains(b.x, b.y, b.z) || zone.contains(c.x, c.y, c.z)
+                || zone.contains(centroid.x, centroid.y, centroid.z)
+                || zone.touchesSegment(a, b) || zone.touchesSegment(b, c) || zone.touchesSegment(c, a)) {
+                perZone[k]++;
+                all.add(t);
+            }
+        });
+    }
+    return { perZone, all };
+}
+
+/** Directions probed from a point to tell a cavity from open air: the 26 neighbours of a cube. */
+const ENCLOSURE_DIRECTIONS: THREE.Vector3[] = [];
+for (const dx of [-1, 0, 1]) for (const dy of [-1, 0, 1]) for (const dz of [-1, 0, 1]) {
+    if (dx || dy || dz) ENCLOSURE_DIRECTIONS.push(new THREE.Vector3(dx, dy, dz).normalize());
+}
+
+/**
+ * Whether an island's contact is on a surface facing into a closed cavity: a
+ * point just below the contact (islands are overhangs, so the air is below)
+ * from which every one of 26 rays meets the model. Open air, even under a deep
+ * overhang, lets at least one ray escape; a sealed hollow does not. (Ray parity
+ * cannot tell them apart: a cavity point and an outside point are both "even".)
+ * A drilled hole is a leak, but a small one: a few of the 26 rays could pass
+ * through it, so a point in a drained cavity can read as open only if it sits
+ * right in line with the hole.
+ */
+function isInternalContact(mesh: THREE.Mesh, contact: { x: number; y: number; z: number }): boolean {
+    const raycaster = new THREE.Raycaster();
+    const origin = new THREE.Vector3(contact.x, contact.y, contact.z - 0.3);
+    for (const direction of ENCLOSURE_DIRECTIONS) {
+        raycaster.set(origin, direction);
+        if (raycaster.intersectObject(mesh, false).length === 0) return false;
+    }
+    return true;
+}
+
+interface SupportProbe {
+    id: string;
+    contacts: THREE.Vector3[];
+    runs: [THREE.Vector3, THREE.Vector3][];
+}
+
+/**
+ * Every committed support's contact points and shaft runs, in the plate frame
+ * (the store is already there). A shaft starts at its root's plate position, or
+ * the knot it hangs from; runs through its segments' joints; and ends at its
+ * contact. Braces are the straight run between their two knots.
+ */
+function probeCommittedSupports(): SupportProbe[] {
+    type P = { x: number; y: number; z: number };
+    type Seg = { bottomJoint?: { pos: P }; topJoint?: { pos: P } };
+    const state = getSnapshot() as unknown as Record<string, Record<string, Record<string, unknown>>>;
+    const vec = (p: P) => new THREE.Vector3(p.x, p.y, p.z);
+    const rootPos = (id: unknown): THREE.Vector3 | null => {
+        const root = state.roots?.[id as string] as { transform?: { pos?: P } } | undefined;
+        return root?.transform?.pos ? vec(root.transform.pos) : null;
+    };
+    const knotPos = (id: unknown): THREE.Vector3 | null => {
+        const knot = state.knots?.[id as string] as { pos?: P } | undefined;
+        return knot?.pos ? vec(knot.pos) : null;
+    };
+    const probes: SupportProbe[] = [];
+    for (const descriptor of SUPPORT_STATE_TYPES) {
+        for (const [id, entity] of Object.entries(state[descriptor.location.key] ?? {})) {
+            const probe: SupportProbe = { id, contacts: [], runs: [] };
+            for (const field of descriptor.contactFields) {
+                const cone = entity[field] as { pos?: P } | undefined;
+                if (cone?.pos) probe.contacts.push(vec(cone.pos));
+            }
+            const start = rootPos(entity.rootId) ?? knotPos(entity.parentKnotId);
+            let previous = start;
+            const segments = (entity.segments ?? []) as Seg[];
+            segments.forEach((seg, i) => {
+                const bottom = seg.bottomJoint ? vec(seg.bottomJoint.pos) : previous;
+                const top = seg.topJoint ? vec(seg.topJoint.pos) : (i === segments.length - 1 ? probe.contacts[0] ?? null : null);
+                if (bottom && top) probe.runs.push([bottom, top]);
+                previous = top ?? previous;
+            });
+            // A shaft-less support (a leaf) is a straight run from its knot to its contact.
+            if (segments.length === 0 && start && probe.contacts[0]) probe.runs.push([start, probe.contacts[0]]);
+            const a = knotPos(entity.startKnotId);
+            const b = knotPos(entity.endKnotId);
+            if (a && b) probe.runs.push([a, b]);
+            probes.push(probe);
+        }
+    }
+    return probes;
+}
+
+/** Every support entity in the store, of any type. */
+function totalEntities(): number {
+    return Object.values(countCommitted().byType).reduce((sum, n) => sum + n, 0);
+}
+
+/**
+ * Shafts that hold nothing: a trunk, branch or stick with no contact of its own
+ * and nothing hanging off its knots (no hosted support, no brace end).
+ */
+function findDanglingShafts(): string[] {
+    const state = getSnapshot() as unknown as Record<string, Record<string, Record<string, unknown>>>;
+    const knotHost = (knotId: unknown): string | null => {
+        const knot = state.knots?.[knotId as string] as { parentShaftId?: string } | undefined;
+        return knot?.parentShaftId ?? null;
+    };
+    const hosted = new Set<string>();
+    for (const descriptor of SUPPORT_STATE_TYPES) {
+        for (const entity of Object.values(state[descriptor.location.key] ?? {})) {
+            for (const field of ['parentKnotId', 'startKnotId', 'endKnotId']) {
+                const host = entity[field] ? knotHost(entity[field]) : null;
+                if (host) hosted.add(host);
+            }
+        }
+    }
+    const dangling: string[] = [];
+    for (const descriptor of SUPPORT_STATE_TYPES) {
+        if (descriptor.contactFields.length === 0) continue; // braces, stumps and the like carry no shaft of their own
+        for (const [id, entity] of Object.entries(state[descriptor.location.key] ?? {})) {
+            const hasShaft = Array.isArray(entity.segments) && entity.segments.length > 0;
+            const hasContact = descriptor.contactFields.some((field) => entity[field]);
+            if (hasShaft && !hasContact && !hosted.has(id)) dangling.push(id);
+        }
+    }
+    return dangling;
+}
+
 function writeBinaryStl(path: string, positions: Float32Array): void {
     const triangles = positions.length / 9;
     const buffer = Buffer.alloc(84 + triangles * 50);
@@ -406,6 +668,21 @@ async function main(): Promise<void> {
         warnings.push('lift 0: the model sits on the plate, so only overhangs above its base are supported');
     }
 
+    // Keep-out zones: the holes come in the STL's frame, the model now sits in the plate's.
+    const zones = options.keepOut ? parseHoles(options.keepOut).map((spec, i) => new KeepOutZone(i, spec, plateShift)) : [];
+    if (options.probePoints) {
+        process.stdout.write(`${JSON.stringify({
+            zones: zones.map((zone) => ({
+                hole: zone.index,
+                exit_plate_mm: zone.exit.toArray(),
+                t_range_mm: [zone.tMin, zone.tMax],
+                radius_mm: zone.radius,
+                contains: options.probePoints!.map(([x, y, z]) => zone.contains(x, y, z)),
+            })),
+        })}\n`);
+        return;
+    }
+
     // Islands, the voxel family first, as the bench detects them.
     type IslandScanModule = typeof import('../vendor/dragonfruit/scripts/bench-island-scan');
     const islandScan = await importDragonFruitScript<IslandScanModule>('scripts/bench-island-scan.ts');
@@ -463,9 +740,54 @@ async function main(): Promise<void> {
     mesh.updateMatrixWorld(true);
     setModelMesh(modelId, mesh);
 
+    // Which islands face into a sealed cavity. Hollow interiors go unsupported
+    // by default: the only way in is a trunk routed up through the drain hole.
+    const internalIds = new Set(islands.filter((island) => isInternalContact(mesh, island.contact)).map((island) => island.id));
+    const skippedInternal = options.supportInternalIslands ? [] : islands.filter((island) => internalIds.has(island.id));
+    const placed = options.supportInternalIslands ? islands : islands.filter((island) => !internalIds.has(island.id));
+    const tag = (island: DetectedIsland) => (internalIds.has(island.id) ? 'internal' : 'external');
+    const describe = (island: DetectedIsland) => `${island.id} (${tag(island)} ${island.source}, contact ${island.contact.x.toFixed(1)}, ${island.contact.y.toFixed(1)}, ${island.contact.z.toFixed(1)})`;
+    if (skippedInternal.length > 0) {
+        warnings.push(`${skippedInternal.length} of ${islands.length} islands face into a cavity and were not supported (hollow interiors are left bare; pass support_internal_islands to support them)`);
+    }
+
+    const keepOutReport = zones.map((zone) => ({
+        hole: zone.index,
+        purpose: zone.spec.purpose ?? null,
+        start_plate_mm: zone.start.toArray(),
+        exit_plate_mm: zone.exit.toArray(),
+        t_range_mm: [zone.tMin, zone.tMax],
+        direction: zone.dir.toArray(),
+        keep_out_radius_mm: zone.radius,
+        blocked_triangles: 0,
+        islands_inside: [] as string[],
+        islands_inside_internal: [] as string[],
+        contacts_removed: 0,
+        supports_removed: 0,
+        lost_coverage: [] as string[],
+    }));
+    if (zones.length > 0) {
+        const blocked = triangleIndicesInZones(geometry.getAttribute('position').array as Float32Array, zones);
+        blocked.perZone.forEach((count, k) => {
+            keepOutReport[k].blocked_triangles = count;
+            if (count === 0) warnings.push(`keep-out hole ${k}: no model surface lies within ${zones[k].radius} mm of its axis (does the holes file match this STL?)`);
+        });
+        setSupportBlockedTriangles(modelId, blocked.all);
+        for (const island of islands) {
+            zones.forEach((zone, k) => {
+                if (!zone.contains(island.contact.x, island.contact.y, island.contact.z)) return;
+                (internalIds.has(island.id) ? keepOutReport[k].islands_inside_internal : keepOutReport[k].islands_inside).push(island.id);
+            });
+        }
+        keepOutReport.forEach((r, k) => {
+            if (r.islands_inside.length + r.islands_inside_internal.length === 0) return;
+            warnings.push(`keep-out hole ${k}: ${r.islands_inside.length} external island(s) [${r.islands_inside.join(', ')}] and ${r.islands_inside_internal.length} internal island(s) [${r.islands_inside_internal.join(', ')}] have their contact point inside the zone, so cannot take a support there`);
+        });
+    }
+
     const plan = await time('auto_place_ms', () => runAutoPlaceRequest({
         modelId,
-        islands: islands.map(serializeIsland),
+        islands: placed.map(serializeIsland),
         settingsOverride,
         sizingBands: resolvedSizingBandsForRun(settingsOverride.sizingPreset ?? autoDefaults.sizingPreset),
         appSettings,
@@ -473,13 +795,88 @@ async function main(): Promise<void> {
         mesh: serializeModelMesh(mesh),
         meshKey: modelMeshKey(mesh),
     }));
-    if (!plan) throw new Error(`auto-support produced no plan (${islands.length} islands)`);
+    if (!plan) throw new Error(`auto-support produced no plan (${placed.length} islands)`);
     const result = commitAutoPlacePlan(plan);
     disposeHistory();
+    let keepOutTotals: Record<string, unknown> | null = null;
+    if (zones.length > 0) {
+        deleteSupportBlockers(modelId);
+        const entitiesBefore = totalEntities();
+        // Whatever still enters a zone: a contact the blockers missed or a shaft leaning in.
+        const probes = probeCommittedSupports();
+        const reachOf = (island: DetectedIsland) => Math.max(3, Math.sqrt((island.areaMm2 ?? 0) / Math.PI) + 1);
+        const at = (island: DetectedIsland) => new THREE.Vector3(island.contact.x, island.contact.y, island.contact.z);
+        const coverageNear = (island: DetectedIsland, live: SupportProbe[]): number => {
+            const where = at(island);
+            return live.filter((p) => p.contacts.some((q) => q.distanceTo(where) <= reachOf(island))).length;
+        };
+        const before = new Map(placed.map((island) => [island.id, coverageNear(island, probes)]));
+        const removedBy = new Map<string, Set<number>>();
+        for (const probe of probes) {
+            zones.forEach((zone, k) => {
+                const contact = probe.contacts.some((q) => zone.contains(q.x, q.y, q.z));
+                const shaft = probe.runs.some(([p, q]) => zone.touchesSegment(p, q));
+                if (!contact && !shaft) return;
+                if (contact) keepOutReport[k].contacts_removed++;
+                keepOutReport[k].supports_removed++;
+                removedBy.set(probe.id, (removedBy.get(probe.id) ?? new Set<number>()).add(k));
+            });
+        }
+        for (const id of removedBy.keys()) removeSupportEntity(id); // cascades to what hangs off it; a repeat is a harmless null
+        // Shafts left holding nothing (no contact of their own, nothing hanging off them), to a fixed point.
+        const danglingRemoved: string[] = [];
+        for (;;) {
+            const dangling = findDanglingShafts();
+            if (dangling.length === 0) break;
+            for (const id of dangling) removeSupportEntity(id);
+            danglingRemoved.push(...dangling);
+        }
+        const live = probeCommittedSupports();
+        const zoneNear = (island: DetectedIsland): number[] => zones.filter((zone) => {
+            const where = at(island);
+            const t = Math.min(zone.tMax, Math.max(zone.tMin, where.clone().sub(zone.start).dot(zone.dir)));
+            return where.distanceTo(zone.start.clone().addScaledVector(zone.dir, t)) <= reachOf(island) + zone.radius;
+        }).map((zone) => zone.index);
+        for (const island of placed) {
+            if (coverageNear(island, live) > 0) continue;
+            if ((before.get(island.id) ?? 0) > 0) {
+                // Supported before the removals, bare after: say which hole's supports went.
+                const where = at(island);
+                const holes = new Set<number>();
+                for (const probe of probes) {
+                    if (!removedBy.has(probe.id) || !probe.contacts.some((q) => q.distanceTo(where) <= reachOf(island))) continue;
+                    removedBy.get(probe.id)!.forEach((k) => holes.add(k));
+                }
+                holes.forEach((k) => keepOutReport[k].lost_coverage.push(island.id));
+                warnings.push(`island ${describe(island)} lost all its supports to keep-out hole(s) ${[...holes].join(', ') || '?'}`);
+            } else {
+                // Never had a support: the blockers (or placement) left it bare. Name a hole if one is within reach.
+                const near = zoneNear(island);
+                if (near.length > 0) warnings.push(`island ${describe(island)} has no support within reach; keep-out hole(s) ${near.join(', ')} block the surface nearby`);
+            }
+        }
+        for (const [k, zone] of zones.entries()) {
+            const r = keepOutReport[k];
+            if (r.supports_removed > 0) {
+                warnings.push(`keep-out hole ${k}: removed ${r.supports_removed} support(s) (${r.contacts_removed} by contact, ${r.supports_removed - r.contacts_removed} by shaft) that entered ${zone.radius} mm of its axis`);
+            }
+        }
+        // A last look at what is committed: nothing may be left inside any zone.
+        const residual = live.filter((probe) => zones.some((zone) => probe.contacts.some((q) => zone.contains(q.x, q.y, q.z))
+            || probe.runs.some(([p, q]) => zone.touchesSegment(p, q)))).length;
+        if (residual > 0) warnings.push(`${residual} support(s) are still inside a keep-out zone after removal`);
+        keepOutTotals = {
+            entities_before: entitiesBefore,
+            entities_after: totalEntities(),
+            entities_removed_total: entitiesBefore - totalEntities(),
+            dangling_removed: danglingRemoved.length,
+            residual_in_zone: residual,
+        };
+    }
     const committed = countCommitted();
     const analytics = plan.analytics;
-    if (islands.length === 0) warnings.push('no islands found: nothing was supported');
-    if (analytics.islandsUncovered > 0) warnings.push(`${analytics.islandsUncovered} of ${islands.length} islands have no support near them`);
+    if (placed.length === 0) warnings.push('no islands to support: nothing was supported');
+    if (analytics.islandsUncovered > 0) warnings.push(`${analytics.islandsUncovered} of ${placed.length} islands have no support near them`);
     const orphans = analytics.forestReport?.orphans?.length ?? 0;
     if (orphans > 0) warnings.push(`${orphans} supports were culled as orphans`);
 
@@ -596,7 +993,7 @@ async function main(): Promise<void> {
     disposeEventLoopChannel();
 
     const placedByType = Object.fromEntries(Object.entries(result.placed).filter(([, count]) => count > 0));
-    console.error(`autosupport-slice: ${islands.length} islands, ${committed.contacts} contacts, ${supportTriangles.length} support/raft triangles`);
+    console.error(`autosupport-slice: ${placed.length} islands, ${committed.contacts} contacts, ${supportTriangles.length} support/raft triangles`);
     process.stdout.write(`${JSON.stringify({
         stl: options.stl,
         printer: { preset_id: job.printer.officialPresetId ?? null, name: job.printer.name, output_format: format, material: job.material.name, layer_height_mm: layerHeightMm },
@@ -611,12 +1008,12 @@ async function main(): Promise<void> {
         layers_expected: layerCount.totalLayers,
         support_tip_shrink_percent: supportTipShrinkPercent,
         island_detection: { px_mm: options.pxMm ?? detect.pxMm, support_buffer_mm: detect.supportBufferMm },
-        islands: islands.length,
-        islands_by_source: islands.reduce<Record<string, number>>((counts, island) => {
+        islands: placed.length,
+        islands_by_source: placed.reduce<Record<string, number>>((counts, island) => {
             counts[island.source] = (counts[island.source] ?? 0) + 1;
             return counts;
         }, {}),
-        island_list: islands.map((island) => ({
+        island_list: placed.map((island) => ({
             id: island.id,
             source: island.source,
             contact: [island.contact.x, island.contact.y, island.contact.z],
@@ -638,6 +1035,10 @@ async function main(): Promise<void> {
         supported_stl: options.supportedStl,
         output: options.slice ? options.out : null,
         job_dir: options.jobDir,
+        keep_out: options.keepOut ? { source: options.keepOut, holes: keepOutReport, ...keepOutTotals } : null,
+        islands_detected: islands.length,
+        islands_internal: internalIds.size,
+        islands_internal_skipped: skippedInternal.length,
         overwritten,
         slice,
         timings_ms: timings,
