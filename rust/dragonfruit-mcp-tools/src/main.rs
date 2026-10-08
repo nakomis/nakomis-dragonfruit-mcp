@@ -4,9 +4,13 @@
 //!
 //! `overhangs` runs DragonFruit's mesh-normal overhang classifier (NDFM-8),
 //! which upstream only exposes as a Tauri command; see build.rs.
+//!
+//! `render` draws an STL to a PNG for print previews (NDFM-14), with a software
+//! rasteriser: no display or GPU needed.
 
 mod drain;
 mod ops;
+mod render;
 
 #[allow(dead_code, clippy::all)]
 mod overhang {
@@ -107,6 +111,41 @@ enum Command {
         /// Whether the print has a raft (only changes the stability report).
         #[arg(long)]
         has_raft: bool,
+    },
+    /// Render an STL to a PNG preview: model and supports in two colours, shaded,
+    /// from a three-quarter view. No display or GPU needed. Prints a JSON report.
+    Render {
+        /// Binary or ASCII STL.
+        #[arg(long)]
+        stl: PathBuf,
+        /// Output PNG.
+        #[arg(long)]
+        out: PathBuf,
+        /// Triangles before this index are the model; the rest (supports, raft)
+        /// take the support colour. Default: all model.
+        #[arg(long)]
+        split: Option<usize>,
+        /// Width and height in pixels.
+        #[arg(long, default_value_t = 580)]
+        size: u32,
+        /// Degrees round from the front (-Y); negative views from the left (-X).
+        #[arg(long, default_value_t = -35.0, allow_negative_numbers = true)]
+        azimuth: f32,
+        /// Degrees above the horizon.
+        #[arg(long, default_value_t = 28.0, allow_negative_numbers = true)]
+        elevation: f32,
+        /// Field of view in degrees; 0 is orthographic.
+        #[arg(long, default_value_t = 25.0)]
+        fov: f32,
+        /// Faces meeting at more than this many degrees keep a hard edge.
+        #[arg(long, default_value_t = 50.0)]
+        crease: f32,
+        #[arg(long, default_value = "230,56,133")]
+        model_rgb: String,
+        #[arg(long, default_value = "64,128,242")]
+        support_rgb: String,
+        #[arg(long, default_value = "20,20,20")]
+        background: String,
     },
 }
 
@@ -462,11 +501,72 @@ fn main() {
             px_mm,
             has_raft,
         } => overhangs_cmd(&input, angle, px_mm, has_raft),
+        Command::Render {
+            stl,
+            out,
+            split,
+            size,
+            azimuth,
+            elevation,
+            fov,
+            crease,
+            model_rgb,
+            support_rgb,
+            background,
+        } => (|| {
+            let opts = render::RenderOptions {
+                size,
+                azimuth_deg: azimuth,
+                elevation_deg: elevation,
+                fov_deg: fov,
+                crease_deg: crease,
+                split,
+                model_rgb: render::parse_rgb(&model_rgb)?,
+                support_rgb: render::parse_rgb(&support_rgb)?,
+                background: render::parse_rgb(&background)?,
+                ..render::RenderOptions::default()
+            };
+            render_cmd(&stl, &out, &opts)
+        })(),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+/// Render an STL to a PNG and print what was drawn, with timings, as JSON.
+fn render_cmd(stl: &Path, out: &Path, opts: &render::RenderOptions) -> Result<(), String> {
+    let total = Instant::now();
+    let t = Instant::now();
+    let tris = render::read_stl(stl)?;
+    let load_ms = ms(t);
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(split) = opts.split {
+        if split > tris.len() {
+            warnings.push(format!(
+                "split {split} is past the last of {} triangles: everything is model",
+                tris.len()
+            ));
+        }
+    }
+    let t = Instant::now();
+    let image = render::render(&tris, opts)?;
+    let render_ms = ms(t);
+    let t = Instant::now();
+    render::write_png(&image, out)?;
+    let write_ms = ms(t);
+    let report = json!({
+        "stl": stl,
+        "out": out,
+        "triangles": tris.len(),
+        "model_triangles": opts.split.map_or(tris.len(), |s| s.min(tris.len())),
+        "size_px": opts.size,
+        "timing_ms": {"load": load_ms, "render": render_ms, "write": write_ms, "total": ms(total)},
+        "warnings": warnings,
+    });
+    println!("{report}");
+    Ok(())
 }
 
 /// Classify overhang regions as the app's `scan_overhangs` does; print the scan as JSON.
