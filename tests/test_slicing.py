@@ -6,6 +6,7 @@ import pytest
 
 from nakomis_dragonfruit_mcp import cli
 from nakomis_dragonfruit_mcp import stl as stl_io
+from nakomis_dragonfruit_mcp.goo_motion import HEADER
 from nakomis_dragonfruit_mcp.tools import slicing
 from tests.conftest import write_stl
 
@@ -27,7 +28,7 @@ def test_list_printers(fake_df):
     by_name = {p.name: p for p in result.printers}
     mars = by_name["mars5ultra"]
     assert (mars.route, mars.preset_id, mars.output_format) == (
-        "json",
+        "py",
         "elegoo-mars-5-ultra-ctb",
         ".goo",
     )
@@ -54,7 +55,10 @@ def test_slice_default_printer(fake_df, stl):
     assert result.printer == "mars5ultra" and result.printer_chosen_by == "default"
     assert result.format == ".goo" and result.layers == 42
     assert result.output_path == str(stl.with_name("model-mars5ultra.goo"))
-    assert Path(result.output_path).read_text() == "data"
+    # mars5ultra's driver post-processes .goo: the plate-motion fix is applied.
+    data = Path(result.output_path).read_bytes()
+    assert data[:4] == b"V1.2"
+    assert data[HEADER["per_layer"][0]] == 0 and data[HEADER["delay_mode"][0]] == 1
     # The default .goo is derived from the .ctb preset: custom profile, no presetId.
     assert "presetId" not in result.profile
     assert result.profile["display"]["outputFormat"] == ".goo"

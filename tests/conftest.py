@@ -26,7 +26,9 @@ case "$1" in
     esac
     shift
   done
-  printf data > "$out"
+  # A real (minimal) .goo when one is asked for, so printer drivers that
+  # post-process .goo files see a valid file; placeholder bytes otherwise.
+  case "$out" in *.goo) cp "$FAKE_GOO" "$out" ;; *) printf data > "$out" ;; esac
   sed "s#__OUT__#$out#g" "$FAKE_SUMMARY"
   exit 0
   ;;
@@ -43,7 +45,9 @@ case "$2 $3" in
     shift
   done
   ext=".${out##*.}"
-  printf data > "$out"
+  # A real (minimal) .goo when one is asked for, so printer drivers that
+  # post-process .goo files see a valid file; placeholder bytes otherwise.
+  case "$out" in *.goo) cp "$FAKE_GOO" "$out" ;; *) printf data > "$out" ;; esac
   printf '{"output": "%s", "format": "%s", "layers": 42, "layer_height_mm": %s, ' \
     "$out" "$ext" "${lh:-0.05}"
   printf '"resolution_px": [8520, 4320], "wall_s": 1.5, "anti_aliasing": {"preset": "balanced"}}'
@@ -60,6 +64,9 @@ def fake_df(tmp_path, monkeypatch):
     tsx_dir.mkdir(parents=True)
     tsx = tsx_dir / "tsx"
     tsx.write_text(FAKE_TSX)
+    minimal_goo = tmp_path / "minimal.goo"
+    write_minimal_goo(minimal_goo)
+    monkeypatch.setenv("FAKE_GOO", str(minimal_goo))
     tsx.chmod(tsx.stat().st_mode | stat.S_IXUSR)
     rust = df / "rust" / "dragonfruit-cli" / "target" / "release"
     rust.mkdir(parents=True)
@@ -121,6 +128,26 @@ def isolated_config(tmp_path, monkeypatch):
     monkeypatch.setattr(loader, "config_dir", lambda: tmp_path / "config")
     monkeypatch.delenv("NDFM_PRINTER", raising=False)
     monkeypatch.delenv("NDFM_PRINTERS_DIR", raising=False)
+
+
+def write_minimal_goo(path):
+    """The smallest valid .goo: a DragonFruit-style header and one black 4x2 layer."""
+    from nakomis_dragonfruit_mcp import goo
+
+    head = bytearray(goo.HEADER_BYTES)
+    head[:12] = b"V1.2" + goo.FILE_MAGIC
+    head[12:23] = b"DragonFruit"
+    for end in (194 + 116 * 116 * 2, 194 + 116 * 116 * 2 + 2 + 290 * 290 * 2):
+        head[end : end + 2] = b"\r\n"
+    s = goo.SETTINGS_OFFSET
+    struct.pack_into(">I", head, s, 1)
+    struct.pack_into(">HH", head, s + 4, 4, 2)
+    struct.pack_into(">f", head, s + 22, 0.05)
+    struct.pack_into(">I", head, s + 160, goo.HEADER_BYTES)
+    body = bytes([0b00 << 6 | 8])  # one black run of 8 pixels
+    data = b"\x55" + body + bytes([~sum(body) & 0xFF])
+    layer = b"\0" * 64 + b"\r\n" + struct.pack(">I", len(data)) + data + b"\r\n"
+    path.write_bytes(bytes(head) + layer)
 
 
 def write_stl(path, triangles):
