@@ -15,6 +15,7 @@ encoder never writes the format's "step" runs (TT 10), so those are refused.
 
 from __future__ import annotations
 
+import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,8 +150,56 @@ def header_room(path: Path, offset: int) -> int:
     return path.stat().st_size - offset
 
 
+# One run record, by its first byte [TT][SS][CCCC]: 1 byte, + a grey value byte
+# when TT is 01, + SS length bytes. TT 10 (step runs) matches nothing, so the
+# records stop tiling the data and the slow path names the problem.
+_RECORD = re.compile(
+    rb"[\x00-\x0f\xc0-\xcf]"
+    rb"|[\x10-\x1f\xd0-\xdf\x40-\x4f]."
+    rb"|[\x20-\x2f\xe0-\xef\x50-\x5f].."
+    rb"|[\x30-\x3f\xf0-\xff\x60-\x6f]..."
+    rb"|[\x70-\x7f]....",
+    re.DOTALL,
+)
+
+
 def decode_layer(data: bytes, width: int, height: int) -> bytes:
-    """Row-major 8-bit grey pixels of one layer."""
+    """Row-major 8-bit grey pixels of one layer.
+
+    The records are split in C by a regular expression and expanded with numpy;
+    anything that doesn't decode cleanly is handed to `_decode_slowly`, which
+    walks the runs one by one and says exactly what is wrong.
+    """
+    if not data or data[0] != 0x55:
+        raise GooError("layer data does not start with 0x55")
+    end = len(data) - 1
+    body = data[1:end]
+    raw = np.frombuffer(body, np.uint8)
+    if ~int(raw.sum(dtype=np.int64)) & 0xFF != data[end]:
+        raise GooError("layer checksum does not match")
+    records = _RECORD.findall(body)
+    sizes = np.fromiter(map(len, records), np.int64, len(records))
+    if int(sizes.sum()) != len(body):
+        return _decode_slowly(data, width, height)  # raises
+    at = np.r_[0, np.cumsum(sizes)[:-1]].astype(np.int64)
+    head = raw[at].astype(np.int64)
+    kind, extra = head >> 6, (head >> 4) & 3
+    grey = kind == 1
+    values = np.where(kind == 3, 255, 0).astype(np.uint8)
+    values[grey] = raw[at[grey] + 1]
+    high = np.zeros(len(at), np.int64)
+    after = at + 1 + grey
+    for k in (1, 2, 3):  # big-endian length bytes above the low 4 bits
+        has = extra >= k
+        high[has] = high[has] * 256 + raw[after[has] + k - 1]
+    lengths = high * 16 + (head & 0x0F)
+    if int(lengths.sum()) != width * height:  # checked before allocating anything
+        return _decode_slowly(data, width, height)  # raises
+    return np.repeat(values, lengths).tobytes()
+
+
+def _decode_slowly(data: bytes, width: int, height: int) -> bytes:
+    """The run-by-run decoder: the reference, and the source of precise errors."""
     if not data or data[0] != 0x55:
         raise GooError("layer data does not start with 0x55")
     end = len(data) - 1

@@ -9,9 +9,9 @@ dependencies = [
     # Pinned below 2: v2 renamed FastMCP.
     "mcp[cli]>=1.30,<2",
     "numpy>=2.4.6",
+    "opencv-python-headless>=4.10",
     "pillow>=10",
     "pydantic>=2.7",
-    "scipy>=1.14",
 ]
 
 [project.scripts]
