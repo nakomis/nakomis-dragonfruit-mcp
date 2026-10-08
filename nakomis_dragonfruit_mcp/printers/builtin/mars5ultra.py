@@ -31,5 +31,11 @@ class Mars5Ultra(Printer):
     def postprocess(self, out: Path, job: SliceJob, run: SliceRun) -> Path:
         if out.suffix.lower() == ".goo":
             display = run.profile.get("display", {}) if isinstance(run.profile, dict) else {}
-            normalise_tilting_motion(out, mirror_x=display.get("mirrorX"))
+            try:
+                normalise_tilting_motion(out, mirror_x=display.get("mirrorX"))
+            except Exception:
+                # Never leave an unpatched .goo where it could be printed: on this
+                # printer its plate would not rise. Keep it, renamed, for diagnosis.
+                out.replace(out.with_name(out.name + ".unpatched"))
+                raise
         return out

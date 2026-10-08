@@ -14,6 +14,8 @@ bottom and transition layers, PWM and the layer images are left as they are.
 
 from __future__ import annotations
 
+import os
+import shutil
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,6 +100,9 @@ LAYER = _offsets(_LAYER_FIELDS, 0)
 
 # Chitubox's values on a Mars 5 Ultra (firmware V1.5.0), from a .goo that printed.
 REST_BEFORE_CURE_S = 3.0
+
+# Both DragonFruit and Chitubox end a .goo with this after the last layer.
+END_MARKER = b"\x00\x00\x00\x07\x00\x00\x00DLP\x00"
 TILT_MOVE_MM = 0.05
 
 
@@ -124,6 +129,8 @@ def normalise_tilting_motion(path: Path, *, mirror_x: bool | None = None) -> Mot
     mirror_x, when given, also sets the header's mirror flag (DragonFruit leaves
     it 0 even when the layer images are mirrored).
     """
+    # The whole file is held in memory (about 2x its size at peak): fine for the
+    # ~150-300 MB files a resin print makes.
     data = bytearray(path.read_bytes())
     if not goo.is_goo(data[:16]):
         raise goo.GooError(f"{path} is not a .goo file")
@@ -144,6 +151,9 @@ def normalise_tilting_motion(path: Path, *, mirror_x: bool | None = None) -> Mot
     )
     before = {k: _get(data, HEADER[k]) for k in watched}
 
+    # Validate the whole layer table before changing a single byte.
+    layer_defs = _layer_definitions(data, path)
+
     _set(data, HEADER["per_layer"], 0)
     _set(data, HEADER["delay_mode"], 1)
     for k in ("b_wait_before_cure", "wait_before_cure"):
@@ -153,21 +163,52 @@ def normalise_tilting_motion(path: Path, *, mirror_x: bool | None = None) -> Mot
     if mirror_x is not None:
         _set(data, HEADER["mirror_x"], int(mirror_x))
 
-    layers = int(_get(data, HEADER["layers"]))
-    table = struct.unpack_from(">I", data, goo.SETTINGS_OFFSET + 160)[0]
-    off = table
-    for index in range(1, layers + 1):
-        if data[off + goo.LAYER_DEF_BYTES - 2 : off + goo.LAYER_DEF_BYTES] != b"\r\n":
-            raise goo.GooError(f"layer {index} is not where expected; nothing was written")
+    for off in layer_defs:
         _set(data, LAYER["pause_z"], _get(data, LAYER["z"], off), off)
         _set(data, LAYER["w_before_cure"], REST_BEFORE_CURE_S, off)
         for k in ("lift_h", "lift_s", "ret_h", "ret_s"):
             _set(data, LAYER[k], TILT_MOVE_MM, off)
-        size = struct.unpack_from(">I", data, off + goo.LAYER_DEF_BYTES)[0]
-        off += goo.LAYER_DEF_BYTES + 4 + size + 2
 
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    tmp.replace(path)
+    _replace_atomically(path, data)
     after = {k: _get(data, HEADER[k]) for k in watched}
-    return MotionReport(layers_patched=layers, header_before=before, header_after=after)
+    return MotionReport(layers_patched=len(layer_defs), header_before=before, header_after=after)
+
+
+def _layer_definitions(data: bytearray, path: Path) -> list[int]:
+    """Offsets of every layer definition; raises GooError unless the table is whole."""
+    if len(data) < goo.SETTINGS_OFFSET + 176:
+        raise goo.GooError(f"{path} is too short for a .goo header")
+    layers = int(_get(data, HEADER["layers"]))
+    table = struct.unpack_from(">I", data, goo.SETTINGS_OFFSET + 160)[0]
+    if table < goo.SETTINGS_OFFSET + 164 or table > len(data):
+        raise goo.GooError(f"{path}: layer table offset {table} is outside the file")
+    offsets, off = [], table
+    for index in range(1, layers + 1):
+        end_of_def = off + goo.LAYER_DEF_BYTES
+        if end_of_def + 4 > len(data) or data[end_of_def - 2 : end_of_def] != b"\r\n":
+            raise goo.GooError(f"{path}: layer {index} is not where expected; nothing was written")
+        size = struct.unpack_from(">I", data, end_of_def)[0]
+        end = end_of_def + 4 + size
+        if end + 2 > len(data) or data[end : end + 2] != b"\r\n":
+            raise goo.GooError(f"{path}: layer {index} is truncated; nothing was written")
+        offsets.append(off)
+        off = end + 2
+    if data[off:] not in (b"", END_MARKER):
+        raise goo.GooError(
+            f"{path}: {len(data) - off} unexpected bytes after the last layer; nothing was written"
+        )
+    return offsets
+
+
+def _replace_atomically(path: Path, data: bytes) -> None:
+    """Write next to the target, keep its mode, then swap it in; no partial target."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with tmp.open("wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        shutil.copymode(path, tmp)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)

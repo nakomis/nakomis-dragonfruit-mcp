@@ -49,7 +49,8 @@ def write_previews(
             if head[end : end + 2] != b"\r\n":
                 raise goo.GooError("preview slots are not where expected; nothing was written")
 
-        image = Image.open(picture).convert("RGB")
+        with Image.open(picture) as opened:
+            image = opened.convert("RGB")
         corner = image.getpixel((0, 0))
         bg = background or corner
         diff = np.abs(np.asarray(image, dtype=np.int16) - np.array(corner, dtype=np.int16)).sum(
@@ -62,8 +63,8 @@ def write_previews(
                 (
                     max(xs.min() - pad, 0),
                     max(ys.min() - pad, 0),
-                    min(xs.max() + pad, image.width),
-                    min(ys.max() + pad, image.height),
+                    min(xs.max() + 1 + pad, image.width),
+                    min(ys.max() + 1 + pad, image.height),
                 )
             )
 

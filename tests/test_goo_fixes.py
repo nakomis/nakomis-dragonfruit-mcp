@@ -7,7 +7,7 @@ from PIL import Image
 from test_printfile import LAYER_1, LAYER_2, LAYER_3, make_goo
 
 from nakomis_dragonfruit_mcp import goo
-from nakomis_dragonfruit_mcp.goo_motion import HEADER, LAYER, normalise_tilting_motion
+from nakomis_dragonfruit_mcp.goo_motion import END_MARKER, HEADER, LAYER, normalise_tilting_motion
 from nakomis_dragonfruit_mcp.goo_preview import BIG, BIG_AT, SMALL, SMALL_AT, write_previews
 from nakomis_dragonfruit_mcp.printers import SliceJob, SliceRun
 from nakomis_dragonfruit_mcp.printers.builtin.mars5ultra import Mars5Ultra
@@ -42,6 +42,8 @@ def dragonfruit_goo(tmp_path):
     """A .goo with DragonFruit's tilting-mode motion values, as found on 2026-10-07."""
     path = tmp_path / "df.goo"
     make_goo(path, [LAYER_1, LAYER_2, LAYER_3])
+    # Real files end with an end marker after the last layer.
+    path.write_bytes(path.read_bytes() + END_MARKER)
     data = bytearray(path.read_bytes())
     # Real files end each preview slot with CRLF.
     for at, size in ((SMALL_AT, SMALL), (BIG_AT, BIG)):
@@ -157,3 +159,111 @@ def test_mars5ultra_postprocess_fixes_goo_only(dragonfruit_goo, tmp_path):
     ctb.write_bytes(b"ctb bytes")
     assert printer.postprocess(ctb, job, run) == ctb
     assert ctb.read_bytes() == b"ctb bytes"
+
+
+# -- Literal offsets: independent of the field tables under test ------------
+# From DragonFruit's goo_encoder.rs write order and Cthulhu's header.ts.
+HEADER_LITERAL = {
+    "layers": 0,
+    "mirror_x": 8,
+    "layer_h": 22,
+    "exposure": 26,
+    "delay_mode": 30,
+    "b_wait_before_cure": 43,
+    "wait_before_cure": 55,
+    "b_exposure": 59,
+    "b_layers": 63,
+    "b_lift_h": 67,
+    "lift_h": 75,
+    "b_ret_h": 83,
+    "ret_h": 91,
+    "ret_s2": 127,
+    "per_layer": 135,
+}
+LAYER_LITERAL = {
+    "pause_z": 2,
+    "z": 6,
+    "exposure": 10,
+    "w_before_cure": 26,
+    "lift_h": 30,
+    "lift_s": 34,
+    "ret_h": 46,
+    "ret_s": 50,
+}
+
+
+@pytest.mark.parametrize("name,offset", HEADER_LITERAL.items())
+def test_header_offsets_are_pinned(name, offset):
+    assert HEADER[name][0] == goo.SETTINGS_OFFSET + offset
+
+
+@pytest.mark.parametrize("name,offset", LAYER_LITERAL.items())
+def test_layer_offsets_are_pinned(name, offset):
+    assert LAYER[name][0] == offset
+
+
+def test_offsets_agree_with_the_independent_reader(dragonfruit_goo):
+    header = goo.read_header(dragonfruit_goo)
+    data = dragonfruit_goo.read_bytes()
+    assert get(data, HEADER["layers"]) == header.layers
+    assert get(data, HEADER["exposure"]) == pytest.approx(header.exposure_s)
+    assert get(data, HEADER["b_exposure"]) == pytest.approx(header.bottom_exposure_s)
+    assert get(data, HEADER["b_layers"]) == header.bottom_layers
+
+
+def test_motion_fix_writes_the_literal_bytes(dragonfruit_goo):
+    normalise_tilting_motion(dragonfruit_goo)
+    data = dragonfruit_goo.read_bytes()
+    s = goo.SETTINGS_OFFSET
+    assert data[s + 135] == 0 and data[s + 30] == 1
+    assert data[s + 91 : s + 95] == struct.pack(">f", 0.05)  # retract height, big-endian
+    assert data[s + 55 : s + 59] == struct.pack(">f", 3.0)  # rest before cure
+
+
+def test_motion_fix_refuses_a_missing_trailing_crlf(dragonfruit_goo):
+    data = bytearray(dragonfruit_goo.read_bytes())
+    end = len(data) - len(END_MARKER)
+    data[end - 2 : end] = b"XX"
+    dragonfruit_goo.write_bytes(data)
+    with pytest.raises(goo.GooError, match="truncated"):
+        normalise_tilting_motion(dragonfruit_goo)
+    assert dragonfruit_goo.read_bytes() == data
+
+
+def test_motion_fix_refuses_trailing_garbage(dragonfruit_goo):
+    data = dragonfruit_goo.read_bytes() + b"extra"
+    dragonfruit_goo.write_bytes(data)
+    with pytest.raises(goo.GooError, match="unexpected bytes"):
+        normalise_tilting_motion(dragonfruit_goo)
+    assert dragonfruit_goo.read_bytes() == data
+
+
+def test_motion_fix_keeps_the_file_mode_and_leaves_no_temp(dragonfruit_goo):
+    dragonfruit_goo.chmod(0o640)
+    normalise_tilting_motion(dragonfruit_goo)
+    assert dragonfruit_goo.stat().st_mode & 0o777 == 0o640
+    assert list(dragonfruit_goo.parent.glob("*.tmp")) == []
+
+
+def test_mars5ultra_never_leaves_an_unpatched_goo(tmp_path):
+    bad = tmp_path / "broken.goo"
+    bad.write_bytes(b"not really a goo" * 10)
+    run = SliceRun(profile={"display": {"mirrorX": True}}, cli_args=[], result={})
+    with pytest.raises(goo.GooError):
+        Mars5Ultra().postprocess(bad, SliceJob(stl_path=Path("x.stl"), out_path=bad), run)
+    assert not bad.exists()
+    assert (tmp_path / "broken.goo.unpatched").exists()
+
+
+def test_preview_bytes_are_big_endian_rgb565(dragonfruit_goo, tmp_path):
+    picture = tmp_path / "red.png"
+    Image.new("RGB", (50, 50), (255, 0, 0)).save(picture)
+    write_previews(dragonfruit_goo, picture, background=(255, 0, 0))
+    data = dragonfruit_goo.read_bytes()
+    assert data[BIG_AT : BIG_AT + 2] == b"\xf8\x00"  # pure red = 0xF800, high byte first
+
+
+def test_motion_fix_accepts_a_file_without_the_end_marker(dragonfruit_goo):
+    data = dragonfruit_goo.read_bytes()
+    dragonfruit_goo.write_bytes(data[: -len(END_MARKER)])
+    assert normalise_tilting_motion(dragonfruit_goo).layers_patched == 3
