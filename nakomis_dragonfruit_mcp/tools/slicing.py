@@ -13,7 +13,7 @@ from typing import Any
 import anyio
 from pydantic import BaseModel, Field
 
-from nakomis_dragonfruit_mcp import cli
+from nakomis_dragonfruit_mcp import cli, goo_preview
 from nakomis_dragonfruit_mcp import stl as stl_io
 from nakomis_dragonfruit_mcp.app import ToolResult, mcp
 from nakomis_dragonfruit_mcp.printers import Printer, SliceJob, SliceRun, loader, presets
@@ -81,6 +81,10 @@ class SliceResult(ToolResult):
     )
     plate_bbox_mm: dict[str, list[float]] | None = Field(
         default=None, description="min and max corners of the plate STL, in plate coordinates"
+    )
+    previews_written: bool = Field(
+        default=False,
+        description="The print file's preview pictures were rendered from the model (.goo only)",
     )
 
 
@@ -175,6 +179,7 @@ async def slice(  # noqa: A001  (the tool's name)
     options: dict[str, Any] | None = None,
     export_plate_stl: bool = False,
     place_on_plate: bool = True,
+    previews: bool = True,
 ) -> SliceResult:
     """Slice an STL to the printer's own print file, as DragonFruit's app would.
 
@@ -204,6 +209,10 @@ async def slice(  # noqa: A001  (the tool's name)
         place_on_plate: Centre the model on the plate in XY and put its lowest
             point on z = 0 (default). False slices the STL as positioned, using
             its own coordinates (plate centre is 0, 0); the offset is then zero.
+        previews: Render the model into the print file's preview pictures, which
+            the printer's screen and print servers show (.goo only; other
+            formats keep the slicer's). A render that fails is a warning, not a
+            failed slice; `previews_written` says whether it happened.
 
     Always writes `<print file>.ndfm.json` recording how the file was made.
     """
@@ -219,6 +228,7 @@ async def slice(  # noqa: A001  (the tool's name)
         options=options,
         export_plate_stl=export_plate_stl,
         place_on_plate=place_on_plate,
+        previews=previews,
     )
     # The slice takes seconds to minutes: keep the event loop free meanwhile.
     return await anyio.to_thread.run_sync(run)
@@ -236,6 +246,7 @@ def run_slice(
     options: dict[str, Any] | None = None,
     export_plate_stl: bool = False,
     place_on_plate: bool = True,
+    previews: bool = True,
 ) -> SliceResult:
     """The blocking body of `slice`."""
     stl = Path(stl_path).expanduser().resolve()
@@ -325,6 +336,9 @@ def run_slice(
     run = SliceRun(profile=profile, cli_args=args, result=data)
     final = call_hook(chosen, "postprocess", chosen.postprocess, out_file, job, run)
     warnings.append(SUPPORTS_WARNING)
+    # After postprocess, which may rewrite the file. The view fits the mesh, so
+    # the STL as given draws the same as the plate STL would.
+    previews_written = previews and goo_preview.add_previews(final, job.stl_path, warnings)
     plate_path = plate_bbox = None
     if export_plate_stl:
         plate = final.with_name(final.name + ".plate.stl")
@@ -365,6 +379,7 @@ def run_slice(
         plate_offset_mm=offset,
         plate_stl_path=plate_path,
         plate_bbox_mm=plate_bbox,
+        previews_written=previews_written,
         warnings=warnings,
     )
 

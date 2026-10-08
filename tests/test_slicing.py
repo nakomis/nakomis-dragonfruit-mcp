@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from nakomis_dragonfruit_mcp import cli
+from nakomis_dragonfruit_mcp import cli, goo_preview
 from nakomis_dragonfruit_mcp import stl as stl_io
-from nakomis_dragonfruit_mcp.goo_motion import HEADER
+from nakomis_dragonfruit_mcp.goo_motion import HEADER, _layer_definitions
 from nakomis_dragonfruit_mcp.tools import slicing
 from tests.conftest import write_stl
 
@@ -297,6 +297,16 @@ def test_real_slice_of_test_model(real_model, monkeypatch, printer, format, expe
     # The test model is already centred on x/y and sits on z = 0.
     assert result.plate_bbox_mm["max"][2] == pytest.approx(70.2033, abs=1e-3)
     assert result.plate_offset_mm[2] == 0 and abs(result.plate_offset_mm[0]) < 0.01
+    # NDFM-14: a .goo gets rendered previews (magenta model); other formats are left alone.
+    assert result.previews_written is (expected == ".goo")
+    if expected == ".goo":
+        from tests.test_goo_preview import magenta_pixels, slot
+
+        data = Path(result.output_path).read_bytes()
+        assert magenta_pixels(slot(data, goo_preview.BIG_AT, goo_preview.BIG)) > 5000
+        # Written after mars5ultra's motion fix, and the file still validates.
+        assert data[HEADER["per_layer"][0]] == 0
+        assert len(_layer_definitions(bytearray(data), Path(result.output_path))) == 1405
 
 
 # -- placement, fit, hooks, sidecar, async -----------------------------------------------------

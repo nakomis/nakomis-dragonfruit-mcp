@@ -18,7 +18,7 @@ from typing import Any
 import anyio
 from pydantic import BaseModel, Field
 
-from nakomis_dragonfruit_mcp import cli
+from nakomis_dragonfruit_mcp import cli, goo_preview
 from nakomis_dragonfruit_mcp import stl as stl_io
 from nakomis_dragonfruit_mcp.app import ToolResult, mcp
 from nakomis_dragonfruit_mcp.printers import SliceRun
@@ -193,6 +193,11 @@ class SupportedSlice(ToolResult):
     keep_out: KeepOut | None = Field(
         default=None, description="Present when holes were kept clear of supports"
     )
+    previews_written: bool = Field(
+        default=False,
+        description="The print file's preview pictures show the model with its supports "
+        "and raft (.goo only)",
+    )
     timings_ms: dict[str, int]
 
 
@@ -292,6 +297,7 @@ async def auto_support_and_slice(
     holes: list[dict[str, Any]] | None = None,
     support_internal_islands: bool = False,
     options: dict[str, Any] | None = None,
+    previews: bool = True,
 ) -> SupportedSlice:
     """Auto-support an STL with DragonFruit's own placement, add a raft, and slice it.
 
@@ -357,6 +363,13 @@ async def auto_support_and_slice(
     +Y, and `mirror_x`/`mirror_y` say whether the printer's images are mirrored
     (the Mars 5 Ultra mirrors X).
 
+    Previews: by default the print file's preview pictures (shown on the
+    printer's screen and by print servers) are rendered from the model, in
+    magenta, with its supports and raft, in blue, as Chitubox's are (.goo
+    only). `previews=False` leaves the slicer's placeholder. A render that
+    fails is a warning, not a failed slice; `previews_written` says whether it
+    happened.
+
     Read `warnings`: they name islands left without support, supports culled as
     orphans, and anything else that makes the print riskier. Contact counts
     vary by about 7% between runs of the same model (upstream's overhang
@@ -384,6 +397,7 @@ async def auto_support_and_slice(
         holes=holes,
         support_internal_islands=support_internal_islands,
         options=options,
+        previews=previews,
     )
     # Minutes of work: keep the event loop free meanwhile.
     return await anyio.to_thread.run_sync(run)
@@ -410,6 +424,7 @@ def run_auto_support_and_slice(
     holes: list[dict[str, Any]] | None = None,
     support_internal_islands: bool = False,
     options: dict[str, Any] | None = None,
+    previews: bool = True,
 ) -> SupportedSlice:
     """The blocking body of `auto_support_and_slice`."""
     stl = Path(stl_path).expanduser().resolve()
@@ -508,104 +523,121 @@ def run_auto_support_and_slice(
             keep_out_file = Path(tmp) / "holes.json"
             keep_out_file.write_text(json.dumps({"holes": zones}))
             args += ["--keep-out", str(keep_out_file)]
+        # The previews show supports and raft, so they need the supported STL:
+        # beside the print when asked for, else a scratch copy (only .goo has them).
+        supported_stl = None
         if export_supported_stl:
-            args += [
-                "--supported-stl",
-                str(job.out_path.with_name(job.out_path.name + ".supported.stl")),
-            ]
+            supported_stl = job.out_path.with_name(job.out_path.name + ".supported.stl")
+        elif previews and plan.suffix == ".goo":
+            supported_stl = Path(tmp) / "preview.supported.stl"
+        if supported_stl is not None:
+            args += ["--supported-stl", str(supported_stl)]
         result = cli.run_ts(args, script=SCRIPT, parse_json=True, timeout=TIMEOUT_S)
 
-    data = result.data
-    if not isinstance(data, dict) or not data.keys() >= _REQUIRED_KEYS:
-        raise cli.CliError(f"unexpected autosupport-slice output: {result.stdout[:200]!r}")
-    slice_info = data.get("slice")
-    if not isinstance(slice_info, dict) or not slice_info.keys() >= _SLICE_KEYS:
-        raise cli.CliError(f"the slicer reported nothing usable: {str(slice_info)[:200]!r}")
-    out_file = Path(data["output"])
-    if not out_file.is_file():
-        raise cli.CliError(f"the slicer reported success but {out_file} does not exist")
+        data = result.data
+        if not isinstance(data, dict) or not data.keys() >= _REQUIRED_KEYS:
+            raise cli.CliError(f"unexpected autosupport-slice output: {result.stdout[:200]!r}")
+        slice_info = data.get("slice")
+        if not isinstance(slice_info, dict) or not slice_info.keys() >= _SLICE_KEYS:
+            raise cli.CliError(f"the slicer reported nothing usable: {str(slice_info)[:200]!r}")
+        out_file = Path(data["output"])
+        if not out_file.is_file():
+            raise cli.CliError(f"the slicer reported success but {out_file} does not exist")
 
-    warnings += data["warnings"]
-    if data["contacts"] == 0:
-        warnings.append("no supports were placed: the print will have none")
-    run = SliceRun(profile=plan.profile, cli_args=args, result=slice_info)
-    final = slicing.call_hook(chosen, "postprocess", chosen.postprocess, out_file, job, run)
+        warnings += data["warnings"]
+        if data["contacts"] == 0:
+            warnings.append("no supports were placed: the print will have none")
+        run = SliceRun(profile=plan.profile, cli_args=args, result=slice_info)
+        final = slicing.call_hook(chosen, "postprocess", chosen.postprocess, out_file, job, run)
+        # After postprocess, which may rewrite the file.
+        previews_written = False
+        if previews:
+            if supported_stl is not None and supported_stl.is_file():
+                previews_written = goo_preview.add_previews(
+                    final, supported_stl, warnings, model_triangles=data["model_triangles"]
+                )
+            elif goo_preview.has_preview_slots(final):
+                warnings.append(
+                    "the slice succeeded but its preview pictures could not be written "
+                    "(the printer shows a placeholder): no supported STL was written"
+                )
 
-    offset = [float(v) + 0.0 for v in data["plate_transform"]["translate_mm"]]
-    bbox = data.get("model_bbox_mm") or {}
-    plate_bbox = {"min": bbox.get("min", []), "max": bbox.get("max", [])}
-    plate_path = None
-    if export_plate_stl:
-        # The same writer and frame as `slice`'s plate STL: the STL moved by the offset.
-        plate = final.with_name(final.name + ".plate.stl")
-        try:
-            stl_io.write_translated(job.stl_path, plate, (offset[0], offset[1], offset[2]))
-        except (OSError, stl_io.StlError) as e:
-            warnings.append(f"the slice succeeded but the plate STL could not be written: {e}")
-        else:
-            plate_path = str(plate)
-    supports_info = {
-        "lift_mm": data.get("lift_mm"),
-        "raft": data["raft"],
-        "islands": data["islands"],
-        "islands_by_source": data["islands_by_source"],
-        "supports_by_type": data["placed_by_type"],
-        "contacts": data["contacts"],
-        "islands_uncovered": data.get("islands_uncovered", 0),
-        "supported_stl": data.get("supported_stl"),
-    }
-    sidecar = slicing.write_sidecar(
-        final,
-        chosen,
-        plan.profile,
-        slice_info,
-        place_on_plate=True,
-        offset=offset,
-        plate_path=plate_path,
-        plate_bbox=plate_bbox if plate_path else None,
-        supports=supports_info,
-    )
-    printer_info = data.get("printer", {})
-    return SupportedSlice(
-        output_path=str(final),
-        format=slice_info["format"],
-        printer=chosen.name,
-        printer_chosen_by=plan.origin,
-        material=printer_info.get("material", ""),
-        layers=slice_info["layers"],
-        layer_height_mm=round(slice_info["layer_height_mm"], 4),
-        lift_mm=data.get("lift_mm", lift_mm or 0),
-        islands=data["islands"],
-        islands_by_source=data["islands_by_source"],
-        supports_by_type=data["placed_by_type"],
-        contacts=data["contacts"],
-        roots=data.get("roots", 0),
-        islands_covered=data.get("islands_covered", 0),
-        islands_uncovered=data.get("islands_uncovered", 0),
-        area_coverage=data.get("area_coverage", 0.0),
-        raft=data["raft"],
-        height_mm=data.get("height_mm", 0.0),
-        build_height_mm=data.get("build_height_mm", 0.0),
-        model_triangles=data["model_triangles"],
-        support_triangles=data["support_triangles"],
-        profile=plan.profile,
-        sidecar_path=str(sidecar),
-        plate_offset_mm=offset,
-        plate_transform=PlateTransform(**data["plate_transform"]),
-        layer_frame=LayerFrame(**data["layer_frame"]),
-        plate_stl_path=plate_path,
-        plate_bbox_mm=plate_bbox if plate_path else None,
-        supported_stl_path=data.get("supported_stl"),
-        overwritten=data.get("overwritten", []),
-        extra_files=[str(p) for p in run.extra_files],
-        islands_detected=data.get("islands_detected", data["islands"]),
-        islands_internal=data.get("islands_internal", 0),
-        islands_internal_skipped=data.get("islands_internal_skipped", 0),
-        keep_out=(
-            KeepOut(**{**data["keep_out"], "source": zone_source or ""})
-            if data.get("keep_out")
-            else None
-        ),
-        timings_ms=data["timings_ms"],
-        warnings=warnings,
-    )
+        offset = [float(v) + 0.0 for v in data["plate_transform"]["translate_mm"]]
+        bbox = data.get("model_bbox_mm") or {}
+        plate_bbox = {"min": bbox.get("min", []), "max": bbox.get("max", [])}
+        plate_path = None
+        if export_plate_stl:
+            # The same writer and frame as `slice`'s plate STL: the STL moved by the offset.
+            plate = final.with_name(final.name + ".plate.stl")
+            try:
+                stl_io.write_translated(job.stl_path, plate, (offset[0], offset[1], offset[2]))
+            except (OSError, stl_io.StlError) as e:
+                warnings.append(f"the slice succeeded but the plate STL could not be written: {e}")
+            else:
+                plate_path = str(plate)
+        supports_info = {
+            "lift_mm": data.get("lift_mm"),
+            "raft": data["raft"],
+            "islands": data["islands"],
+            "islands_by_source": data["islands_by_source"],
+            "supports_by_type": data["placed_by_type"],
+            "contacts": data["contacts"],
+            "islands_uncovered": data.get("islands_uncovered", 0),
+            "supported_stl": data.get("supported_stl") if export_supported_stl else None,
+        }
+        sidecar = slicing.write_sidecar(
+            final,
+            chosen,
+            plan.profile,
+            slice_info,
+            place_on_plate=True,
+            offset=offset,
+            plate_path=plate_path,
+            plate_bbox=plate_bbox if plate_path else None,
+            supports=supports_info,
+        )
+        printer_info = data.get("printer", {})
+        return SupportedSlice(
+            output_path=str(final),
+            format=slice_info["format"],
+            printer=chosen.name,
+            printer_chosen_by=plan.origin,
+            material=printer_info.get("material", ""),
+            layers=slice_info["layers"],
+            layer_height_mm=round(slice_info["layer_height_mm"], 4),
+            lift_mm=data.get("lift_mm", lift_mm or 0),
+            islands=data["islands"],
+            islands_by_source=data["islands_by_source"],
+            supports_by_type=data["placed_by_type"],
+            contacts=data["contacts"],
+            roots=data.get("roots", 0),
+            islands_covered=data.get("islands_covered", 0),
+            islands_uncovered=data.get("islands_uncovered", 0),
+            area_coverage=data.get("area_coverage", 0.0),
+            raft=data["raft"],
+            height_mm=data.get("height_mm", 0.0),
+            build_height_mm=data.get("build_height_mm", 0.0),
+            model_triangles=data["model_triangles"],
+            support_triangles=data["support_triangles"],
+            profile=plan.profile,
+            sidecar_path=str(sidecar),
+            plate_offset_mm=offset,
+            plate_transform=PlateTransform(**data["plate_transform"]),
+            layer_frame=LayerFrame(**data["layer_frame"]),
+            plate_stl_path=plate_path,
+            plate_bbox_mm=plate_bbox if plate_path else None,
+            supported_stl_path=data.get("supported_stl") if export_supported_stl else None,
+            overwritten=data.get("overwritten", []),
+            extra_files=[str(p) for p in run.extra_files],
+            islands_detected=data.get("islands_detected", data["islands"]),
+            islands_internal=data.get("islands_internal", 0),
+            islands_internal_skipped=data.get("islands_internal_skipped", 0),
+            keep_out=(
+                KeepOut(**{**data["keep_out"], "source": zone_source or ""})
+                if data.get("keep_out")
+                else None
+            ),
+            timings_ms=data["timings_ms"],
+            previews_written=previews_written,
+            warnings=warnings,
+        )

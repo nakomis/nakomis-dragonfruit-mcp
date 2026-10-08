@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from nakomis_dragonfruit_mcp import cli
+from nakomis_dragonfruit_mcp import cli, goo_preview
 from nakomis_dragonfruit_mcp.tools import supports
 from tests.test_cli import make_fake_binary
 
@@ -125,11 +125,13 @@ def test_default_arguments(fake_env, stl):
     assert args[args.index("--raft") + 1] == "solid"
     assert args[args.index("--cli") + 1].endswith("/bin/dragonfruit-cli")
     assert args[args.index("--tools") + 1].endswith("/bin/dragonfruit-mcp-tools")
+    # The previews need supports and raft: a scratch supported STL, not beside the print.
+    scratch = Path(args[args.index("--supported-stl") + 1])
+    assert scratch.name == "preview.supported.stl" and not scratch.exists()
     for flag in (
         "--material",
         "--lift-mm",
         "--density",
-        "--supported-stl",
         "--coarse-islands",
         "--no-overhangs",
         "--settings",
@@ -455,6 +457,12 @@ def test_real_auto_support_and_slice(tmp_path):
     assert Path(result.plate_stl_path).stat().st_size == 84 + 50 * result.model_triangles
     sidecar = json.loads(Path(result.sidecar_path).read_text())
     assert sidecar["supports_included"] is True and sidecar["profile"]["mirrorX"] is True
+    # NDFM-14: the previews show the model (magenta) with its supports and raft (blue).
+    from tests.test_goo_preview import blue_pixels, magenta_pixels, slot
+
+    assert result.previews_written is True
+    big = slot(out.read_bytes(), goo_preview.BIG_AT, goo_preview.BIG)
+    assert magenta_pixels(big) > 2000 and blue_pixels(big) > 2000
 
 
 @pytest.mark.integration
