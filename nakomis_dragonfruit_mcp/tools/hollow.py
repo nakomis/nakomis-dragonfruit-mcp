@@ -12,7 +12,16 @@ from nakomis_dragonfruit_mcp import cli
 from nakomis_dragonfruit_mcp.app import ToolResult, mcp
 
 _HOLLOW_KEYS = {"before", "after", "wall_mm", "voxel_mm", "timing_ms", "warnings"}
-_PUNCH_KEYS = {"before", "after", "holes", "cavities_found", "timing_ms", "warnings"}
+_PUNCH_KEYS = {
+    "before",
+    "after",
+    "holes",
+    "hole_checks",
+    "holes_sidecar",
+    "cavities_found",
+    "timing_ms",
+    "warnings",
+}
 
 
 class MeshSummary(BaseModel):
@@ -35,7 +44,25 @@ class Hole(BaseModel):
     length_mm: float
     purpose: str = Field(description='"suction relief", "vent", "manual", ...')
     cavity: int | None = Field(description="Which cavity an automatic hole serves")
+    extension_mm: float = Field(
+        default=0.0,
+        description="How far an automatic hole's start was pushed into the cavity so that its "
+        "full diameter breaks into open space (a dome narrowing to an apex needs this)",
+    )
     note: str = ""
+
+
+class HoleCheck(BaseModel):
+    """The narrowest open cross-section along a hole, measured on the drilled mesh."""
+
+    hole: int = Field(description="Index into `holes`")
+    checked: bool = Field(description="False for a hole not along an axis, which is not measured")
+    hole_area_mm2: float = Field(description="The hole's nominal area, pi r^2")
+    min_open_area_mm2: float = Field(
+        description="Open area of the narrowest section, within a disc of 0.9 r"
+    )
+    min_open_fraction: float = Field(description="That area as a fraction of the 0.9 r disc")
+    at_mm: float = Field(description="Where along the hole, from its start, that section is")
 
 
 class HollowResult(ToolResult):
@@ -56,6 +83,14 @@ class DrillResult(ToolResult):
     input_path: str
     output_path: str
     holes: list[Hole]
+    hole_checks: list[HoleCheck] = Field(
+        description="Per hole, the minimum open cross-section along its axis, from slicing the "
+        "drilled mesh; a hole below 90% of its disc also adds a warning"
+    )
+    holes_sidecar: str = Field(
+        description="`<output>.holes.json`: the holes (start point, direction, radius, length, "
+        "purpose, cavity) in the output STL's own coordinates, for tools that act on them"
+    )
     cavities_found: int = Field(description="Sealed cavities in the input, before drilling")
     cavities_before: int
     cavities_after: int
@@ -195,6 +230,17 @@ def drill_holes(
       warning. Read the warnings.
     `down_axis` says which way the plate is (default "-z"; also "+z", "+/-x", "+/-y").
 
+    Each automatic hole starts inside the cavity, far enough that the cavity's width there
+    contains the hole's full diameter (`extension_mm` says how far it moved; capped at 10 mm,
+    with a warning if the cavity is too narrow). The drilled mesh is then sliced across every
+    axis-aligned hole's axis: `hole_checks` gives the narrowest open section, and a warning
+    appears if it is below 90% of the hole.
+
+    Also writes `<output>.holes.json` beside the STL (path in `holes_sidecar`):
+    `{"holes": [{x, y, z, radius_mm, direction, axis, length_mm, purpose, cavity}],
+    "source_stl": <output STL>}` in the STL's own coordinates, x, y, z being where each hole
+    starts and `direction` pointing outwards through the wall.
+
     Warns, with the count, if any sealed cavity is left.
     """
     if bool(holes) == auto_drain:
@@ -212,11 +258,15 @@ def drill_holes(
         args += ["--holes", json.dumps(holes)]
     result = cli.run(cli.MCP_TOOLS, args, parse_json=True)
     data = _schema(result.data, _PUNCH_KEYS, "punch", result.stdout)
+    if not Path(data["holes_sidecar"]).is_file():
+        raise cli.CliError(f"dragonfruit-mcp-tools did not write {data['holes_sidecar']}")
     before, after = _summary(data["before"]), _summary(data["after"])
     return DrillResult(
         input_path=str(src),
         output_path=str(out),
         holes=[Hole(**h) for h in data["holes"]],
+        hole_checks=[HoleCheck(**c) for c in data["hole_checks"]],
+        holes_sidecar=data["holes_sidecar"],
         cavities_found=data["cavities_found"],
         cavities_before=before.cavities,
         cavities_after=after.cavities,

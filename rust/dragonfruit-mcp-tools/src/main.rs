@@ -256,6 +256,40 @@ fn parse_holes(arg: &str) -> Result<Vec<Hole>, String> {
     serde_json::from_value(value).map_err(|e| format!("invalid holes JSON: {e}"))
 }
 
+/// `<out.stl>.holes.json`, the machine-readable record of where the holes are.
+fn holes_sidecar_path(output: &Path) -> std::path::PathBuf {
+    let mut name = output.as_os_str().to_owned();
+    name.push(".holes.json");
+    name.into()
+}
+
+/// Write the holes next to the STL, in the STL's own coordinates (mm): each hole's
+/// start point and the direction it runs outwards through the wall.
+fn write_holes_sidecar(
+    path: &Path,
+    holes: &[PlacedHole],
+    input: &Path,
+    output: &Path,
+) -> Result<(), String> {
+    let list: Vec<_> = holes
+        .iter()
+        .map(|h| {
+            json!({
+                "x": h.x, "y": h.y, "z": h.z,
+                "radius_mm": h.radius_mm,
+                "direction": h.direction,
+                "axis": h.axis,
+                "length_mm": h.length_mm,
+                "purpose": h.purpose,
+                "cavity": h.cavity,
+            })
+        })
+        .collect();
+    let doc = json!({"holes": list, "source_stl": output, "input_stl": input});
+    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
 fn punch_cmd(
     input: &Path,
     output: &Path,
@@ -303,10 +337,37 @@ fn punch_cmd(
     let after = ops::stats(&outcome.mesh);
     analyse_ms += ms(t);
     let t = Instant::now();
+    let checks = drain::verify_holes(&outcome.mesh, &placed);
+    let verify_ms = ms(t);
+    let t = Instant::now();
     write(&outcome.mesh, output)?;
+    let sidecar = holes_sidecar_path(output);
+    if let Err(e) = write_holes_sidecar(&sidecar, &placed, input, output) {
+        // An STL without its record of the holes is not left behind.
+        let _ = std::fs::remove_file(output);
+        return Err(e);
+    }
     let write_ms = ms(t);
 
     warnings.extend(ops::punch_warnings(&before, &after));
+    for (h, c) in placed.iter().zip(&checks) {
+        if !c.checked {
+            warnings.push(format!(
+                "hole {} ({}) is not axis-aligned, so its opening was not verified",
+                c.hole, h.purpose
+            ));
+        } else if c.min_open_fraction < drain::CHECK_MIN_OPEN_FRACTION {
+            warnings.push(format!(
+                "hole {} ({}, {:.1} mm across) narrows to {:.1} mm2 of open section ({:.0}% of its disc) {:.1} mm along the axis from its start; it may clog or trap resin there",
+                c.hole,
+                h.purpose,
+                2.0 * h.radius_mm,
+                c.min_open_area_mm2,
+                100.0 * c.min_open_fraction,
+                c.at_mm
+            ));
+        }
+    }
 
     let saved = before.volume_ml - after.volume_ml;
     let report = json!({
@@ -315,11 +376,13 @@ fn punch_cmd(
         "auto_drain": auto_drain,
         "cavities_found": cavities_found,
         "holes": placed,
+        "hole_checks": checks,
+        "holes_sidecar": sidecar,
         "before": before,
         "after": after,
         "volume_removed_ml": saved,
         "crate_report": outcome.report,
-        "timing_ms": {"load": load_ms, "punch": punch_ms, "analyse": analyse_ms, "write": write_ms, "total": ms(total)},
+        "timing_ms": {"load": load_ms, "punch": punch_ms, "verify": verify_ms, "analyse": analyse_ms, "write": write_ms, "total": ms(total)},
         "warnings": warnings,
     });
     emit(&report, as_json, || {
@@ -519,6 +582,14 @@ mod tests {
             (steep[0].area_mm2 - 400.0).abs() < 1.0,
             "area {}",
             steep[0].area_mm2
+        );
+    }
+
+    #[test]
+    fn the_sidecar_sits_beside_the_stl_with_its_full_name() {
+        assert_eq!(
+            crate::holes_sidecar_path(std::path::Path::new("/tmp/a/logo.drilled.stl")),
+            std::path::Path::new("/tmp/a/logo.drilled.stl.holes.json")
         );
     }
 }

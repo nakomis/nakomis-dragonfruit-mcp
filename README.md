@@ -45,7 +45,9 @@ Early days. The repository is scaffolded; the tools are being built. Planned too
   so slice with `format=".goo"` to preview it
 - `hollow` and `drill_holes`: hollow a model to save resin, then drill a suction-relief
   hole through each cavity's floor and a vent through its roof so it can drain
-  (always follow `hollow` with `drill_holes`)
+  (always follow `hollow` with `drill_holes`). Each hole starts inside the cavity far enough
+  for its full diameter to open (a dome narrowing to an apex would otherwise give a slit),
+  is checked by slicing the drilled mesh, and is recorded in `<output>.holes.json`
 - `auto_support_and_slice`: DragonFruit's own auto-supports and raft, sliced
   into the print, with the same printer, format and material options as `slice`
   (NDFM-8; see below)

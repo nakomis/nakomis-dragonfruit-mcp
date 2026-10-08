@@ -17,9 +17,27 @@ use crate::ops::{axis_name, ray_hits, ray_tri, PlacedHole, Shells, EXIT_MARGIN_M
 const CAVITY_CRUMB_FRACTION: f64 = 0.01;
 /// How far into the cavity (along the hole) a hole starts, so it begins in the void.
 const START_INSET_MM: f32 = 0.3;
+/// A hole's start is pushed further into the cavity until the cavity is wider than the
+/// hole's disc plus this margin all round, so the full diameter breaks into open space
+/// (a dome narrowing to an apex would otherwise give a slit), by at most `EXTEND_MAX_MM`.
+const FULL_WIDTH_MARGIN_MM: f32 = 0.25;
+const EXTEND_STEP_MM: f32 = 0.25;
+const EXTEND_MAX_MM: f32 = 10.0;
+/// Verification samples the hole's disc at this fraction of its radius ...
+const CHECK_RADIUS_FRACTION: f32 = 0.9;
+/// ... on a grid of this pitch, at stations this far apart along the axis.
+const CHECK_GRID_MM: f32 = 0.2;
+const CHECK_STEP_MM: f32 = 0.25;
+/// The first station is this far behind the hole's start, inside the cavity.
+const CHECK_LEAD_MM: f32 = 0.1;
+/// A hole whose narrowest section opens less than this fraction of the sampled disc is
+/// reported as constricted.
+pub const CHECK_MIN_OPEN_FRACTION: f32 = 0.9;
 /// Candidate positions are taken from this band at the cavity's extreme end.
 const CANDIDATE_BAND_MM: f32 = 3.0;
 const CANDIDATE_CELL_MM: f32 = 1.0;
+/// Interior candidates are on a grid at least this coarse.
+const GRID_MIN_STEP_MM: f32 = 1.0;
 const MAX_CANDIDATES: usize = 300;
 /// How picky a placement is. The skin under the hole footprint (and a margin around it)
 /// may vary only so much in depth, or the hole would break through on a slope or on
@@ -101,6 +119,9 @@ impl Axis {
     }
 }
 
+fn bounds(it: impl Iterator<Item = f32>) -> (f32, f32) {
+    it.fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)))
+}
 fn v3(p: [f32; 3]) -> Vec3 {
     Vec3::new(p[0], p[1], p[2])
 }
@@ -200,6 +221,10 @@ struct Candidate {
     dir: [f32; 3],
     exit_mm: f32,
     spread_mm: f32,
+    /// How far the start was pushed into the cavity beyond the usual inset.
+    extension_mm: f32,
+    /// Whether the cavity at the start fully contains the hole's disc.
+    full_width: bool,
     score: f32,
     strictness: &'static str,
 }
@@ -226,6 +251,49 @@ impl Placer<'_> {
         let m = self.cols.mesh;
         let n = m.tri_normal(hit.1 as u32);
         Some((hit.0, n.x * dir[0] + n.y * dir[1] + n.z * dir[2]))
+    }
+
+    /// Whether `p` is in the void of cavity `cav`: the first wall of that cavity met
+    /// along `dir` is one the ray runs into the material through (normals point into
+    /// the void), not one it leaves the material through.
+    fn in_cavity(&self, cav: usize, p: [f32; 3], dir: [f32; 3]) -> bool {
+        self.cols
+            .hits(p, dir)
+            .into_iter()
+            .find(|h| self.shells.triangle_shell[h.1] == cav)
+            .is_some_and(|h| !h.2)
+    }
+
+    /// Whether the cavity contains the hole's whole disc (plus margin) at `p`.
+    fn disc_in_cavity(&self, cav: usize, p: [f32; 3], dir: [f32; 3]) -> bool {
+        let (ia, ib) = self.axis.plane();
+        if !self.in_cavity(cav, p, dir) {
+            return false;
+        }
+        let ring = self.radius + FULL_WIDTH_MARGIN_MM;
+        (0..16).all(|i| {
+            let ang = 0.1 + i as f32 * std::f32::consts::FRAC_PI_8;
+            let mut q = p;
+            q[ia] += ring * ang.cos();
+            q[ib] += ring * ang.sin();
+            self.in_cavity(cav, q, dir)
+        })
+    }
+
+    /// Move `start` back into the cavity (against `dir`) until the disc fits, at most
+    /// `EXTEND_MAX_MM`. Returns the new start, the extra depth, and whether it fits;
+    /// if it never does, the start is left where it was.
+    fn extend(&self, cav: usize, start: [f32; 3], dir: [f32; 3]) -> ([f32; 3], f32, bool) {
+        let inward = [-dir[0], -dir[1], -dir[2]];
+        let steps = (EXTEND_MAX_MM / EXTEND_STEP_MM) as usize;
+        for i in 0..=steps {
+            let s = i as f32 * EXTEND_STEP_MM;
+            let p = add(start, inward, s);
+            if self.disc_in_cavity(cav, p, dir) {
+                return (p, s, true);
+            }
+        }
+        (start, 0.0, false)
     }
 
     /// Try a hole at column (`a`, `b`) at one end of cavity `cav`.
@@ -256,6 +324,7 @@ impl Placer<'_> {
         let surface = surface.ok_or("the column does not cross the cavity")?;
         let on_surface = add(origin, up, surface.0);
         let start = add(on_surface, up, inset);
+        let (start, extension_mm, full_width) = self.extend(cav, start, dir);
         let (exit_mm, squareness) = self.exit(start, dir).ok_or("no way out of the skin")?;
         if squareness < self.strict.squareness {
             return Err("the skin there is not square to the hole".into());
@@ -286,7 +355,13 @@ impl Placer<'_> {
             dir,
             exit_mm,
             spread_mm: spread,
-            score: exit_mm + 2.0 * spread + 0.3 * off_extreme,
+            extension_mm,
+            full_width,
+            score: exit_mm
+                + 2.0 * spread
+                + 0.3 * off_extreme
+                + 0.5 * extension_mm
+                + if full_width { 0.0 } else { 5.0 },
             strictness: self.strict.name,
         })
     }
@@ -317,6 +392,7 @@ fn placed(
         length_mm: length,
         purpose: purpose.into(),
         cavity: Some(cav),
+        extension_mm: c.extension_mm,
         note,
     }
 }
@@ -418,10 +494,29 @@ pub fn auto_drain_holes(
                     let mut v: Vec<_> = cells.into_iter().collect();
                     v.sort_by_key(|x| x.0);
                     let stride = v.len().div_ceil(MAX_CANDIDATES).max(1);
-                    v.into_iter()
+                    let mut spots: Vec<(f32, f32)> = v
+                        .into_iter()
                         .step_by(stride)
                         .map(|(_, (a, b, _))| (a + JITTER[0], b + JITTER[1]))
-                        .collect()
+                        .collect();
+                    // Vertices sit on the cavity's edges and corners, where the hole's
+                    // disc would half miss the void, so add a coarse grid over its
+                    // footprint (columns that miss the cavity are rejected cheaply).
+                    let (a0, a1) = bounds(pts.iter().map(|p| p.0));
+                    let (b0, b1) = bounds(pts.iter().map(|p| p.1));
+                    let step = ((a1 - a0) * (b1 - b0) / MAX_CANDIDATES as f32)
+                        .sqrt()
+                        .max(GRID_MIN_STEP_MM);
+                    let mut a = a0 + step / 2.0;
+                    while a < a1 {
+                        let mut b = b0 + step / 2.0;
+                        while b < b1 {
+                            spots.push((a + JITTER[0], b + JITTER[1]));
+                            b += step;
+                        }
+                        a += step;
+                    }
+                    spots
                 }
             };
             let mut reason = String::from("no candidate position");
@@ -465,14 +560,29 @@ pub fn auto_drain_holes(
                             "cavity {cav}: the {purpose} hole is vertical but exits on rough skin (no flat spot within reach); check it is not on a visible face or detail"
                         ));
                     }
+                    if !c.full_width {
+                        out.warnings.push(format!(
+                            "cavity {cav}: the {purpose} hole could not be started where the cavity is wide enough for its full {:.1} mm diameter (searched {EXTEND_MAX_MM} mm into the cavity); it may open only a narrow slit",
+                            2.0 * radius_mm
+                        ));
+                    }
                     out.holes.push(placed(
                         c,
                         radius_mm,
                         cav,
                         purpose,
                         format!(
-                            "cavity {cav} ({volume_ml:.1} ml): through the {what}; {:.1} mm of wall, skin flat within {:.2} mm",
-                            c.exit_mm, c.spread_mm
+                            "cavity {cav} ({volume_ml:.1} ml): through the {what}; {:.1} mm of wall, skin flat within {:.2} mm{}",
+                            c.exit_mm,
+                            c.spread_mm,
+                            if c.extension_mm > 0.0 {
+                                format!(
+                                    "; started {:.2} mm further into the cavity so the full diameter opens",
+                                    c.extension_mm
+                                )
+                            } else {
+                                String::new()
+                            }
                         ),
                         c.exit_mm + EXIT_MARGIN_MM,
                     ));
@@ -572,10 +682,100 @@ fn horizontal_pair(
             length_mm: d + EXIT_MARGIN_MM,
             purpose: format!("{purpose} (horizontal fallback)"),
             cavity: Some(cav),
+            extension_mm: 0.0,
             note: format!("cavity {cav}: {d:.1} mm from the hole start to the outside"),
         }
     })
     .collect())
+}
+
+/// What slicing a punched mesh across a hole's axis found.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HoleCheck {
+    /// Index into the holes as punched.
+    pub hole: usize,
+    /// Whether the hole could be checked (axis-aligned holes only).
+    pub checked: bool,
+    /// The hole's nominal area, pi r^2.
+    pub hole_area_mm2: f32,
+    /// The open area of the narrowest section along the axis, within the sampled disc
+    /// (`CHECK_RADIUS_FRACTION` of the radius).
+    pub min_open_area_mm2: f32,
+    /// The same as a fraction of the sampled disc's area.
+    pub min_open_fraction: f32,
+    /// Where along the axis (mm from the hole's start, negative behind it) the narrowest section is.
+    pub at_mm: f32,
+}
+
+/// Slice the punched mesh with planes perpendicular to each axis-aligned hole's axis,
+/// from the hole's start out to its end, and find the narrowest open cross-section:
+/// a grid of points over a disc of 0.9 r is tested at every station, a point being open
+/// unless the first surface met along the hole direction is one the ray leaves material
+/// through. A hole starting at a cavity's very apex shows up as a small fraction.
+pub fn verify_holes(mesh: &IndexedMesh, holes: &[PlacedHole]) -> Vec<HoleCheck> {
+    let mut columns: HashMap<usize, Columns> = HashMap::new();
+    holes
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let unchecked = HoleCheck {
+                hole: i,
+                checked: false,
+                hole_area_mm2: std::f32::consts::PI * h.radius_mm * h.radius_mm,
+                min_open_area_mm2: 0.0,
+                min_open_fraction: 0.0,
+                at_mm: 0.0,
+            };
+            let Some(k) = (0..3).find(|&k| (h.direction[k].abs() - 1.0).abs() < 1e-4) else {
+                return unchecked;
+            };
+            let axis = Axis {
+                k,
+                sign: h.direction[k],
+            };
+            let cols = columns.entry(k).or_insert_with(|| Columns::new(mesh, axis));
+            let (ia, ib) = axis.plane();
+            let reach = CHECK_RADIUS_FRACTION * h.radius_mm;
+            let n = (reach / CHECK_GRID_MM).ceil() as i32;
+            let mut disc = Vec::new();
+            for gx in -n..=n {
+                for gy in -n..=n {
+                    let (dx, dy) = (gx as f32 * CHECK_GRID_MM, gy as f32 * CHECK_GRID_MM);
+                    if dx * dx + dy * dy <= reach * reach {
+                        disc.push((dx + JITTER[0], dy + JITTER[1]));
+                    }
+                }
+            }
+            // From just behind the start: the opening of the hole's end cap into the
+            // cavity is the first (and for a dome apex the narrowest) cross-section.
+            let stations = (h.length_mm / CHECK_STEP_MM) as usize;
+            let mut worst = (usize::MAX, 0.0_f32);
+            for st in 0..=stations {
+                let s = st as f32 * CHECK_STEP_MM - CHECK_LEAD_MM;
+                let centre = add([h.x, h.y, h.z], h.direction, s);
+                let open = disc
+                    .iter()
+                    .filter(|(dx, dy)| {
+                        let mut p = centre;
+                        p[ia] += dx;
+                        p[ib] += dy;
+                        !cols.hits(p, h.direction).first().is_some_and(|x| x.2)
+                    })
+                    .count();
+                if open < worst.0 {
+                    worst = (open, s);
+                }
+            }
+            let fraction = worst.0 as f32 / disc.len() as f32;
+            HoleCheck {
+                checked: true,
+                min_open_area_mm2: fraction * std::f32::consts::PI * reach * reach,
+                min_open_fraction: fraction,
+                at_mm: worst.1,
+                ..unchecked
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -730,7 +930,9 @@ mod tests {
             triangles,
         };
         let mesh = merge(vec![skin, cuboid([-6.0; 3], [6.0; 3], true)]);
-        let drain = auto_drain_holes(&mesh, 2.0, z_down(), None).unwrap();
+        // Radius 3: even on the central tip the skin varies by more than the relaxed 3 mm
+        // under the hole's footprint.
+        let drain = auto_drain_holes(&mesh, 3.0, z_down(), None).unwrap();
         assert!(
             drain
                 .warnings
@@ -744,5 +946,173 @@ mod tests {
             .iter()
             .all(|h| h.purpose.contains("horizontal fallback")));
         assert!(drain.holes.iter().all(|h| h.direction[2] == 0.0));
+    }
+
+    /// A 40 mm cube with a sealed cavity of revolution about the vertical line through
+    /// (20, 20): flat floor at z = 8, 10 mm radius, vertical wall to z = 22, then a cone
+    /// narrowing to an apex at z = 32 (so 2.25 mm below the apex it is 4.5 mm wide).
+    /// `flip` mirrors it so the cone points down instead.
+    fn dome_cavity(flip: bool) -> IndexedMesh {
+        let profile = [
+            (0.0, 8.0),
+            (10.0, 8.0),
+            (10.0, 22.0),
+            (7.5, 24.5),
+            (5.0, 27.0),
+            (2.5, 29.5),
+            (0.0, 32.0),
+        ];
+        let n = 32u32;
+        let mut positions = Vec::new();
+        let mut rows: Vec<Vec<u32>> = Vec::new();
+        for &(r, z) in &profile {
+            let z = if flip { 40.0 - z } else { z };
+            let count = if r == 0.0 { 1 } else { n };
+            let mut row = Vec::new();
+            for i in 0..count {
+                let a = i as f32 * std::f32::consts::TAU / n as f32;
+                row.push(positions.len() as u32);
+                positions.push(Vec3::new(20.0 + r * a.cos(), 20.0 + r * a.sin(), z));
+            }
+            rows.push(row);
+        }
+        let mut triangles = Vec::new();
+        for w in rows.windows(2) {
+            for i in 0..n as usize {
+                let j = (i + 1) % n as usize;
+                let (a0, a1) = (w[0][i % w[0].len()], w[0][j % w[0].len()]);
+                let (b0, b1) = (w[1][i % w[1].len()], w[1][j % w[1].len()]);
+                if a0 != a1 {
+                    triangles.push([a0, a1, b1]);
+                }
+                if b0 != b1 {
+                    triangles.push([a0, b1, b0]);
+                }
+            }
+        }
+        // Normals into the void (a cavity), whichever way the winding came out.
+        let mut volume = 0.0;
+        for t in &triangles {
+            let (a, b, c) = (
+                positions[t[0] as usize],
+                positions[t[1] as usize],
+                positions[t[2] as usize],
+            );
+            volume += a.dot(b.cross(c));
+        }
+        if volume > 0.0 {
+            for t in &mut triangles {
+                t.swap(1, 2);
+            }
+        }
+        merge(vec![
+            cube(40.0),
+            IndexedMesh {
+                positions,
+                triangles,
+            },
+        ])
+    }
+
+    fn hole_at(start: [f32; 3], direction: [f32; 3], length_mm: f32) -> PlacedHole {
+        PlacedHole {
+            x: start[0],
+            y: start[1],
+            z: start[2],
+            radius_mm: 2.0,
+            direction,
+            axis: axis_name(direction),
+            length_mm,
+            purpose: "manual".into(),
+            cavity: None,
+            extension_mm: 0.0,
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_hole_at_the_apex_of_a_dome_is_a_narrow_slit() {
+        // The old placement: 0.3 mm below the apex, where the cone is 0.6 mm wide.
+        let mesh = dome_cavity(false);
+        let hole = hole_at([20.0, 20.0, 31.7], [0.0, 0.0, 1.0], 9.3);
+        let punched = punch(mesh, &[hole.clone()]).mesh;
+        let check = &verify_holes(&punched, &[hole])[0];
+        assert!(check.checked);
+        assert!(check.min_open_fraction < 0.2, "{check:?}");
+    }
+
+    #[test]
+    fn dome_roof_vent_starts_deep_enough_to_open_the_full_diameter() {
+        let mesh = dome_cavity(false);
+        let drain = auto_drain_holes(&mesh, 2.0, z_down(), None).unwrap();
+        assert_eq!(drain.holes.len(), 2, "{:?}", drain.warnings);
+        assert!(drain.warnings.is_empty(), "{:?}", drain.warnings);
+        let vent = drain.holes.iter().find(|h| h.purpose == "vent").unwrap();
+        // The cone is 4.5 mm wide (radius 2.25 = hole radius 2 + 0.25 margin) 2.25 mm
+        // below the apex at z = 32, so the start lies at or below z = 29.75.
+        assert!(vent.z <= 29.75 + 1e-3 && vent.z > 28.5, "z {}", vent.z);
+        assert!(
+            vent.extension_mm > 1.5 && vent.extension_mm < 3.0,
+            "{}",
+            vent.extension_mm
+        );
+        // The floor is flat, so the suction hole needs no extension.
+        let relief = drain
+            .holes
+            .iter()
+            .find(|h| h.purpose == "suction relief")
+            .unwrap();
+        assert_eq!(relief.extension_mm, 0.0);
+        let punched = punch(mesh, &drain.holes).mesh;
+        assert_eq!(stats(&punched).cavities, 0);
+        for check in verify_holes(&punched, &drain.holes) {
+            assert!(check.checked);
+            assert!(check.min_open_fraction > 0.95, "{check:?}");
+            // pi (0.9 * 2)^2 = 10.2 mm2 sampled, of the hole's 12.6.
+            assert!(check.min_open_area_mm2 > 9.5, "{check:?}");
+            assert!((check.hole_area_mm2 - 12.566).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn dome_floor_suction_hole_also_opens_the_full_diameter() {
+        let mesh = dome_cavity(true);
+        let drain = auto_drain_holes(&mesh, 2.0, z_down(), None).unwrap();
+        let relief = drain
+            .holes
+            .iter()
+            .find(|h| h.purpose == "suction relief")
+            .unwrap();
+        // Mirrored: the apex is at z = 8 and the start must sit at or above z = 10.25.
+        assert!(
+            relief.z >= 10.25 - 1e-3 && relief.z < 11.5,
+            "z {}",
+            relief.z
+        );
+        assert!(relief.extension_mm > 1.5, "{}", relief.extension_mm);
+        let punched = punch(mesh, &drain.holes).mesh;
+        assert_eq!(stats(&punched).cavities, 0);
+        for check in verify_holes(&punched, &drain.holes) {
+            assert!(check.min_open_fraction > 0.95, "{check:?}");
+        }
+    }
+
+    #[test]
+    fn a_cavity_too_narrow_for_the_hole_warns() {
+        // A 3 mm-wide cavity can never hold a 4 mm hole.
+        let mesh = merge(vec![
+            cube(40.0),
+            cuboid([18.5, 18.5, 10.0], [21.5, 21.5, 30.0], true),
+        ]);
+        let drain = auto_drain_holes(&mesh, 2.0, z_down(), None).unwrap();
+        assert!(
+            drain.warnings.iter().any(|w| w.contains("full 4.0 mm")),
+            "{:?}",
+            drain.warnings
+        );
+        let punched = punch(mesh, &drain.holes).mesh;
+        assert!(verify_holes(&punched, &drain.holes)
+            .iter()
+            .all(|c| c.checked));
     }
 }

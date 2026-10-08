@@ -44,6 +44,14 @@ HOLLOW_REPORT = {
     "timing_ms": {"load": 1.0, "hollow": 2.0, "total": 3.0},
     "warnings": ["the cavity is sealed: uncured resin is trapped"],
 }
+HOLE_CHECK = {
+    "hole": 0,
+    "checked": True,
+    "hole_area_mm2": 12.57,
+    "min_open_area_mm2": 10.18,
+    "min_open_fraction": 1.0,
+    "at_mm": -0.1,
+}
 PUNCH_REPORT = {
     "before": _stats(17.5, cavities=1, shells=2),
     "after": _stats(17.4),
@@ -59,12 +67,21 @@ PUNCH_REPORT = {
             "length_mm": 9.0,
             "purpose": "suction relief",
             "cavity": 1,
+            "extension_mm": 2.25,
             "note": "through the floor",
         }
     ],
+    "hole_checks": [HOLE_CHECK],
     "timing_ms": {"load": 1.0, "punch": 2.0, "total": 3.0},
     "warnings": [],
 }
+
+
+def _punch_report(stl, **extra):
+    """PUNCH_REPORT with a sidecar that really exists beside the (fake) output."""
+    sidecar = stl.with_name("model.drilled.stl.holes.json")
+    sidecar.write_text("{}")
+    return {**PUNCH_REPORT, "holes_sidecar": str(sidecar), **extra}
 
 
 @pytest.fixture
@@ -127,12 +144,15 @@ def test_hollow_stale_binary_schema(bin_dir, stl, payload):
 
 
 def test_drill_auto_drain(bin_dir, stl):
-    args = _fake_tools(bin_dir, PUNCH_REPORT)
+    args = _fake_tools(bin_dir, _punch_report(stl))
     result = hollow_tools.drill_holes(stl, auto_drain=True, radius_mm=1.5)
     assert result.drains
     assert (result.cavities_before, result.cavities_after) == (1, 0)
     assert result.cavities_found == 1
     assert result.holes[0].direction == [0.0, 0.0, -1.0]
+    assert result.holes[0].extension_mm == 2.25
+    assert result.hole_checks[0].min_open_fraction == 1.0
+    assert result.holes_sidecar == str(stl.with_name("model.drilled.stl.holes.json"))
     assert (result.holes[0].axis, result.holes[0].purpose) == ("-z", "suction relief")
     assert result.output_path == str(stl.with_name("model.drilled.stl"))
     recorded = args.read_text()
@@ -144,7 +164,7 @@ def test_drill_auto_drain(bin_dir, stl):
 
 
 def test_drill_xy_and_down_axis_are_passed(bin_dir, stl):
-    args = _fake_tools(bin_dir, PUNCH_REPORT)
+    args = _fake_tools(bin_dir, _punch_report(stl))
     hollow_tools.drill_holes(stl, auto_drain=True, xy=(-3.0, 4.5), down_axis="+x")
     recorded = args.read_text()
     assert "--down-axis +x" in recorded
@@ -152,13 +172,13 @@ def test_drill_xy_and_down_axis_are_passed(bin_dir, stl):
 
 
 def test_drill_xy_needs_auto_drain(bin_dir, stl):
-    _fake_tools(bin_dir, PUNCH_REPORT)
+    _fake_tools(bin_dir, _punch_report(stl))
     with pytest.raises(cli.CliError, match="xy"):
         hollow_tools.drill_holes(stl, holes=[{"x": 0, "y": 0, "z": 0}], xy=(1, 2))
 
 
 def test_drill_explicit_holes(bin_dir, stl):
-    args = _fake_tools(bin_dir, PUNCH_REPORT)
+    args = _fake_tools(bin_dir, _punch_report(stl))
     holes = [{"x": 1, "y": 2, "z": 3, "direction": [0, 1, 0]}]
     hollow_tools.drill_holes(stl, holes=holes)
     recorded = args.read_text()
@@ -168,7 +188,7 @@ def test_drill_explicit_holes(bin_dir, stl):
 
 def test_drill_sealed_cavity_left_is_not_draining(bin_dir, stl):
     report = {
-        **PUNCH_REPORT,
+        **_punch_report(stl),
         "after": _stats(17.5, cavities=1, shells=2),
         "warnings": ["a sealed cavity remains"],
     }
@@ -180,9 +200,25 @@ def test_drill_sealed_cavity_left_is_not_draining(bin_dir, stl):
 
 @pytest.mark.parametrize("kwargs", [{}, {"auto_drain": True, "holes": [{"x": 0, "y": 0, "z": 0}]}])
 def test_drill_needs_exactly_one_of_holes_or_auto_drain(bin_dir, stl, kwargs):
-    _fake_tools(bin_dir, PUNCH_REPORT)
+    _fake_tools(bin_dir, _punch_report(stl))
     with pytest.raises(cli.CliError, match="either"):
         hollow_tools.drill_holes(stl, **kwargs)
+
+
+def test_drill_missing_sidecar_is_an_error(bin_dir, stl):
+    report = {**PUNCH_REPORT, "holes_sidecar": str(stl.with_name("nope.holes.json"))}
+    _fake_tools(bin_dir, report)
+    with pytest.raises(cli.CliError, match="did not write"):
+        hollow_tools.drill_holes(stl, auto_drain=True)
+
+
+def test_drill_constriction_warning_is_passed_on(bin_dir, stl):
+    narrow = {**HOLE_CHECK, "min_open_fraction": 0.2, "min_open_area_mm2": 2.0}
+    warning = "hole 0 (vent, 4.0 mm across) narrows to 2.0 mm2 of open section"
+    _fake_tools(bin_dir, _punch_report(stl, hole_checks=[narrow], warnings=[warning]))
+    result = hollow_tools.drill_holes(stl, auto_drain=True)
+    assert result.hole_checks[0].min_open_fraction == 0.2
+    assert result.warnings == [warning]
 
 
 def test_drill_stale_binary_schema(bin_dir, stl):
@@ -245,6 +281,17 @@ def test_real_binary_hollow_then_drill_a_cube(tmp_path):
     assert sorted(h.axis for h in drilled.holes) == ["+z", "-z"]
     assert drilled.after.watertight
     assert drilled.warnings == []
+    # A flat cube cavity needs no extension, and the holes open at full width.
+    assert all(h.extension_mm == 0.0 for h in drilled.holes)
+    assert all(c.checked and c.min_open_fraction > 0.95 for c in drilled.hole_checks)
+    sidecar = json.loads(Path(drilled.holes_sidecar).read_text())
+    assert drilled.holes_sidecar == drilled.output_path + ".holes.json"
+    assert sidecar["source_stl"] == drilled.output_path
+    assert len(sidecar["holes"]) == 2
+    assert {h["purpose"] for h in sidecar["holes"]} == {"suction relief", "vent"}
+    assert set(sidecar["holes"][0]) == {
+        "x", "y", "z", "radius_mm", "direction", "axis", "length_mm", "purpose", "cavity",
+    }  # fmt: skip
 
 
 @pytest.mark.integration
@@ -264,6 +311,10 @@ def test_real_binary_on_the_test_model(tmp_path):
     # Out through the base and the crown, never the visible cut face (-Y).
     assert sorted(h.axis for h in drilled.holes) == ["+z", "-z"]
     assert {h.purpose for h in drilled.holes} == {"suction relief", "vent"}
+    # The crown is a dome narrowing to an apex: the vent must start inside the cavity.
+    vent = next(h for h in drilled.holes if h.purpose == "vent")
+    assert vent.extension_mm > 1.0
+    assert all(c.checked and c.min_open_fraction > 0.9 for c in drilled.hole_checks)
 
 
 def test_tools_are_registered_with_the_server():
