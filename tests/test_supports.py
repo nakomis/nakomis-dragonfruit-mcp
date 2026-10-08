@@ -217,6 +217,86 @@ def test_the_tool_runs_off_the_event_loop(fake_env, stl):
     assert result.contacts == 286
 
 
+KEEP_OUT_RESULT = {
+    "hole": 0, "purpose": "suction_relief", "start_plate_mm": [-14.2, -9.8, 7.1],
+    "direction": [0, 0, -1], "keep_out_radius_mm": 3.0, "blocked_triangles": 41,
+    "islands_inside": [], "contacts_removed": 1, "supports_removed": 2, "lost_coverage": [],
+}  # fmt: skip
+
+BASE_HOLE = {
+    "x": -2.193, "y": -5.822, "z": 2.619, "radius_mm": 2.0,
+    "direction": [0, 0, -1], "axis": "z", "length_mm": 3.6,
+    "purpose": "suction_relief", "cavity": 0,
+}  # fmt: skip
+
+
+def keep_out_args(fake_env) -> dict:
+    return json.loads(Path(f"{fake_env.log}.keepout").read_text())
+
+
+def test_no_holes_file_means_no_keep_out(fake_env, stl):
+    result = run(stl)
+    assert "--keep-out" not in script_args(fake_env)
+    assert result.keep_out is None
+
+
+def test_holes_sidecar_is_passed_in_the_stl_frame(fake_env, stl):
+    stl.with_name(stl.name + ".holes.json").write_text(
+        json.dumps({"holes": [BASE_HOLE], "source_stl": "model.stl"})
+    )
+    fake_env.summary.write_text(
+        json.dumps({**SUMMARY, "keep_out": {"source": "x", "holes": [KEEP_OUT_RESULT]}})
+    )
+    result = run(stl)
+    args = script_args(fake_env)
+    assert "--keep-out" in args
+    # Untransformed: the script applies the plate translation, as it does to the model.
+    sent = keep_out_args(fake_env)["holes"][0]
+    assert (sent["x"], sent["y"], sent["z"]) == (-2.193, -5.822, 2.619)
+    assert sent["radius_mm"] == 2.0 and sent["direction"] == [0, 0, -1] and sent["length_mm"] == 3.6
+    assert result.keep_out.source == str(stl.with_name(stl.name + ".holes.json"))
+    assert result.keep_out.holes[0].supports_removed == 2
+
+
+def test_holes_argument_overrides_the_sidecar(fake_env, stl):
+    stl.with_name(stl.name + ".holes.json").write_text(json.dumps({"holes": [BASE_HOLE]}))
+    other = {**BASE_HOLE, "x": 9.5, "radius_mm": 1.5}
+    fake_env.summary.write_text(
+        json.dumps({**SUMMARY, "keep_out": {"source": "x", "holes": [KEEP_OUT_RESULT]}})
+    )
+    result = run(stl, holes=[other])
+    sent = keep_out_args(fake_env)["holes"]
+    assert len(sent) == 1 and sent[0]["x"] == 9.5 and sent[0]["radius_mm"] == 1.5
+    assert result.keep_out.source == "the holes argument"
+
+
+def test_keep_out_can_be_switched_off(fake_env, stl):
+    stl.with_name(stl.name + ".holes.json").write_text(json.dumps({"holes": [BASE_HOLE]}))
+    run(stl, keep_out_holes=False)
+    assert "--keep-out" not in script_args(fake_env)
+    run(stl, keep_out_holes=False, holes=[BASE_HOLE])
+    assert all("--keep-out" not in ln for ln in fake_env.log.read_text().splitlines())
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{**BASE_HOLE, "radius_mm": 0}, {**BASE_HOLE, "direction": [0, 0, 0]}, {"x": 1}],
+)
+def test_bad_holes_raise_before_any_work(fake_env, stl, bad):
+    with pytest.raises(ValueError, match="hole 0"):
+        run(stl, holes=[bad])
+    assert not fake_env.log.exists()
+
+
+def test_a_broken_holes_file_raises(fake_env, stl):
+    stl.with_name(stl.name + ".holes.json").write_text("{nope")
+    with pytest.raises(cli.CliError, match="not readable JSON"):
+        run(stl)
+    stl.with_name(stl.name + ".holes.json").write_text('{"holes": 3}')
+    with pytest.raises(cli.CliError, match="'holes' list"):
+        run(stl)
+
+
 def _real_pipeline_available() -> bool:
     if TEST_STL is None or not TEST_STL.exists():
         return False
@@ -306,3 +386,29 @@ def test_real_refuses_a_print_taller_than_the_printer(tmp_path):
 def test_real_script_refuses_an_extension_the_printer_does_not_write(tmp_path):
     with pytest.raises(cli.CliError, match="writes .ctb files"):
         _run_script(tmp_path, "--out", str(tmp_path / "x.goo"))
+
+
+@pytest.mark.integration
+@needs_pipeline
+def test_real_keep_out_moves_the_hole_with_the_model_and_clears_it(tmp_path):
+    plain = _run_script(tmp_path, "--no-slice", "--coarse-islands")
+    assert plain["keep_out"] is None
+    # A hole in the STL's frame at an island's contact: the plate shift undone,
+    # as the sidecar would carry it. Islands report plate-frame contacts.
+    shift = plain["plate_transform"]["translate_mm"]
+    contact = plain["island_list"][0]["contact"]
+    hole = {
+        "x": contact[0] - shift[0], "y": contact[1] - shift[1], "z": contact[2] - shift[2],
+        "radius_mm": 2.0, "direction": [0, 0, -1], "length_mm": 2.0, "purpose": "test",
+    }  # fmt: skip
+    holes = tmp_path / "holes.json"
+    holes.write_text(json.dumps({"holes": [hole]}))
+    data = _run_script(tmp_path, "--no-slice", "--coarse-islands", "--keep-out", str(holes))
+    report = data["keep_out"]["holes"][0]
+    # The zone sits where the model went on the plate.
+    assert report["start_plate_mm"] == pytest.approx(contact, abs=1e-3)
+    assert report["keep_out_radius_mm"] == 3.0
+    assert report["blocked_triangles"] > 0
+    # Nothing is left inside the zone: whatever was removed is counted, not hidden.
+    assert report["supports_removed"] >= report["contacts_removed"] >= 0
+    assert data["contacts"] > 0

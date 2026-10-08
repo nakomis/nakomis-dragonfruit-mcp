@@ -44,6 +44,10 @@ _REQUIRED_KEYS = {
 }
 
 
+# What a hole needs to be a keep-out zone (the `<stl>.holes.json` records `drill_holes` writes).
+_HOLE_NUMBERS = ("x", "y", "z", "radius_mm", "length_mm")
+
+
 # What the sidecar and result need from `dragonfruit-cli slice run --json`.
 _SLICE_KEYS = {"layers", "layer_height_mm", "format", "resolution_px"}
 
@@ -73,6 +77,36 @@ class LayerFrame(BaseModel):
     layer_height_mm: float
     mirror_x: bool = Field(description="Layer images are mirrored in X relative to the plate frame")
     mirror_y: bool
+
+
+class KeepOutHole(BaseModel):
+    """What one keep-out zone did to the supports."""
+
+    hole: int = Field(description="Index in the holes list that was used")
+    purpose: str | None = None
+    start_plate_mm: list[float] = Field(description="The hole's start point in the plate frame")
+    direction: list[float]
+    keep_out_radius_mm: float = Field(description="Hole radius + 1 mm")
+    blocked_triangles: int = Field(
+        description="Model triangles within the zone, refused as contacts (support blockers)"
+    )
+    islands_inside: list[str] = Field(
+        description="Islands whose own contact point lies in the zone, so cannot be supported there"
+    )
+    contacts_removed: int = Field(
+        description="Supports removed after placement for a contact in the zone"
+    )
+    supports_removed: int = Field(
+        description="Supports removed after placement for a contact or shaft entering the zone"
+    )
+    lost_coverage: list[str] = Field(
+        description="Islands left with no support near them by the removals"
+    )
+
+
+class KeepOut(BaseModel):
+    source: str = Field(description="The holes file or `holes` argument these came from")
+    holes: list[KeepOutHole]
 
 
 class SupportedSlice(ToolResult):
@@ -122,7 +156,59 @@ class SupportedSlice(ToolResult):
     extra_files: list[str] = Field(
         default_factory=list, description="Written by the printer driver"
     )
+    keep_out: KeepOut | None = Field(
+        default=None, description="Present when holes were kept clear of supports"
+    )
     timings_ms: dict[str, int]
+
+
+def _holes_sidecar(stl_path: str, stl: Path) -> Path | None:
+    """`<stl>.holes.json` beside the STL as named, else beside where a symlink points."""
+    named = Path(stl_path).expanduser()
+    for candidate in (named, stl):
+        sidecar = candidate.with_name(candidate.name + ".holes.json")
+        if sidecar.is_file():
+            return sidecar
+    return None
+
+
+def _load_holes(
+    stl_path: str, stl: Path, holes: list[dict[str, Any]] | None, keep_out_holes: bool
+) -> tuple[list[dict[str, Any]], str | None]:
+    """The holes to keep supports away from, in the STL's frame, and where they came from."""
+    sidecar = _holes_sidecar(stl_path, stl) if holes is None and keep_out_holes else None
+    if holes is not None:
+        source = "the holes argument"
+    elif sidecar is not None:
+        source = str(sidecar)
+        try:
+            data = json.loads(sidecar.read_text())
+        except (OSError, ValueError) as e:
+            raise cli.CliError(f"{sidecar} is not readable JSON: {e}") from e
+        holes = data.get("holes") if isinstance(data, dict) else None
+        if not isinstance(holes, list):
+            raise cli.CliError(f"{sidecar}: expected an object with a 'holes' list")
+    else:
+        return [], None
+    if not keep_out_holes:
+        return [], None
+    for i, hole in enumerate(holes):
+        direction = hole.get("direction") if isinstance(hole, dict) else None
+        ok = (
+            isinstance(hole, dict)
+            and all(isinstance(hole.get(k), (int, float)) for k in _HOLE_NUMBERS)
+            and hole["radius_mm"] > 0
+            and isinstance(direction, (list, tuple))
+            and len(direction) == 3
+            and all(isinstance(v, (int, float)) for v in direction)
+            and any(direction)
+        )
+        if not ok:
+            raise ValueError(
+                f"hole {i} needs numeric x, y, z, radius_mm (> 0), length_mm and a non-zero "
+                "direction [dx, dy, dz], in the STL's frame"
+            )
+    return holes, source
 
 
 @mcp.tool()
@@ -140,6 +226,8 @@ async def auto_support_and_slice(
     export_plate_stl: bool = False,
     export_supported_stl: bool = False,
     fast_islands: bool = False,
+    keep_out_holes: bool = True,
+    holes: list[dict[str, Any]] | None = None,
     options: dict[str, Any] | None = None,
 ) -> SupportedSlice:
     """Auto-support an STL with DragonFruit's own placement, add a raft, and slice it.
@@ -161,6 +249,17 @@ async def auto_support_and_slice(
     so isolated low points can be missed. `fast_islands` uses a coarser voxel
     scan (quicker, finds fewer small islands). `density` scales supports per
     area (2 = twice as many). `raft` adds the app's default solid raft.
+
+    Holes: a drilled STL has a `<stl>.holes.json` beside it (written by
+    `drill_holes`); when that exists, supports keep clear of every hole it lists:
+    no contact lands within the hole's radius + 1 mm of its axis (from a little
+    inside the wall to a few mm outside it), and any support whose shaft still
+    enters that zone is removed. `holes` replaces the file with your own list of
+    `{x, y, z, radius_mm, length_mm, direction: [dx, dy, dz]}` in the STL's own
+    frame (mm; start point, direction pointing out through the wall).
+    `keep_out_holes=False` ignores both. `keep_out` in the result says, per
+    hole, what was blocked and removed; islands that cannot be supported
+    because of a zone are named in `warnings`.
 
     Outputs: the print at `out_path`, or beside the STL as
     `<name>-<printer>-supported<ext>`. The printer profile decides the format;
@@ -197,6 +296,8 @@ async def auto_support_and_slice(
         export_plate_stl=export_plate_stl,
         export_supported_stl=export_supported_stl,
         fast_islands=fast_islands,
+        keep_out_holes=keep_out_holes,
+        holes=holes,
         options=options,
     )
     # Minutes of work: keep the event loop free meanwhile.
@@ -218,6 +319,8 @@ def run_auto_support_and_slice(
     export_plate_stl: bool = False,
     export_supported_stl: bool = False,
     fast_islands: bool = False,
+    keep_out_holes: bool = True,
+    holes: list[dict[str, Any]] | None = None,
     options: dict[str, Any] | None = None,
 ) -> SupportedSlice:
     """The blocking body of `auto_support_and_slice`."""
@@ -241,6 +344,8 @@ def run_auto_support_and_slice(
         format = format.lower()
         if not format.startswith("."):
             format = "." + format
+
+    zones, zone_source = _load_holes(stl_path, stl, holes, keep_out_holes)
 
     plan = slicing.plan_slice(
         stl,
@@ -292,6 +397,11 @@ def run_auto_support_and_slice(
             args += ["--density", f"{density:g}"]
         if fast_islands:
             args.append("--coarse-islands")
+        if zones:
+            # In the STL's frame: the script moves them with the model onto the plate.
+            keep_out_file = Path(tmp) / "holes.json"
+            keep_out_file.write_text(json.dumps({"holes": zones}))
+            args += ["--keep-out", str(keep_out_file)]
         if export_supported_stl:
             args += [
                 "--supported-stl",
@@ -382,6 +492,11 @@ def run_auto_support_and_slice(
         supported_stl_path=data.get("supported_stl"),
         overwritten=data.get("overwritten", []),
         extra_files=[str(p) for p in run.extra_files],
+        keep_out=(
+            KeepOut(source=zone_source or "", holes=data["keep_out"]["holes"])
+            if data.get("keep_out")
+            else None
+        ),
         timings_ms=data["timings_ms"],
         warnings=warnings,
     )
