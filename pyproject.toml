@@ -41,5 +41,8 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: needs the built binaries in bin/ (skipped otherwise)"]
+markers = [
+    "integration: needs the built binaries in bin/ (skipped otherwise)",
+    "real_previews: run the real preview renderer instead of the stub in conftest",
+]
 addopts = "--cov=nakomis_dragonfruit_mcp --cov-report=term-missing --cov-fail-under=70"

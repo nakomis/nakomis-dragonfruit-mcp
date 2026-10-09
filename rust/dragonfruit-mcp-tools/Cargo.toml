@@ -3,7 +3,7 @@ name = "dragonfruit-mcp-tools"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-description = "Hollowing and hole punching for nakomis-dragonfruit-mcp, built on DragonFruit's mesh-repair crate"
+description = "Hollowing, hole punching, overhang scans and preview rendering for nakomis-dragonfruit-mcp, built on DragonFruit's mesh-repair crate"
 publish = false
 
 [dependencies]
@@ -20,3 +20,5 @@ manifold-csg = { version = "=0.1.4", default-features = false }
 # For the overhang classifier borrowed from DragonFruit's app crate (see build.rs).
 log = "0.4"
 rayon = "1.10"
+# PNG output for `render` (print previews, NDFM-14).
+png = "0.18"

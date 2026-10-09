@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from nakomis_dragonfruit_mcp import goo_preview
 from nakomis_dragonfruit_mcp.printers import loader
 
 # Stands in for `tsx dragonfruit-ts-cli.ts`: logs its arguments (one line per call)
@@ -24,12 +25,16 @@ case "$1" in
       --printer-json) cp "$2" "$FAKE_LOG.printer" ;;
       --material) cp "$2" "$FAKE_LOG.material" ;;
       --keep-out) cp "$2" "$FAKE_LOG.keepout" ;;
+      --stl) model="$2" ;;
+      --supported-stl) supported="$2" ;;
     esac
     shift
   done
   # A real (minimal) .goo when one is asked for, so printer drivers that
   # post-process .goo files see a valid file; placeholder bytes otherwise.
   case "$out" in *.goo) cp "$FAKE_GOO" "$out" ;; *) printf data > "$out" ;; esac
+  # The model stands in for model + supports + raft.
+  if [ -n "$supported" ] && [ -z "$FAKE_NO_SUPPORTED_STL" ]; then cp "$model" "$supported"; fi
   sed "s#__OUT__#$out#g" "$FAKE_SUMMARY"
   exit 0
   ;;
@@ -129,6 +134,35 @@ def isolated_config(tmp_path, monkeypatch):
     monkeypatch.setattr(loader, "config_dir", lambda: tmp_path / "config")
     monkeypatch.delenv("NDFM_PRINTER", raising=False)
     monkeypatch.delenv("NDFM_PRINTERS_DIR", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def preview_calls(request, monkeypatch):
+    """Previews are stubbed out (no Rust binary needed) and the calls recorded.
+
+    Integration tests and those marked `real_previews` get the real renderer.
+    """
+    calls: list[dict] = []
+    if request.node.get_closest_marker("integration") or request.node.get_closest_marker(
+        "real_previews"
+    ):
+        return calls
+
+    def fake(goo_path, stl_path, *, model_triangles=None):
+        written = goo_preview.has_preview_slots(Path(goo_path))
+        calls.append(
+            {
+                "goo": Path(goo_path),
+                "stl": Path(stl_path),
+                "stl_existed": Path(stl_path).is_file(),
+                "model_triangles": model_triangles,
+                "written": written,
+            }
+        )
+        return written
+
+    monkeypatch.setattr(goo_preview, "render_and_write", fake)
+    return calls
 
 
 def write_minimal_goo(path):
