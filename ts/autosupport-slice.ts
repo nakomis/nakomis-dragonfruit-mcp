@@ -8,8 +8,9 @@
  * a scene without its supports. This script runs the app's own code end to end,
  * importing DragonFruit's modules read-only:
  *
- *   STL -> lift off the plate -> voxel islands (`detectVoxelIslands`, through the
- *   bench's in-process worker shim) -> `runAutoPlaceRequest` (the worker's own
+ *   STL -> lift off the plate -> voxel islands (the app's scanline worker, through
+ *   the bench's in-process shim, joined by `voxel-islands.ts`, a bounded
+ *   `detectVoxelIslands`) -> `runAutoPlaceRequest` (the worker's own
  *   entry point) -> `commitAutoPlacePlan` into the support store ->
  *   `buildSupportAndRaftWorldTriangles` (the app's export path) -> model
  *   triangles first, then supports and raft, with `modelTriangleCount` at the
@@ -26,9 +27,11 @@
  * space to get wrong between them.
  *
  * Islands: the app merges three families. The voxel family runs here through
- * the bench's in-process worker; the overhang family is a Tauri command over
- * Rust, which `dragonfruit-mcp-tools overhangs` runs for us (`--tools`); mesh
- * minima (also Tauri) are not run, so a model may get fewer supports at
+ * the bench's in-process worker, with the candidates held as runs rather than
+ * upstream's one Set entry a voxel (which a large part overflows: NDFM-23);
+ * the overhang family is a Tauri command over Rust, which
+ * `dragonfruit-mcp-tools overhangs` runs for us (`--tools`); mesh minima (also
+ * Tauri) are not run, so a model may get fewer supports at
  * isolated low points than the GUI would give it.
  *
  * Usage:
@@ -114,6 +117,8 @@ import type { RaftSettings } from '@/supports/Rafts/Crenelated/RaftTypes';
 import { mergeOverhangRegions, overhangRegionToIsland } from '@/volumeAnalysis/Islands/useIslands';
 import { classifyIntersection } from '@/volumeAnalysis/Islands/intersection';
 import type { DetectedIsland, OverhangScan } from '@/volumeAnalysis/Islands/types';
+
+import { detectVoxelIslandsBounded, type WorkerLike } from './voxel-islands';
 
 /** The footprint resolution the app's island panel asks `scan_overhangs` for (useIslands.ts). */
 const OVERHANG_FOOTPRINT_PX_MM = 0.25;
@@ -251,24 +256,6 @@ function quietPipelineLogs(verbose: boolean): void {
 /** Scripts outside `src/` are not under the `@/` alias, so load them by path. */
 async function importDragonFruitScript<T>(relativePath: string): Promise<T> {
     return (await import(pathToFileURL(join(process.cwd(), relativePath)).href)) as T;
-}
-
-/**
- * The bench's stand-in worker answers synchronously, and the detector asks for
- * the next layer from inside each answer, so the stack grows by a few frames per
- * layer: fine for the bench's small corpus, a stack overflow for a 70 mm part
- * at 50 µm. Delivering each message on its own macrotask (as a real worker
- * would) keeps the stack flat; the in-thread handler and its ordering are
- * unchanged.
- */
-async function deferWorkerMessages(install: () => Promise<void>): Promise<void> {
-    await install();
-    const globals = globalThis as unknown as { Worker: new () => { postMessage: (message: unknown) => void } };
-    const InProcessWorker = globals.Worker;
-    globals.Worker = function DeferredWorker() {
-        const inner = new InProcessWorker();
-        return { ...inner, postMessage: (message: unknown) => setImmediate(() => inner.postMessage(message)) };
-    } as unknown as typeof globals.Worker;
 }
 
 /**
@@ -692,14 +679,21 @@ async function main(): Promise<void> {
     // Islands, the voxel family first, as the bench detects them.
     type IslandScanModule = typeof import('../vendor/dragonfruit/scripts/bench-island-scan');
     const islandScan = await importDragonFruitScript<IslandScanModule>('scripts/bench-island-scan.ts');
-    await deferWorkerMessages(islandScan.installInProcessWorkers);
+    await islandScan.installInProcessWorkers();
+    const InProcessWorker = (globalThis as unknown as { Worker: new () => WorkerLike }).Worker;
     const detect = options.coarseIslands ? ISLAND_DETECT.coarse : ISLAND_DETECT.panel;
-    const voxelIslands = await time('islands_ms', () => islandScan.detectIslands(geometry, {
-        ...islandScan.DEFAULT_DETECT_OPTIONS,
-        pxMm: options.pxMm ?? detect.pxMm,
-        supportBufferMm: detect.supportBufferMm,
+    const voxelIslands = await time('islands_ms', () => detectVoxelIslandsBounded(
+        () => new InProcessWorker(),
+        geometry.getAttribute('position').array as Float32Array,
+        box.clone(),
         layerHeightMm,
-    }));
+        {
+            pxMm: options.pxMm ?? detect.pxMm,
+            supportBufferMm: detect.supportBufferMm,
+            connectivity: islandScan.DEFAULT_DETECT_OPTIONS.connectivity,
+            minAreaMm2: islandScan.DEFAULT_DETECT_OPTIONS.minAreaMm2,
+        },
+    ));
 
     // Then the overhang family, which is what puts a density grid under shallow
     // slopes (the voxel detector only sees surfaces flatter than ~11°). The app
@@ -997,9 +991,6 @@ async function main(): Promise<void> {
         }
     }
 
-    // The island detector's MessageChannel keeps the event loop alive.
-    disposeEventLoopChannel();
-
     const placedByType = Object.fromEntries(Object.entries(result.placed).filter(([, count]) => count > 0));
     console.error(`autosupport-slice: ${placed.length} islands, ${committed.contacts} contacts, ${supportTriangles.length} support/raft triangles`);
     process.stdout.write(`${JSON.stringify({
@@ -1054,7 +1045,29 @@ async function main(): Promise<void> {
     })}\n`);
 }
 
-main().catch((error) => {
-    process.stderr.write(`autosupport-slice: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
-    process.exitCode = 1;
-});
+/**
+ * Exit once stdout and stderr have drained, success or failure. The pipeline
+ * leaves handles open that nothing in the app closes (the yield
+ * MessageChannel, which holds the event loop for as long as it has a
+ * listener, and possibly others), so returning from `main` is not enough: a
+ * run that failed half way used to print its error and then sit until the
+ * Python side's 45-minute timeout (NDFM-23).
+ */
+function exitWhenFlushed(code: number): void {
+    disposeEventLoopChannel();
+    process.exitCode = code;
+    let pending = 2;
+    const done = () => {
+        if (--pending === 0) process.exit(code);
+    };
+    process.stdout.write('', done);
+    process.stderr.write('', done);
+}
+
+main().then(
+    () => exitWhenFlushed(0),
+    (error) => {
+        process.stderr.write(`autosupport-slice: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+        exitWhenFlushed(1);
+    },
+);
