@@ -7,7 +7,10 @@ mesh-level fixes miss slivers thinner than their voxels, so this works on the
 print file's own layers.
 
 Working up from layer 1, a region's cured core (grey >= CORE) is held when it
-touches the held core of the layer below, within TOUCH_PX. Unheld cores are
+overlaps the held core of the layer below: at least MIN_OVERLAP of its own
+pixels must sit on it, and at least MIN_OVERLAP_PX of them (or all of them, for
+a region smaller than that). A graze of a pixel or two holds nothing up: in the
+vat it tears off as a flake, as a region over empty space does. Unheld cores are
 blanked, and so is grey that isn't within HUG_PX of a held core. A dropped
 region's layers above are then judged against what is left, so a sliver is
 trimmed until it meets held material. Layers with nothing dropped are copied
@@ -33,7 +36,8 @@ from nakomis_dragonfruit_mcp import goo
 from nakomis_dragonfruit_mcp.goo_motion import END_MARKER, _layer_definitions
 
 CORE = 128  # grey at or above this cures through; fainter edge pixels barely do
-TOUCH_PX = 2  # a core this close to the held core below rests on it
+MIN_OVERLAP = 0.25  # share of a region's core that must sit on held core below
+MIN_OVERLAP_PX = 8  # and at least this many pixels, so a speck can't pass on one
 HUG_PX = 3  # grey this close to a held core is its anti-aliased edge
 MARGIN_PX = 8
 # OpenCV's dilate with a 3x3 cross, iterated, is scipy's default binary_dilation
@@ -51,12 +55,27 @@ def _label(mask: np.ndarray) -> tuple[np.ndarray, int]:
     return labels, count - 1
 
 
-def _touching(labels: np.ndarray, count: int, mask: np.ndarray) -> np.ndarray:
-    """Lookup table over labels: True for each label with a pixel in `mask`."""
-    lut = np.zeros(count + 1, bool)
-    lut[labels[mask]] = True
+def _supported(
+    labels: np.ndarray, count: int, below: np.ndarray, min_overlap: float, min_overlap_px: int
+) -> np.ndarray:
+    """Lookup table over labels: True for each region resting on `below`.
+
+    A region rests when its pixels on `below` are at least `min_overlap` of its
+    area and at least `min_overlap_px`, or the whole region if it is smaller.
+    """
+    sizes = np.bincount(labels.ravel(), minlength=count + 1)
+    overlap = np.bincount(labels[below], minlength=count + 1)
+    lut = (overlap >= np.minimum(sizes, min_overlap_px)) & (overlap >= min_overlap * sizes)
     lut[0] = False
     return lut
+
+
+def check_thresholds(min_overlap: float, min_overlap_px: int) -> None:
+    """Refuse thresholds that can't mean anything."""
+    if not 0.0 <= min_overlap <= 1.0:
+        raise ValueError(f"min_overlap must be between 0 and 1, not {min_overlap}")
+    if min_overlap_px < 1:
+        raise ValueError(f"min_overlap_px must be at least 1, not {min_overlap_px}")
 
 
 @dataclass
@@ -88,8 +107,18 @@ def _box(lit: np.ndarray, h: int, w: int) -> tuple[slice, slice] | None:
     )
 
 
-def trim_islands(src: Path, dst: Path) -> TrimReport:
-    """Write `src` to `dst` with every unsupported region removed; never overwrites `dst`."""
+def trim_islands(
+    src: Path,
+    dst: Path,
+    min_overlap: float = MIN_OVERLAP,
+    min_overlap_px: int = MIN_OVERLAP_PX,
+) -> TrimReport:
+    """Write `src` to `dst` with every unsupported region removed; never overwrites `dst`.
+
+    A region is supported when at least `min_overlap` of its core, and at least
+    `min_overlap_px` pixels of it (all of it, if smaller), sit on held core below.
+    """
+    check_thresholds(min_overlap, min_overlap_px)
     header = goo.read_header(src)
     w, h = header.resolution_x, header.resolution_y
     data = src.read_bytes()
@@ -108,9 +137,8 @@ def trim_islands(src: Path, dst: Path) -> TrimReport:
         a = full[box]  # a view: blanking it blanks the layer
         core = a >= CORE
         if held is not None:
-            below = _dilate(held[box], TOUCH_PX)
             labels, count = _label(core)
-            lut = _touching(labels, count, core & below)
+            lut = _supported(labels, count, core & held[box], min_overlap, min_overlap_px)
             core = lut[labels]
             drop = (a > 0) & ~_dilate(core, HUG_PX)
             if drop.any():
@@ -162,7 +190,16 @@ def _layer_table(path: Path) -> list[tuple[int, int]]:
     return table
 
 
-def _islands_in(path: Path, table: list[tuple[int, int]], first: int, last: int, w: int, h: int):
+def _islands_in(
+    path: Path,
+    table: list[tuple[int, int]],
+    first: int,
+    last: int,
+    w: int,
+    h: int,
+    min_overlap: float = MIN_OVERLAP,
+    min_overlap_px: int = MIN_OVERLAP_PX,
+):
     """find_islands for layers first..last (1-based), reading layer first-1 for support."""
     found: list[tuple[int, int]] = []
     below = None
@@ -177,27 +214,36 @@ def _islands_in(path: Path, table: list[tuple[int, int]], first: int, last: int,
                 if box is not None:
                     c = core[box]
                     labels, count = _label(c)
-                    touching = _touching(labels, count, c & _dilate(below[box], TOUCH_PX))
+                    held = _supported(labels, count, c & below[box], min_overlap, min_overlap_px)
                     sizes = np.bincount(labels.ravel(), minlength=count + 1)
-                    found += [(n, int(sizes[k])) for k in range(1, count + 1) if not touching[k]]
+                    found += [(n, int(sizes[k])) for k in range(1, count + 1) if not held[k]]
             below = core
     return found
 
 
-def find_islands(path: Path, workers: int | None = None) -> list[tuple[int, int]]:
-    """(layer, pixels) for every cured core with no cured core within TOUCH_PX below.
+def find_islands(
+    path: Path,
+    workers: int | None = None,
+    min_overlap: float = MIN_OVERLAP,
+    min_overlap_px: int = MIN_OVERLAP_PX,
+) -> list[tuple[int, int]]:
+    """(layer, pixels) for every cured core not resting on the cured core below.
+
+    "Resting" is `trim_islands`'s rule, with the same thresholds.
 
     Each layer needs only itself and the one below, so ranges of layers are
     checked in parallel processes; `workers=1` runs in this process.
     """
+    check_thresholds(min_overlap, min_overlap_px)
     header = goo.read_header(path)
     w, h = header.resolution_x, header.resolution_y
     table = _layer_table(path)
     workers = workers or min(os.cpu_count() or 1, 8)
     step = -(-header.layers // (workers * 4))  # a few chunks per worker evens out the load
     ranges = [(a, min(a + step - 1, header.layers)) for a in range(2, header.layers + 1, step)]
+    thresholds = (min_overlap, min_overlap_px)
     if workers == 1 or len(ranges) <= 1:
-        return [i for a, b in ranges for i in _islands_in(path, table, a, b, w, h)]
+        return [i for a, b in ranges for i in _islands_in(path, table, a, b, w, h, *thresholds)]
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        jobs = [pool.submit(_islands_in, path, table, a, b, w, h) for a, b in ranges]
+        jobs = [pool.submit(_islands_in, path, table, a, b, w, h, *thresholds) for a, b in ranges]
         return [i for job in jobs for i in job.result()]
