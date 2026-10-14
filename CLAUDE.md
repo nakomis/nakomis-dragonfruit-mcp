@@ -17,7 +17,7 @@ disclaimer near the top of the README.
 | `tests/` | pytest; integration tests run only when `bin/` is built |
 | `rust/dragonfruit-mcp-tools/` | Our Rust tool (hollowing, hole punching, `overhangs`, `render` for `.goo` preview pictures), linking DragonFruit's `dragonfruit-mesh-repair`; `build.rs` borrows the app's `src-tauri/src/overhang.rs` minus its Tauri command |
 | `accel/goo-trim/` | Optional Rust backend for `trim_islands` (`bin/goo-trim`, built by `scripts/build-accel.sh`, not `build.sh`); output must stay byte-identical to `goo_trim.py`. Chosen by `NDFM_TRIM_BACKEND` or the tool's `backend` argument |
-| `ts/` | Our TS scripts (`autosupport-slice.ts`), run by `cli.run_ts(script=...)` with DragonFruit's tsconfig and `NODE_PATH` at its node_modules |
+| `ts/` | Our TS scripts (`autosupport-slice.ts`; `voxel-islands.ts`, upstream's voxel island detector with the candidates held as runs, not one `Set` entry a voxel), run by `cli.run_ts(script=...)` with DragonFruit's tsconfig and `NODE_PATH` at its node_modules; `ts/tests/` under `tsx --test` |
 | `vendor/dragonfruit/` | DragonFruit, as a submodule pinned to upstream `dev` |
 | `scripts/build.sh` | Builds `bin/dragonfruit-cli` and `bin/dragonfruit-mcp-tools`, and installs DragonFruit's Node dependencies for `dragonfruit-ts-cli` |
 | `docs/architecture/` | Architecture diagram source (`.drawio`) and generated SVG |
@@ -45,8 +45,11 @@ Plane project `NDFM`. Branches `ndfm-<n>-<slug>`, PR titles end `(NDFM-<n>)`.
 
 Python: `uv run ruff check . && uv run pytest --cov` (70% minimum coverage).
 The auto-support integration tests also need `NDFM_TEST_STL` (a binary STL that fits the Mars 5 Ultra).
-TypeScript (type-check only): `cd vendor/dragonfruit && node_modules/.bin/tsc -p ../../ts/tsconfig.json`
-(one upstream error about `clipper-lib` types is expected).
+TypeScript: type-check with `cd vendor/dragonfruit && node_modules/.bin/tsc -p ../../ts/tsconfig.json`
+(one upstream error about `clipper-lib` types is expected); `ts/tests/*.test.ts` run under
+`tsx --test` from `vendor/dragonfruit` (pytest runs them through `tests/test_voxel_islands.py`).
+`autosupport-slice.ts` must always end with `exitWhenFlushed`: upstream leaves handles
+(the yield MessageChannel) that keep Node alive, so a returned or failed `main` would hang.
 Rust: `cargo test` (in `rust/dragonfruit-mcp-tools` and `accel/goo-trim`; the latter's
 `tests/real_file.rs` re-encodes every layer of `NDFM_TEST_GOO` when set).
 

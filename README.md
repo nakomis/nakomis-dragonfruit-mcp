@@ -111,6 +111,10 @@ runs the app's own placement and support export under Node, and
 upstream). The third island family the app uses, mesh minima, isn't run, and
 the overhang scan isn't fully deterministic upstream, so support counts can
 differ slightly from the GUI's and between runs. Check a print before trusting it.
+The voxel island family runs the app's own per-layer scan, but `ts/voxel-islands.ts`
+joins the results: it holds the unsupported voxels as runs along each row rather
+than upstream's one `Set` entry a voxel, which a large part overflows. Its
+islands match upstream's (NDFM-23).
 
 Previews can also be rendered by hand:
 
@@ -134,7 +138,7 @@ bin/dragonfruit-mcp-tools render --stl print.goo.supported.stl --out preview.png
 | `nakomis_dragonfruit_mcp/` | The MCP server (Python, FastMCP) |
 | `tests/` | pytest; integration tests run only when `bin/` is built |
 | `rust/dragonfruit-mcp-tools/` | Our Rust tool (hollowing, hole punching, overhang scan, preview rendering), linking DragonFruit's `dragonfruit-mesh-repair` |
-| `ts/` | Our TypeScript scripts, run under DragonFruit's tsx against its own modules (auto-supports) |
+| `ts/` | Our TypeScript scripts, run under DragonFruit's tsx against its own modules (auto-supports, and a bounded voxel island detector) |
 | `vendor/dragonfruit/` | DragonFruit, as a submodule pinned to upstream `dev` |
 | `accel/goo-trim/` | Optional Rust backend for `trim_islands` (see above) |
 | `scripts/build-accel.sh` | Builds `bin/goo-trim` |
