@@ -220,9 +220,9 @@ pub fn build(
     Some(Masks { lit, core })
 }
 
-/// 8-connected components of `core` that don't rest on `below`. A component
-/// rests when its pixels in `below` are at least `min_overlap` of its size and
-/// at least `min_overlap_px` (or all of it, if it is smaller than that).
+/// 8-connected components of `core` that touch none of `below`, found by
+/// flooding from each core pixel outside `below` and stopping as soon as a
+/// flood reaches `below` (or a component already known to be held).
 /// Returns the unheld pixels and each unheld component's size, in raster
 /// order of the component's first pixel.
 pub struct Flood {
@@ -230,17 +230,22 @@ pub struct Flood {
     pub sizes: Vec<u64>,
 }
 
-pub fn unheld_components(core: &Mask, below: &Mask, min_overlap: f64, min_overlap_px: u64) -> Flood {
+pub fn unheld_components(core: &Mask, below: &Mask) -> Flood {
+    let suspect = core.and_not(below);
     let mut unheld = Mask::zeros_like(core);
     let mut sizes = Vec::new();
+    if suspect.is_empty() {
+        return Flood { unheld, sizes };
+    }
     let (ww, h) = (core.ww, core.h);
     let wpx = ww * 64;
     let mut visited = Mask::zeros_like(core);
+    let mut current = Mask::zeros_like(core);
     let mut stack: Vec<(u32, u32)> = Vec::new();
     let mut members: Vec<(u32, u32)> = Vec::new();
     for y in 0..h {
         for k in 0..ww {
-            let mut word = core.bits[y * ww + k];
+            let mut word = suspect.bits[y * ww + k];
             while word != 0 {
                 let x = (k << 6) + word.trailing_zeros() as usize;
                 word &= word - 1;
@@ -250,30 +255,38 @@ pub fn unheld_components(core: &Mask, below: &Mask, min_overlap: f64, min_overla
                 stack.clear();
                 members.clear();
                 visited.set(x, y);
+                current.set(x, y);
                 stack.push((x as u32, y as u32));
                 members.push((x as u32, y as u32));
-                let mut overlap = u64::from(below.get(x, y));
-                while let Some((px, py)) = stack.pop() {
+                let mut held = false;
+                'flood: while let Some((px, py)) = stack.pop() {
                     let (px, py) = (px as usize, py as usize);
                     for ny in py.saturating_sub(1)..=(py + 1).min(h - 1) {
                         for nx in px.saturating_sub(1)..=(px + 1).min(wpx - 1) {
-                            if !core.get(nx, ny) || visited.get(nx, ny) {
+                            if !core.get(nx, ny) || current.get(nx, ny) {
                                 continue;
                             }
+                            if visited.get(nx, ny) || below.get(nx, ny) {
+                                // A held component (an earlier flood stopped in it) or below itself.
+                                visited.set(nx, ny);
+                                held = true;
+                                break 'flood;
+                            }
                             visited.set(nx, ny);
-                            overlap += u64::from(below.get(nx, ny));
+                            current.set(nx, ny);
                             stack.push((nx as u32, ny as u32));
                             members.push((nx as u32, ny as u32));
                         }
                     }
                 }
-                let size = members.len() as u64;
-                let held = overlap >= size.min(min_overlap_px) && overlap as f64 >= min_overlap * size as f64;
-                if !held {
-                    for &(mx, my) in &members {
+                for &(mx, my) in &members {
+                    current.clear(mx as usize, my as usize);
+                    if !held {
                         unheld.set(mx as usize, my as usize);
                     }
-                    sizes.push(size);
+                }
+                if !held {
+                    sizes.push(members.len() as u64);
                 }
             }
         }
@@ -314,32 +327,11 @@ mod tests {
     fn flood_is_8_connected_and_respects_below() {
         let core = from_rows(&["#...##", ".#..##", "......", "...#.."]);
         let below = from_rows(&["....#.", "......", "......", "......"]);
-        let f = unheld_components(&core, &below, 0.0, 1);
+        let f = unheld_components(&core, &below);
         // the diagonal pair is one component, the 2x2 block touches below, the dot is alone
         assert_eq!(f.sizes, vec![2, 1]);
         assert!(f.unheld.get(0, 0) && f.unheld.get(1, 1) && f.unheld.get(3, 3));
         assert!(!f.unheld.get(4, 0) && !f.unheld.get(5, 1));
-    }
-
-    #[test]
-    fn a_graze_holds_nothing_up() {
-        // a 4x4 region (16 px) with 1, 2, 4 and 16 of its pixels on `below`
-        let core = from_rows(&["####", "####", "####", "####"]);
-        for (rows, held) in [
-            (["#...", "....", "....", "...."], false),
-            (["##..", "....", "....", "...."], false),
-            (["####", "....", "....", "...."], false), // 25 %, but under 8 px
-            (["####", "####", "....", "...."], true),
-            (["####", "####", "####", "####"], true),
-        ] {
-            let f = unheld_components(&core, &from_rows(&rows), 0.25, 8);
-            assert_eq!(f.sizes.is_empty(), held, "{rows:?}");
-        }
-        // a region smaller than min_overlap_px is held when all of it is
-        let dot = from_rows(&["##", "##"]);
-        assert!(unheld_components(&dot, &dot, 0.25, 8).sizes.is_empty());
-        let half = from_rows(&["##", ".."]);
-        assert_eq!(unheld_components(&dot, &half, 0.25, 8).sizes, vec![4]);
     }
 
     #[test]

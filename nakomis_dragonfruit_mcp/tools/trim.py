@@ -5,7 +5,6 @@ from __future__ import annotations
 import functools
 import os
 from pathlib import Path
-from typing import Annotated
 
 import anyio
 from pydantic import Field
@@ -66,29 +65,17 @@ def choose_backend(requested: str | None) -> str:
 
 
 def _trim_python(
-    src: Path, dst: Path, verify: bool, thresholds: tuple[float, int]
+    src: Path, dst: Path, verify: bool
 ) -> tuple[goo_trim.TrimReport, list[tuple[int, int]] | None]:
     try:
-        report = goo_trim.trim_islands(src, dst, *thresholds)
+        report = goo_trim.trim_islands(src, dst)
     except FileExistsError as e:
         raise cli.CliError(f"{dst} appeared while trimming; nothing was overwritten") from e
-    if not verify:
-        return report, None
-    return report, goo_trim.find_islands(dst, None, *thresholds)
+    return report, goo_trim.find_islands(dst) if verify else None
 
 
-def _trim_rust(
-    src: Path, dst: Path, verify: bool, thresholds: tuple[float, int]
-) -> tuple[goo_trim.TrimReport, int | None, int]:
-    min_overlap, min_overlap_px = thresholds
-    args = [
-        "trim",
-        str(src),
-        str(dst),
-        f"--min-overlap={min_overlap!r}",
-        f"--min-overlap-px={min_overlap_px}",
-        *(["--verify"] if verify else []),
-    ]
+def _trim_rust(src: Path, dst: Path, verify: bool) -> tuple[goo_trim.TrimReport, int | None, int]:
+    args = ["trim", str(src), str(dst), *(["--verify"] if verify else [])]
     try:
         out = cli.run(GOO_TRIM, args, parse_json=True).data
     except cli.CliError as e:
@@ -111,14 +98,7 @@ def run(
     pixel_um: float,
     verify: bool,
     backend: str | None = None,
-    min_overlap: float = goo_trim.MIN_OVERLAP,
-    min_overlap_px: int = goo_trim.MIN_OVERLAP_PX,
 ) -> TrimResult:
-    try:
-        goo_trim.check_thresholds(min_overlap, min_overlap_px)
-    except ValueError as e:
-        raise cli.CliError(str(e)) from e
-    thresholds = (float(min_overlap), int(min_overlap_px))
     src = Path(print_path).expanduser()
     if not src.is_file():
         raise cli.CliError(f"print file not found: {src}")
@@ -132,9 +112,9 @@ def run(
     islands_left: int | None = None
     largest = 0
     if chosen == "rust":
-        report, islands_left, largest = _trim_rust(src, dst, verify, thresholds)
+        report, islands_left, largest = _trim_rust(src, dst, verify)
     else:
-        report, left = _trim_python(src, dst, verify, thresholds)
+        report, left = _trim_python(src, dst, verify)
         if left is not None:
             islands_left, largest = len(left), max((px for _, px in left), default=0)
     layer_mm = goo.read_header(src).layer_height_mm
@@ -167,18 +147,13 @@ async def trim_islands(
     pixel_um: float = 18.0,
     verify: bool = True,
     backend: str | None = None,
-    min_overlap: Annotated[float, Field(ge=0.0, le=1.0)] = goo_trim.MIN_OVERLAP,
-    min_overlap_px: Annotated[int, Field(ge=1)] = goo_trim.MIN_OVERLAP_PX,
 ) -> TrimResult:
     """Remove every region of a sliced `.goo` that has nothing cured beneath it.
 
     Such regions don't print: they cure onto the FEP and peel off as flakes.
     Open lattices and cut edges are full of tiny ones that mesh-level checks miss.
     Working up from layer 1, a region's cured core (grey >= 128) is kept when it
-    overlaps the kept core of the layer below: at least `min_overlap` of the
-    region (default 0.25, a quarter of it) and at least `min_overlap_px` pixels
-    (default 8; all of it, for a region smaller than that) must sit on it, so a
-    region merely grazing the layer below by a pixel or two goes. Anything else is
+    touches the kept core of the layer below (within 2 px); anything else is
     blanked, along with grey edge pixels not hugging a kept core (3 px). A
     trimmed sliver is judged again on the next layer, so it is cut back until
     it meets held material. Unchanged layers, the header and the end marker are
@@ -197,7 +172,5 @@ async def trim_islands(
     `verify`) or `auto` (rust when built). Unset, `$NDFM_TRIM_BACKEND` decides.
     The result's `backend` says which ran.
     """
-    work = functools.partial(
-        run, print_path, out_path, pixel_um, verify, backend, min_overlap, min_overlap_px
-    )
+    work = functools.partial(run, print_path, out_path, pixel_um, verify, backend)
     return await anyio.to_thread.run_sync(work)
