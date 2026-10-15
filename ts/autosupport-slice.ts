@@ -794,7 +794,7 @@ async function main(): Promise<void> {
         // A last look at what is committed: nothing may be left inside any zone.
         const residual = live.filter((probe) => allZones.some((zone) => probe.contacts.some((q) => zone.contains(q.x, q.y, q.z))
             || probe.runs.some(([p, q]) => zone.touchesSegment(p, q)))).length;
-        if (residual > 0) warnings.push(`${residual} support(s) are still inside a keep-out zone after removal`);
+        if (residual > 0) warnings.push(`${residual} support(s) are still inside ${capZone ? "a keep-out zone or above the height cap" : "a keep-out zone"} after removal`);
         removalTotals = {
             entities_before: entitiesBefore,
             entities_after: totalEntities(),
