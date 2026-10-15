@@ -16,5 +16,5 @@
     }
   },
   "include": [],
-  "files": ["autosupport-slice.ts", "tests/voxel-islands.test.ts"]
+  "files": ["autosupport-slice.ts", "tests/voxel-islands.test.ts", "tests/support-zones.test.ts"]
 }

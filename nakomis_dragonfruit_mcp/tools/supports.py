@@ -167,6 +167,27 @@ class HeightCap(BaseModel):
     )
 
 
+class OverhangBand(BaseModel):
+    """What the overhang band did to the overhang family (NDFM-22)."""
+
+    overhang_max_height_mm: float = Field(description="The band's top, above the model's own base")
+    band_top_plate_z_mm: float = Field(description="The same height in the plate frame")
+    regions_scanned: int = Field(description="Overhang regions the scan found")
+    regions_clipped: int = Field(description="Regions cut down to their part in the band")
+    regions_dropped: int = Field(description="Regions wholly above the band, left out")
+    voxel_islands_above_band: list[str] = Field(
+        description="Voxel islands above the band, supported as usual"
+    )
+    highest_overhang_contact_mm: float | None = Field(
+        default=None,
+        description="The highest overhang-family contact, above the model's base (None: none)",
+    )
+    overhang_contacts_above_band: int = Field(
+        default=0,
+        description="Overhang-family contacts more than 0.5 mm above the band (should be 0)",
+    )
+
+
 class Graze(BaseModel):
     """A support passing the model too closely, which clear resin can fuse (NDFM-28)."""
 
@@ -249,6 +270,9 @@ class SupportedSlice(ToolResult):
     )
     height_cap: HeightCap | None = Field(
         default=None, description="Present when max_support_height_mm was set"
+    )
+    overhang_band: OverhangBand | None = Field(
+        default=None, description="Present when overhang_max_height_mm was set"
     )
     clearance: Clearance | None = Field(
         default=None, description="Supports that pass the model too closely (min_clearance_mm)"
@@ -357,6 +381,7 @@ async def auto_support_and_slice(
     holes: list[dict[str, Any]] | None = None,
     support_internal_islands: bool = False,
     max_support_height_mm: float | None = None,
+    overhang_max_height_mm: float | None = None,
     min_clearance_mm: float = DEFAULT_MIN_CLEARANCE_MM,
     options: dict[str, Any] | None = None,
     previews: bool = True,
@@ -389,8 +414,21 @@ async def auto_support_and_slice(
     overhangs and would otherwise collect supports all over (NDFM-21). It also
     drops a lifted model's base supports (the voxel family doesn't see the lowest
     layer as an island), so pair it with `lift_mm=0`; a lifted call warns. On a
-    gyroid lattice even 20 degrees still flags the saddles (775 contacts vs ~940).
+    gyroid lattice even 20 degrees still flagged the saddles (775 contacts vs
+    ~940, measured before NDFM-22 fixed the overhang grid's triangle order).
+    For a lifted lattice, `overhang_max_height_mm` (below) is the better switch.
     `islands_by_source` shows what each family found.
+
+    Overhang band: `overhang_max_height_mm` keeps the overhang family to that
+    height over the model's own base, for a lifted self-supporting lattice: its
+    base gets the overhang grid, the lattice above gets none, and the voxel
+    family's islands (anything that really hangs in air) are supported
+    wherever they are, unlike `max_support_height_mm`, which stops all
+    supports. Overhang regions are cut at the band's top before placement, so
+    nothing is blocked or removed. `overhang_band` in the result says how many
+    regions were cut or dropped and checks the outcome: the highest overhang
+    contact, and any more than 0.5 mm over the band (warned about). Not with
+    `overhangs=False`. A few millimetres covers a lantern's rim (NDFM-22).
 
     Holes: a drilled STL has a `<stl>.holes.json` beside it (written by
     `drill_holes`); when that exists, supports keep clear of every hole it lists.
@@ -477,6 +515,7 @@ async def auto_support_and_slice(
         holes=holes,
         support_internal_islands=support_internal_islands,
         max_support_height_mm=max_support_height_mm,
+        overhang_max_height_mm=overhang_max_height_mm,
         min_clearance_mm=min_clearance_mm,
         options=options,
         previews=previews,
@@ -506,6 +545,7 @@ def run_auto_support_and_slice(
     holes: list[dict[str, Any]] | None = None,
     support_internal_islands: bool = False,
     max_support_height_mm: float | None = None,
+    overhang_max_height_mm: float | None = None,
     min_clearance_mm: float = DEFAULT_MIN_CLEARANCE_MM,
     options: dict[str, Any] | None = None,
     previews: bool = True,
@@ -527,6 +567,11 @@ def run_auto_support_and_slice(
         math.isfinite(max_support_height_mm) and max_support_height_mm > 0
     ):
         raise ValueError("max_support_height_mm must be a positive number of mm")
+    if overhang_max_height_mm is not None:
+        if not (math.isfinite(overhang_max_height_mm) and overhang_max_height_mm > 0):
+            raise ValueError("overhang_max_height_mm must be a positive number of mm")
+        if not overhangs:
+            raise ValueError("overhang_max_height_mm limits the overhang family: needs overhangs")
     if not (math.isfinite(min_clearance_mm) and min_clearance_mm >= 0):
         raise ValueError("min_clearance_mm must be 0 (off) or more")
     if aa_preset is not None and aa_preset not in slicing.AA_PRESETS:
@@ -610,6 +655,8 @@ def run_auto_support_and_slice(
             args.append("--support-internal-islands")
         if max_support_height_mm is not None:
             args += ["--max-support-height", f"{max_support_height_mm:g}"]
+        if overhang_max_height_mm is not None:
+            args += ["--overhang-max-height", f"{overhang_max_height_mm:g}"]
         args += ["--min-clearance", f"{min_clearance_mm:g}"]
         if zones:
             # In the STL's frame: the script moves them with the model onto the plate.
@@ -677,6 +724,7 @@ def run_auto_support_and_slice(
             "contacts": data["contacts"],
             "islands_uncovered": data.get("islands_uncovered", 0),
             "max_support_height_mm": max_support_height_mm,
+            "overhang_max_height_mm": overhang_max_height_mm,
             "grazes": len((data.get("clearance") or {}).get("grazes", [])),
             "supported_stl": data.get("supported_stl") if export_supported_stl else None,
         }
@@ -733,6 +781,9 @@ def run_auto_support_and_slice(
                 else None
             ),
             height_cap=HeightCap(**data["height_cap"]) if data.get("height_cap") else None,
+            overhang_band=(
+                OverhangBand(**data["overhang_band"]) if data.get("overhang_band") else None
+            ),
             clearance=Clearance(**data["clearance"]) if data.get("clearance") else None,
             timings_ms=data["timings_ms"],
             previews_written=previews_written,

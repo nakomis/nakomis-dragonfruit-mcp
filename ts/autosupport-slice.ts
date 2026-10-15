@@ -39,7 +39,7 @@
  *     --printer-json <profile.json> [--material <material.json>] [--layer-height N]
  *     [--aa-preset sharp|balanced|smooth|raw] [--lift-mm 7] [--density 1] [--raft solid|line|off]
  *     [--settings <json>] [--coarse-islands] [--no-overhangs] [--px-mm 0.05] [--supported-stl <out.stl>] [--plate-stl <out.stl>] [--job-dir <dir>]
- *     [--keep-out <holes.json>] [--max-support-height <mm>] [--min-clearance <mm>]
+ *     [--keep-out <holes.json>] [--max-support-height <mm>] [--overhang-max-height <mm>] [--min-clearance <mm>]
  *     [--support-internal-islands] [--probe-points <json>] [--no-slice] [--verbose]
  *
  * `--supported-stl` writes model, supports and raft as sliced; `--plate-stl` the
@@ -69,11 +69,26 @@
  * base (NDFM-28): islands above it are not supported, the model surface above
  * it is blocked like a keep-out zone, and any support whose contact or shaft
  * still rises above it is removed the same way. The summary's `height_cap`
- * section counts it. `--min-clearance` (default 0.3 mm; 0 turns it off) is the
- * clearance check: support surface that comes closer than that to the model,
- * away from every contact tip, is reported in `clearance.grazes` and warned
- * about, worst first. In clear resin such a gap cures shut and the support
- * prints fused to the model. Nothing is removed for it.
+ * section counts it.
+ *
+ * `--overhang-max-height` limits the overhang family alone to a band that high
+ * above the model's base (NDFM-22), for self-supporting lattices whose saddles
+ * read as overhangs: the base gets its grid and the lattice above gets none,
+ * while the voxel family's islands are supported wherever they are. Overhang
+ * regions are cut at the band's top before they become islands (the scanner
+ * may return a whole lattice as one region), so the grid samples only the
+ * surface in the band. Nothing is blocked or removed: a voxel island above the
+ * band keeps its supports, shafts and all. The summary's `overhang_band`
+ * section counts the regions cut and dropped, and checks the result: the
+ * highest overhang contact, and any more than 0.5 mm over the band's top (a
+ * triangle straddling the line can carry one a little over it), counted and
+ * warned about.
+ *
+ * `--min-clearance` (default 0.3 mm; 0 turns it off) is the clearance check:
+ * support surface that comes closer than that to the model, away from every
+ * contact tip, is reported in `clearance.grazes` and warned about, worst first.
+ * In clear resin such a gap cures shut and the support prints fused to the
+ * model. Nothing is removed for it.
  *
  * Islands whose contact faces a sealed cavity are skipped before placement
  * (hollow interiors are not supported in normal resin practice, and the only
@@ -121,7 +136,18 @@ import {
 } from '@/features/profiles/profileStore';
 import { buildSupportAndRaftWorldTriangles } from '@/features/slicing/rasterLayerZipExport';
 
-import { DEFAULT_MIN_CLEARANCE_MM, findGrazes, HeightCapZone, KeepOutZone, parseHoles, triangleIndicesInZones, type ClearanceReport, type Zone } from './support-zones';
+import {
+    clipOverhangRegion,
+    DEFAULT_MIN_CLEARANCE_MM,
+    findGrazes,
+    HeightCapZone,
+    KeepOutZone,
+    parseHoles,
+    positionsInFaceOrder,
+    triangleIndicesInZones,
+    type ClearanceReport,
+    type Zone,
+} from './support-zones';
 import { resolveSliceLayerCount, resolveSliceRasterSettings } from '@/features/slicing/sliceJobAssembly';
 import { resolveSliceJobAntiAliasing } from '@/features/slicing/sliceAntiAliasing';
 import type { PlateFootprintSource } from '@/supports/Rafts/Crenelated/geometry/modelPlateFootprint';
@@ -129,7 +155,7 @@ import { disposeEventLoopChannel } from '@/utils/yieldToEventLoop';
 import type { RaftSettings } from '@/supports/Rafts/Crenelated/RaftTypes';
 import { mergeOverhangRegions, overhangRegionToIsland } from '@/volumeAnalysis/Islands/useIslands';
 import { classifyIntersection } from '@/volumeAnalysis/Islands/intersection';
-import type { DetectedIsland, OverhangScan } from '@/volumeAnalysis/Islands/types';
+import type { DetectedIsland, OverhangRegion, OverhangScan } from '@/volumeAnalysis/Islands/types';
 
 import { detectVoxelIslandsBounded, type WorkerLike } from './voxel-islands';
 
@@ -145,6 +171,13 @@ const ISLAND_DETECT = {
     panel: { pxMm: 0.05, supportBufferMm: 0.25 },
     coarse: { pxMm: 0.1, supportBufferMm: 0.6 },
 } as const;
+
+/**
+ * How far over the overhang band's top a contact may sit before the check
+ * counts it: a region keeps a triangle that straddles the line, and its
+ * contacts can land on the part above (NDFM-22).
+ */
+const OVERHANG_BAND_SLACK_MM = 0.5;
 
 /** Our temp dirs share a prefix, so a run can clear what a killed run left behind. */
 const TEMP_PREFIX = 'ndfm-autosupport-';
@@ -175,6 +208,8 @@ interface Options {
     keepOut: string | null;
     /** Supports only up to this height above the model's base, mm (NDFM-28). */
     maxSupportHeightMm: number | null;
+    /** Overhang-family contacts only up to this height above the model's base, mm (NDFM-22). */
+    overhangMaxHeightMm: number | null;
     /** Report supports passing closer than this to the model; 0 turns the check off. */
     minClearanceMm: number;
     supportInternalIslands: boolean;
@@ -205,6 +240,7 @@ function parseArgs(argv: string[]): Options {
         jobDir: null,
         keepOut: null,
         maxSupportHeightMm: null,
+        overhangMaxHeightMm: null,
         minClearanceMm: DEFAULT_MIN_CLEARANCE_MM,
         supportInternalIslands: false,
         probePoints: null,
@@ -244,6 +280,7 @@ function parseArgs(argv: string[]): Options {
         else if (arg === '--job-dir') options.jobDir = resolve(value());
         else if (arg === '--keep-out') options.keepOut = resolve(value());
         else if (arg === '--max-support-height') options.maxSupportHeightMm = number();
+        else if (arg === '--overhang-max-height') options.overhangMaxHeightMm = number();
         else if (arg === '--min-clearance') options.minClearanceMm = number();
         else if (arg === '--support-internal-islands') options.supportInternalIslands = true;
         else if (arg === '--probe-points') options.probePoints = JSON.parse(value()) as number[][];
@@ -258,6 +295,7 @@ function parseArgs(argv: string[]): Options {
     if (options.liftMm < 0) throw new Error('--lift-mm must not be negative');
     if (options.density <= 0) throw new Error('--density must be positive');
     if (options.maxSupportHeightMm !== null && options.maxSupportHeightMm <= 0) throw new Error('--max-support-height must be positive');
+    if (options.overhangMaxHeightMm !== null && options.overhangMaxHeightMm <= 0) throw new Error('--overhang-max-height must be positive');
     if (options.minClearanceMm < 0) throw new Error('--min-clearance must not be negative');
     return options;
 }
@@ -282,10 +320,10 @@ async function importDragonFruitScript<T>(relativePath: string): Promise<T> {
 }
 
 /**
- * The app's `scan_overhangs`, through `dragonfruit-mcp-tools overhangs`, mapped
- * to islands with the app's own `overhangRegionToIsland`.
+ * The app's `scan_overhangs`, through `dragonfruit-mcp-tools overhangs`: its
+ * regions, which the app's own `overhangRegionToIsland` maps to islands.
  */
-function scanOverhangs(tools: string, positions: Float32Array, angleDeg: number, hasRaft: boolean): DetectedIsland[] {
+function scanOverhangs(tools: string, positions: Float32Array, angleDeg: number, hasRaft: boolean): OverhangRegion[] {
     const tmp = mkdtempSync(join(tmpdir(), TEMP_PREFIX));
     try {
         const input = join(tmp, 'positions.bin');
@@ -294,7 +332,7 @@ function scanOverhangs(tools: string, positions: Float32Array, angleDeg: number,
         if (hasRaft) args.push('--has-raft');
         const stdout = execFileSync(tools, args, { encoding: 'utf-8', maxBuffer: 512 * 1024 * 1024 });
         const scan = JSON.parse(stdout) as OverhangScan;
-        return scan.regions.map(overhangRegionToIsland);
+        return scan.regions;
     } finally {
         rmSync(tmp, { recursive: true, force: true });
     }
@@ -427,6 +465,26 @@ function probeCommittedSupports(): SupportProbe[] {
     return probes;
 }
 
+/**
+ * The contact heights of the supports the overhang family placed: its grid
+ * (origin `overhang`) and its single-candidate regions (`standalone`, autoPlace's
+ * ORIGIN_BY_SOURCE).
+ */
+function overhangContactHeights(): number[] {
+    const state = getSnapshot() as unknown as Record<string, Record<string, Record<string, unknown>>>;
+    const heights: number[] = [];
+    for (const descriptor of SUPPORT_STATE_TYPES) {
+        for (const entity of Object.values(state[descriptor.location.key] ?? {})) {
+            if (entity.origin !== 'overhang' && entity.origin !== 'standalone') continue;
+            for (const field of descriptor.contactFields) {
+                const cone = entity[field] as { pos?: { z: number } } | undefined;
+                if (cone?.pos) heights.push(cone.pos.z);
+            }
+        }
+    }
+    return heights;
+}
+
 /** Every support entity in the store, of any type. */
 function totalEntities(): number {
     return Object.values(countCommitted().byType).reduce((sum, n) => sum + n, 0);
@@ -546,7 +604,17 @@ async function main(): Promise<void> {
     });
     const plateShift = placeOnPlate(geometry, options.liftMm);
     geometry.computeVertexNormals();
+    // The BVH reorders the model's triangles (it gives the STL's unindexed
+    // triangles an index and sorts it), and placement, in the worker, builds the
+    // same order again from the index we send it: its raycasts' face indices
+    // count triangles in that order. So build it here, before anything names a
+    // triangle, and hand everything that does (the overhang scan's region
+    // triangles, the support blockers) the triangles in that order. Without it
+    // the overhang grid sampled surface on the wrong triangles, landing contacts
+    // anywhere up a lattice, and the blockers blocked the wrong ones (NDFM-22).
+    initializeBVH();
     accelerateGeometry(geometry);
+    const facePositions = positionsInFaceOrder(geometry);
     const box = geometry.boundingBox!;
     const build = job.printer.buildVolumeMm;
     if (box.max.x - box.min.x > build.width || box.max.y - box.min.y > build.depth) {
@@ -609,19 +677,45 @@ async function main(): Promise<void> {
     // Mesh minima (the third family) are not available headless.
     const selfSupportAngleDeg = options.settings.overhangSelfSupportAngleDeg
         ?? createDefaultSettings().autoSupport.overhangSelfSupportAngleDeg;
-    let overhangIslands: DetectedIsland[] = [];
+    let overhangRegions: OverhangRegion[] | null = null;
     if (!options.overhangs) {
         // Asked for: self-supporting shapes (lattices) whose saddles read as overhangs.
     } else if (options.tools) {
-        overhangIslands = await time('overhangs_ms', () => scanOverhangs(
+        overhangRegions = await time('overhangs_ms', () => scanOverhangs(
             options.tools!,
-            geometry.getAttribute('position').array as Float32Array,
+            facePositions,
             selfSupportAngleDeg,
             options.raft !== 'off',
         ));
     } else {
         warnings.push('no --tools: overhang regions were not scanned, so shallow slopes get no supports');
     }
+    // The overhang band (NDFM-22), measured from the model's own base like the cap.
+    // Regions are cut at its top before they become islands, so the voxel
+    // islands they no longer cover come back in the merge below.
+    const bandTopZ = options.overhangMaxHeightMm !== null ? box.min.z + options.overhangMaxHeightMm : null;
+    const bandReport = bandTopZ !== null && overhangRegions ? {
+        overhang_max_height_mm: options.overhangMaxHeightMm,
+        band_top_plate_z_mm: bandTopZ,
+        regions_scanned: overhangRegions.length,
+        regions_clipped: 0,
+        regions_dropped: 0,
+        voxel_islands_above_band: [] as string[],
+        highest_overhang_contact_mm: null as number | null,
+        overhang_contacts_above_band: 0,
+    } : null;
+    if (bandTopZ !== null && !overhangRegions) {
+        warnings.push('--overhang-max-height has no effect: the overhang family was not run');
+    }
+    if (bandReport && overhangRegions) {
+        overhangRegions = overhangRegions.flatMap((region) => {
+            const clipped = clipOverhangRegion(region, bandTopZ!, facePositions);
+            if (!clipped) bandReport.regions_dropped++;
+            else if (clipped !== region) bandReport.regions_clipped++;
+            return clipped ? [clipped] : [];
+        });
+    }
+    const overhangIslands = (overhangRegions ?? []).map(overhangRegionToIsland);
     const classified = classifyIntersection(voxelIslands, [], { xyToleranceMm: 0.5, zBandMm: layerHeightMm });
     const islands = mergeOverhangRegions(classified.islands, overhangIslands);
 
@@ -692,10 +786,15 @@ async function main(): Promise<void> {
     if (aboveCap.length > 0) {
         warnings.push(`${aboveCap.length} of ${islands.length} islands lie above the height cap (${options.maxSupportHeightMm} mm above the model's base) and were not supported`);
     }
+    if (bandReport) {
+        bandReport.voxel_islands_above_band = placed
+            .filter((island) => island.source !== 'overhang' && island.contact.z > bandTopZ!)
+            .map((island) => island.id);
+    }
     // Removal counters for every zone, holes first, in `allZones` order.
     const counters: { contacts_removed: number; supports_removed: number; lost_coverage: string[] }[] = capReport ? [...keepOutReport, capReport] : keepOutReport;
     if (allZones.length > 0) {
-        const blocked = triangleIndicesInZones(geometry.getAttribute('position').array as Float32Array, allZones);
+        const blocked = triangleIndicesInZones(facePositions, allZones);
         if (capReport) capReport.blocked_triangles = blocked.perZone[zones.length];
         blocked.perZone.slice(0, zones.length).forEach((count, k) => {
             keepOutReport[k].blocked_triangles = count;
@@ -802,6 +901,16 @@ async function main(): Promise<void> {
             dangling_removed: danglingRemoved.length,
             residual_in_zone: residual,
         };
+    }
+    if (bandReport) {
+        // The check: no overhang support's contact above the band, give or take
+        // a triangle straddling its top.
+        const heights = overhangContactHeights();
+        bandReport.highest_overhang_contact_mm = heights.length > 0 ? Math.max(...heights) - box.min.z : null;
+        bandReport.overhang_contacts_above_band = heights.filter((z) => z > bandTopZ! + OVERHANG_BAND_SLACK_MM).length;
+        if (bandReport.overhang_contacts_above_band > 0) {
+            warnings.push(`${bandReport.overhang_contacts_above_band} overhang support contact(s) landed more than ${OVERHANG_BAND_SLACK_MM} mm above the overhang band (${options.overhangMaxHeightMm} mm above the model's base)`);
+        }
     }
     const committed = countCommitted();
     const analytics = plan.analytics;
@@ -986,6 +1095,7 @@ async function main(): Promise<void> {
         job_dir: options.jobDir,
         keep_out: options.keepOut ? { source: options.keepOut, holes: keepOutReport, ...removalTotals } : null,
         height_cap: capReport ? { ...capReport, ...removalTotals } : null,
+        overhang_band: bandReport,
         clearance,
         islands_detected: islands.length,
         islands_internal: internalIds.size,
