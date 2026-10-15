@@ -9,8 +9,10 @@
 //! rasteriser: no display or GPU needed.
 
 mod drain;
+mod grid;
 mod ops;
 mod render;
+mod vent;
 
 #[allow(dead_code, clippy::all)]
 mod overhang {
@@ -72,9 +74,9 @@ enum Command {
             required_unless_present = "auto_drain"
         )]
         holes: Option<String>,
-        /// Place a suction-relief hole through the floor and a vent through the roof of
-        /// every cavity (vertical, along the down axis), falling back to a horizontal
-        /// pair where there is no clear vertical path.
+        /// Place a suction-relief drain through the floor at the lowest point and a vent
+        /// at the highest point of every cavity (the drain vertical, along the down axis),
+        /// falling back to a horizontal drain where there is no clear vertical path.
         #[arg(long)]
         auto_drain: bool,
         /// Which way is down, towards the build plate: -z (default), +z, -x, +x, -y, +y.
@@ -93,6 +95,18 @@ enum Command {
         /// Hole radius in mm, for --auto-drain and holes without their own (the app's default is 2.0).
         #[arg(long, default_value_t = ops::DEFAULT_HOLE_RADIUS_MM)]
         radius_mm: f32,
+        /// How the vent leaves the top of each cavity: `shortest` (the shortest straight
+        /// route that keeps clear of the surface until its exit, in any upward or
+        /// sideways direction) or `vertical` (straight up through a flat roof).
+        #[arg(long, default_value = "shortest", requires = "auto_drain")]
+        vent_route: String,
+        /// Prefer suction-relief positions at least radius + this (mm) across from the
+        /// model's lowest skin, where the first supports land; 0 turns it off.
+        #[arg(long, default_value_t = 3.0, requires = "auto_drain")]
+        lowest_clearance_mm: f32,
+        /// The resin is clear or translucent: warn about holes under 3 mm across, not 2.
+        #[arg(long)]
+        clear_resin: bool,
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
@@ -361,16 +375,26 @@ fn write_outputs(
     Ok(())
 }
 
-fn punch_cmd(
-    input: &Path,
-    output: &Path,
-    holes_arg: Option<&str>,
+struct PunchArgs<'a> {
+    holes: Option<&'a str>,
     auto_drain: bool,
-    down_axis: &str,
-    xy: Option<&[f32]>,
+    down_axis: &'a str,
+    xy: Option<&'a [f32]>,
     radius_mm: f32,
-    as_json: bool,
-) -> Result<(), String> {
+    vent_route: &'a str,
+    lowest_clearance_mm: f32,
+    clear_resin: bool,
+}
+
+fn punch_cmd(input: &Path, output: &Path, args: &PunchArgs, as_json: bool) -> Result<(), String> {
+    let PunchArgs {
+        holes: holes_arg,
+        auto_drain,
+        down_axis,
+        xy,
+        radius_mm,
+        ..
+    } = *args;
     let total = Instant::now();
     if radius_mm <= 0.0 {
         return Err("hole radius must be positive".into());
@@ -384,10 +408,15 @@ fn punch_cmd(
 
     let mut warnings: Vec<String> = Vec::new();
     let mut cavities_found = before.cavities;
-    let placed: Vec<PlacedHole> = if auto_drain {
-        let axis = drain::Axis::parse(down_axis)?;
-        let xy = xy.map(|v| [v[0], v[1]]);
-        let found = drain::auto_drain_holes(&mesh, radius_mm, axis, xy)?;
+    let mut placed: Vec<PlacedHole> = if auto_drain {
+        let opts = drain::DrainOptions {
+            radius_mm,
+            axis: drain::Axis::parse(down_axis)?,
+            xy: xy.map(|v| [v[0], v[1]]),
+            vent: drain::VentRoute::parse(args.vent_route)?,
+            lowest_clearance_mm: args.lowest_clearance_mm.max(0.0),
+        };
+        let found = drain::auto_drain_holes(&mesh, &opts)?;
         cavities_found = found.cavities;
         warnings.extend(found.warnings);
         found.holes
@@ -400,6 +429,14 @@ fn punch_cmd(
     if placed.is_empty() {
         return Err("no holes to punch".into());
     }
+    let t = Instant::now();
+    let openings = drain::openings(&mesh, &placed);
+    for o in &openings {
+        for &i in &o.holes {
+            placed[i].cavity.get_or_insert(o.cavity);
+        }
+    }
+    analyse_ms += ms(t);
 
     let t = Instant::now();
     let outcome = ops::punch(mesh.clone(), &placed);
@@ -416,7 +453,8 @@ fn punch_cmd(
     let write_ms = ms(t);
 
     warnings.extend(ops::punch_warnings(&before, &after));
-    warnings.extend(drain::hole_warnings(&placed, &checks));
+    warnings.extend(drain::hole_warnings(&placed, &checks, args.clear_resin));
+    warnings.extend(drain::opening_warnings(&openings));
 
     let saved = before.volume_ml - after.volume_ml;
     let report = json!({
@@ -426,6 +464,7 @@ fn punch_cmd(
         "cavities_found": cavities_found,
         "holes": placed,
         "hole_checks": checks,
+        "openings": openings,
         "holes_sidecar": sidecar,
         "before": before,
         "after": after,
@@ -484,15 +523,23 @@ fn main() {
             down_axis,
             xy,
             radius_mm,
+            vent_route,
+            lowest_clearance_mm,
+            clear_resin,
             json,
         } => punch_cmd(
             &input,
             &output,
-            holes.as_deref(),
-            auto_drain,
-            &down_axis,
-            xy.as_deref(),
-            radius_mm,
+            &PunchArgs {
+                holes: holes.as_deref(),
+                auto_drain,
+                down_axis: &down_axis,
+                xy: xy.as_deref(),
+                radius_mm,
+                vent_route: &vent_route,
+                lowest_clearance_mm,
+                clear_resin,
+            },
             json,
         ),
         Command::Overhangs {

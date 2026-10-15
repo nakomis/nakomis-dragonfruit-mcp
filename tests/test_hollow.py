@@ -73,6 +73,7 @@ PUNCH_REPORT = {
         }
     ],
     "hole_checks": [HOLE_CHECK],
+    "openings": [{"cavity": 1, "volume_ml": 0.48, "holes": [0]}],
     "timing_ms": {"load": 1.0, "punch": 2.0, "total": 3.0},
     "warnings": [],
 }
@@ -160,8 +161,39 @@ def test_drill_auto_drain(bin_dir, stl):
     assert "--auto-drain" in recorded
     assert "--radius-mm 1.5" in recorded
     assert "--down-axis -z" in recorded
+    assert "--vent-route shortest" in recorded
+    assert "--lowest-clearance-mm 3" in recorded
+    assert "--clear-resin" not in recorded
     assert "--xy" not in recorded
     assert "--holes" not in recorded
+    assert result.openings[0].cavity == 1
+    assert result.openings[0].holes == [0]
+
+
+def test_drill_vent_route_clearance_and_clear_resin_are_passed(bin_dir, stl):
+    args = _fake_tools(bin_dir, _punch_report(stl))
+    hollow_tools.drill_holes(
+        stl, auto_drain=True, vent_route="vertical", lowest_clearance_mm=-1, clear_resin=True
+    )
+    recorded = args.read_text()
+    assert "--vent-route vertical" in recorded
+    # A negative clearance is no clearance.
+    assert "--lowest-clearance-mm 0" in recorded
+    assert "--clear-resin" in recorded
+
+
+def test_drill_clear_resin_applies_to_explicit_holes_too(bin_dir, stl):
+    args = _fake_tools(bin_dir, _punch_report(stl))
+    hollow_tools.drill_holes(stl, holes=[{"x": 0, "y": 0, "z": 0}], clear_resin=True)
+    recorded = args.read_text()
+    assert "--clear-resin" in recorded
+    assert "--vent-route" not in recorded
+
+
+def test_drill_unknown_vent_route_is_refused(bin_dir, stl):
+    _fake_tools(bin_dir, _punch_report(stl))
+    with pytest.raises(cli.CliError, match="vent_route"):
+        hollow_tools.drill_holes(stl, auto_drain=True, vent_route="sideways")
 
 
 def test_drill_xy_and_down_axis_are_passed(bin_dir, stl):
@@ -300,7 +332,9 @@ def test_real_binary_hollow_then_drill_a_cube(tmp_path):
     drilled = hollow_tools.drill_holes(hollowed.output_path, auto_drain=True, radius_mm=1.5)
     assert drilled.drains
     assert len(drilled.holes) == 2 * drilled.cavities_found == 2
+    # The shortest clear route out of a cube's flat roof is straight up through it.
     assert sorted(h.axis for h in drilled.holes) == ["+z", "-z"]
+    assert [o.holes for o in drilled.openings] == [[0, 1]]
     assert drilled.after.watertight
     assert drilled.warnings == []
     # A flat cube cavity needs no extension, and the holes open at full width.
@@ -327,11 +361,11 @@ def test_real_binary_on_the_test_model(tmp_path):
     assert hollowed.solid_volume_ml == pytest.approx(47.13, abs=0.05)
     assert 14 < hollowed.hollow_volume_ml < 22
     assert hollowed.after.watertight
-    drilled = hollow_tools.drill_holes(tmp_path / "h.stl", auto_drain=True)
+    drilled = hollow_tools.drill_holes(tmp_path / "h.stl", auto_drain=True, vent_route="vertical")
     assert drilled.drains
     assert drilled.after.watertight
     assert len(drilled.holes) == 2 * drilled.cavities_found
-    # Out through the base and the crown, never the visible cut face (-Y).
+    # Vertical: out through the base and the crown, never the visible cut face (-Y).
     assert sorted(h.axis for h in drilled.holes) == ["+z", "-z"]
     assert {h.purpose for h in drilled.holes} == {"suction relief", "vent"}
     # The crown is a dome narrowing to an apex: the vent must start inside the cavity.
@@ -349,3 +383,62 @@ def test_tools_are_registered_with_the_server():
 
     names = {t.name for t in asyncio.run(mcp.list_tools())}
     assert {"hollow", "drill_holes"} <= names
+
+
+def _write_stl(path: Path, triangles: list[tuple[tuple[float, float, float], ...]]) -> None:
+    import struct
+
+    with path.open("wb") as f:
+        f.write(b"\0" * 80 + struct.pack("<I", len(triangles)))
+        for tri in triangles:
+            f.write(struct.pack("<3f", 0, 0, 0))
+            for p in tri:
+                f.write(struct.pack("<3f", *p))
+            f.write(b"\0\0")
+
+
+def _box(lo, hi, inward=False):
+    """The 12 triangles of an axis-aligned box, outward-facing (or inward, a cavity)."""
+    corner = [
+        (hi[0] if i & 1 else lo[0], hi[1] if i & 2 else lo[1], hi[2] if i & 4 else lo[2])
+        for i in range(8)
+    ]
+    faces = [
+        (0, 2, 3, 1), (4, 5, 7, 6), (0, 1, 5, 4), (2, 6, 7, 3), (0, 4, 6, 2), (1, 3, 7, 5),
+    ]  # fmt: skip
+    tris = []
+    for a, b, c, d in faces:
+        for t in ((a, b, c), (a, c, d)):
+            tris.append(tuple(corner[i] for i in (reversed(t) if inward else t)))
+    return tris
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not _tools_available(), reason="dragonfruit-mcp-tools not built (run scripts/build.sh)"
+)
+def test_real_binary_vents_by_the_shortest_route_and_reports_openings(tmp_path):
+    # A 40 mm cube with a cavity 4 mm from its -x face and 8 mm under its roof.
+    model = tmp_path / "box.stl"
+    _write_stl(model, _box((0, 0, 0), (40, 40, 40)) + _box((4, 10, 6), (20, 30, 32), True))
+    drilled = hollow_tools.drill_holes(model, auto_drain=True, radius_mm=1.5)
+    assert drilled.drains, drilled.warnings
+    relief, vent = drilled.holes
+    assert (relief.purpose, relief.axis) == ("suction relief", "-z")
+    assert (vent.purpose, vent.axis) == ("vent", "-x")
+    assert vent.length_mm < 8
+    assert all(c.checked and c.exits_skin for c in drilled.hole_checks)
+    assert [o.holes for o in drilled.openings] == [[0, 1]]
+    assert drilled.warnings == []
+
+    # One small hole by hand: too small for clear resin, and the only opening.
+    one = hollow_tools.drill_holes(
+        model,
+        holes=[{"x": 12, "y": 20, "z": 6.3, "radius": 1.25, "direction": [0, 0, -1]}],
+        out_path=tmp_path / "one.stl",
+        clear_resin=True,
+    )
+    assert one.drains
+    assert one.holes[0].cavity == one.openings[0].cavity
+    assert any("only one opening" in w for w in one.warnings), one.warnings
+    assert any("clear or translucent" in w for w in one.warnings), one.warnings
