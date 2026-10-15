@@ -29,6 +29,8 @@ SCRIPT = cli.REPO_ROOT / "ts" / "autosupport-slice.ts"
 # Placement and island detection take seconds; slicing a tall part at 50 µm
 # takes minutes on an old machine.
 TIMEOUT_S = 45 * 60
+# Support surface closer than this to the model is reported (ts/support-zones.ts).
+DEFAULT_MIN_CLEARANCE_MM = 0.3
 
 _REQUIRED_KEYS = {
     "islands",
@@ -134,6 +136,58 @@ class KeepOut(BaseModel):
     )
 
 
+class HeightCap(BaseModel):
+    """What the height cap did to the supports (NDFM-28)."""
+
+    max_support_height_mm: float = Field(description="The cap, above the model's own base")
+    cap_plate_z_mm: float = Field(description="The same height in the plate frame")
+    blocked_triangles: int = Field(
+        description="Model triangles reaching above the cap, refused as contacts"
+    )
+    islands_above_cap: list[str] = Field(
+        description="Islands whose contact lies above the cap, left unsupported"
+    )
+    contacts_removed: int = Field(
+        description="Supports removed after placement for a contact above the cap"
+    )
+    supports_removed: int = Field(
+        description="Supports removed after placement for a contact or shaft above the cap"
+    )
+    lost_coverage: list[str] = Field(description="Islands left with no support by the removals")
+    entities_before: int = Field(default=0, description="Support entities before any removal")
+    entities_after: int = Field(default=0, description="Support entities in the print")
+    entities_removed_total: int = Field(
+        default=0,
+        description="Everything removed by the cap and any keep-out holes together, "
+        "dependants and dangling shafts included",
+    )
+    dangling_removed: int = 0
+    residual_in_zone: int = Field(
+        default=0, description="Supports still above the cap or in a hole's zone (should be 0)"
+    )
+
+
+class Graze(BaseModel):
+    """A support passing the model too closely, which clear resin can fuse (NDFM-28)."""
+
+    gap_mm: float = Field(description="Smallest gap between support and model surface")
+    at_plate_mm: list[float] = Field(description="Where that gap is, on the support, plate frame")
+    height_above_base_mm: float = Field(description="Its height above the model's base")
+    z_range_mm: list[float] = Field(
+        description="Lowest and highest close points, plate frame: how far it runs alongside"
+    )
+    samples: int
+
+
+class Clearance(BaseModel):
+    min_clearance_mm: float = Field(description="Gaps smaller than this were reported")
+    tip_allowance_mm: float = Field(
+        description="Support surface this close to a contact point is its tip, and not checked"
+    )
+    samples_checked: int
+    grazes: list[Graze] = Field(description="Worst first")
+
+
 class SupportedSlice(ToolResult):
     output_path: str = Field(description="The sliced print, supports and raft included")
     format: str
@@ -192,6 +246,12 @@ class SupportedSlice(ToolResult):
     )
     keep_out: KeepOut | None = Field(
         default=None, description="Present when holes were kept clear of supports"
+    )
+    height_cap: HeightCap | None = Field(
+        default=None, description="Present when max_support_height_mm was set"
+    )
+    clearance: Clearance | None = Field(
+        default=None, description="Supports that pass the model too closely (min_clearance_mm)"
     )
     previews_written: bool = Field(
         default=False,
@@ -296,6 +356,8 @@ async def auto_support_and_slice(
     keep_out_holes: bool = True,
     holes: list[dict[str, Any]] | None = None,
     support_internal_islands: bool = False,
+    max_support_height_mm: float | None = None,
+    min_clearance_mm: float = DEFAULT_MIN_CLEARANCE_MM,
     options: dict[str, Any] | None = None,
     previews: bool = True,
 ) -> SupportedSlice:
@@ -349,6 +411,24 @@ async def auto_support_and_slice(
     a trunk routed up through the drain hole); `support_internal_islands=True`
     supports them anyway. `islands_internal_skipped` counts them.
 
+    Height cap: `max_support_height_mm` puts no supports above that height over
+    the model's own base (whatever the lift). Islands above it are left to hold
+    themselves up, the surface above it takes no contacts, and any support
+    whose shaft still rises above it is removed with whatever hung off it (a
+    contact just under the cap keeps its tip, which can poke a fraction of a
+    millimetre above it).
+    `height_cap` in the result counts it. Use it to keep columns away from a
+    detailed top that needs none: on Chi, supports climbing to his ear tufts
+    ran a tenth of a millimetre from his face and tore his cheek off (NDFM-28).
+
+    Clearance: after placement, any support surface that comes within
+    `min_clearance_mm` (default 0.3; 0 turns the check off) of the model,
+    away from every contact tip and above the model's base, is reported in
+    `clearance.grazes` (gap, position, height, how far it runs alongside),
+    worst first, and the worst few are warned about. In clear resin such a gap
+    cures shut and the support prints fused to the model. Nothing is removed
+    for it: move the model, cap the supports or edit them.
+
     Outputs: the print at `out_path`, or beside the STL as
     `<name>-<printer>-supported<ext>`. The printer profile decides the format;
     an `out_path` with another extension is refused. Parent folders are
@@ -396,6 +476,8 @@ async def auto_support_and_slice(
         keep_out_holes=keep_out_holes,
         holes=holes,
         support_internal_islands=support_internal_islands,
+        max_support_height_mm=max_support_height_mm,
+        min_clearance_mm=min_clearance_mm,
         options=options,
         previews=previews,
     )
@@ -423,6 +505,8 @@ def run_auto_support_and_slice(
     keep_out_holes: bool = True,
     holes: list[dict[str, Any]] | None = None,
     support_internal_islands: bool = False,
+    max_support_height_mm: float | None = None,
+    min_clearance_mm: float = DEFAULT_MIN_CLEARANCE_MM,
     options: dict[str, Any] | None = None,
     previews: bool = True,
 ) -> SupportedSlice:
@@ -439,6 +523,12 @@ def run_auto_support_and_slice(
     if overhang_angle_deg is not None and not 20 <= overhang_angle_deg <= 75:
         # The app's own range (AUTO_SUPPORT_CONSTRAINTS); it would clamp silently.
         raise ValueError("overhang_angle_deg must be between 20 and 75 (the app's range)")
+    if max_support_height_mm is not None and not (
+        math.isfinite(max_support_height_mm) and max_support_height_mm > 0
+    ):
+        raise ValueError("max_support_height_mm must be a positive number of mm")
+    if not (math.isfinite(min_clearance_mm) and min_clearance_mm >= 0):
+        raise ValueError("min_clearance_mm must be 0 (off) or more")
     if aa_preset is not None and aa_preset not in slicing.AA_PRESETS:
         raise ValueError(f"aa_preset must be one of {', '.join(slicing.AA_PRESETS)}")
     material_path = None
@@ -518,6 +608,9 @@ def run_auto_support_and_slice(
             args += ["--settings", json.dumps(settings, separators=(",", ":"))]
         if support_internal_islands:
             args.append("--support-internal-islands")
+        if max_support_height_mm is not None:
+            args += ["--max-support-height", f"{max_support_height_mm:g}"]
+        args += ["--min-clearance", f"{min_clearance_mm:g}"]
         if zones:
             # In the STL's frame: the script moves them with the model onto the plate.
             keep_out_file = Path(tmp) / "holes.json"
@@ -583,6 +676,8 @@ def run_auto_support_and_slice(
             "supports_by_type": data["placed_by_type"],
             "contacts": data["contacts"],
             "islands_uncovered": data.get("islands_uncovered", 0),
+            "max_support_height_mm": max_support_height_mm,
+            "grazes": len((data.get("clearance") or {}).get("grazes", [])),
             "supported_stl": data.get("supported_stl") if export_supported_stl else None,
         }
         sidecar = slicing.write_sidecar(
@@ -637,6 +732,8 @@ def run_auto_support_and_slice(
                 if data.get("keep_out")
                 else None
             ),
+            height_cap=HeightCap(**data["height_cap"]) if data.get("height_cap") else None,
+            clearance=Clearance(**data["clearance"]) if data.get("clearance") else None,
             timings_ms=data["timings_ms"],
             previews_written=previews_written,
             warnings=warnings,

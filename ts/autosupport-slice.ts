@@ -39,7 +39,8 @@
  *     --printer-json <profile.json> [--material <material.json>] [--layer-height N]
  *     [--aa-preset sharp|balanced|smooth|raw] [--lift-mm 7] [--density 1] [--raft solid|line|off]
  *     [--settings <json>] [--coarse-islands] [--no-overhangs] [--px-mm 0.05] [--supported-stl <out.stl>] [--plate-stl <out.stl>] [--job-dir <dir>]
- *     [--keep-out <holes.json>] [--support-internal-islands] [--probe-points <json>] [--no-slice] [--verbose]
+ *     [--keep-out <holes.json>] [--max-support-height <mm>] [--min-clearance <mm>]
+ *     [--support-internal-islands] [--probe-points <json>] [--no-slice] [--verbose]
  *
  * `--supported-stl` writes model, supports and raft as sliced; `--plate-stl` the
  * model alone in the same plate frame (centred, lifted), to line up with a layer.
@@ -63,6 +64,16 @@
  * with `removeSupportEntity`, which takes its dependants with it, and shafts
  * left holding nothing are removed in turn. The summary's `keep_out` section
  * counts all of it, per hole.
+ *
+ * `--max-support-height` caps supports at that height above the model's own
+ * base (NDFM-28): islands above it are not supported, the model surface above
+ * it is blocked like a keep-out zone, and any support whose contact or shaft
+ * still rises above it is removed the same way. The summary's `height_cap`
+ * section counts it. `--min-clearance` (default 0.3 mm; 0 turns it off) is the
+ * clearance check: support surface that comes closer than that to the model,
+ * away from every contact tip, is reported in `clearance.grazes` and warned
+ * about, worst first. In clear resin such a gap cures shut and the support
+ * prints fused to the model. Nothing is removed for it.
  *
  * Islands whose contact faces a sealed cavity are skipped before placement
  * (hollow interiors are not supported in normal resin practice, and the only
@@ -109,6 +120,8 @@ import {
     setActivePrinterProfile,
 } from '@/features/profiles/profileStore';
 import { buildSupportAndRaftWorldTriangles } from '@/features/slicing/rasterLayerZipExport';
+
+import { DEFAULT_MIN_CLEARANCE_MM, findGrazes, HeightCapZone, KeepOutZone, parseHoles, triangleIndicesInZones, type ClearanceReport, type Zone } from './support-zones';
 import { resolveSliceLayerCount, resolveSliceRasterSettings } from '@/features/slicing/sliceJobAssembly';
 import { resolveSliceJobAntiAliasing } from '@/features/slicing/sliceAntiAliasing';
 import type { PlateFootprintSource } from '@/supports/Rafts/Crenelated/geometry/modelPlateFootprint';
@@ -160,6 +173,10 @@ interface Options {
     plateStl: string | null;
     jobDir: string | null;
     keepOut: string | null;
+    /** Supports only up to this height above the model's base, mm (NDFM-28). */
+    maxSupportHeightMm: number | null;
+    /** Report supports passing closer than this to the model; 0 turns the check off. */
+    minClearanceMm: number;
     supportInternalIslands: boolean;
     probePoints: number[][] | null;
     slice: boolean;
@@ -187,6 +204,8 @@ function parseArgs(argv: string[]): Options {
         plateStl: null,
         jobDir: null,
         keepOut: null,
+        maxSupportHeightMm: null,
+        minClearanceMm: DEFAULT_MIN_CLEARANCE_MM,
         supportInternalIslands: false,
         probePoints: null,
         slice: true,
@@ -224,6 +243,8 @@ function parseArgs(argv: string[]): Options {
         else if (arg === '--plate-stl') options.plateStl = resolve(value());
         else if (arg === '--job-dir') options.jobDir = resolve(value());
         else if (arg === '--keep-out') options.keepOut = resolve(value());
+        else if (arg === '--max-support-height') options.maxSupportHeightMm = number();
+        else if (arg === '--min-clearance') options.minClearanceMm = number();
         else if (arg === '--support-internal-islands') options.supportInternalIslands = true;
         else if (arg === '--probe-points') options.probePoints = JSON.parse(value()) as number[][];
         else if (arg === '--no-slice') options.slice = false;
@@ -236,6 +257,8 @@ function parseArgs(argv: string[]): Options {
     if (!['solid', 'line', 'off'].includes(options.raft)) throw new Error('--raft must be solid, line or off');
     if (options.liftMm < 0) throw new Error('--lift-mm must not be negative');
     if (options.density <= 0) throw new Error('--density must be positive');
+    if (options.maxSupportHeightMm !== null && options.maxSupportHeightMm <= 0) throw new Error('--max-support-height must be positive');
+    if (options.minClearanceMm < 0) throw new Error('--min-clearance must not be negative');
     return options;
 }
 
@@ -323,124 +346,6 @@ function countCommitted(): { byType: Record<string, number>; contacts: number; r
         }
     }
     return { byType, contacts, roots: Object.keys(state.roots ?? {}).length };
-}
-
-/** Margin round a hole's opening that supports must keep clear of, mm. */
-const KEEP_OUT_MARGIN_MM = 1;
-/**
- * The zone is anchored on the hole's exit through the skin, E = start + dir *
- * length_mm: it reaches this far back along the bore (into the wall and the
- * cavity side of it) and this far past E (outside the part). A hole's start may
- * lie well inside a cavity, so the zone never reaches further in than that, and
- * never further than KEEP_OUT_BEHIND_START_MM behind the start itself.
- */
-const KEEP_OUT_INWARD_OF_EXIT_MM = 4;
-const KEEP_OUT_OUTWARD_OF_EXIT_MM = 3;
-const KEEP_OUT_BEHIND_START_MM = 2;
-
-interface HoleSpec {
-    x: number;
-    y: number;
-    z: number;
-    radius_mm: number;
-    direction: [number, number, number];
-    /** From the start point, along `direction`, to where the bore leaves the skin. */
-    length_mm: number;
-    purpose?: string;
-}
-
-/** A hole's keep-out cylinder in the plate frame. */
-class KeepOutZone {
-    readonly start: THREE.Vector3;
-    readonly dir: THREE.Vector3;
-    readonly exit: THREE.Vector3;
-    /** The cylinder runs from `t = tMin` to `t = tMax` along `dir` from `start`. */
-    readonly tMin: number;
-    readonly tMax: number;
-    readonly radius: number;
-    /** Bounding box of the whole cylinder, for cheap rejection. */
-    readonly box: THREE.Box3;
-
-    constructor(readonly index: number, readonly spec: HoleSpec, shift: THREE.Vector3) {
-        this.start = new THREE.Vector3(spec.x, spec.y, spec.z).add(shift);
-        this.dir = new THREE.Vector3(...spec.direction).normalize();
-        this.exit = this.start.clone().addScaledVector(this.dir, spec.length_mm);
-        this.tMin = Math.max(-KEEP_OUT_BEHIND_START_MM, spec.length_mm - KEEP_OUT_INWARD_OF_EXIT_MM);
-        this.tMax = spec.length_mm + KEEP_OUT_OUTWARD_OF_EXIT_MM;
-        this.radius = spec.radius_mm + KEEP_OUT_MARGIN_MM;
-        this.box = new THREE.Box3()
-            .setFromPoints([this.start.clone().addScaledVector(this.dir, this.tMin), this.start.clone().addScaledVector(this.dir, this.tMax)])
-            .expandByScalar(this.radius);
-    }
-
-    contains(x: number, y: number, z: number): boolean {
-        const dx = x - this.start.x;
-        const dy = y - this.start.y;
-        const dz = z - this.start.z;
-        const t = dx * this.dir.x + dy * this.dir.y + dz * this.dir.z;
-        if (t < this.tMin || t > this.tMax) return false;
-        const px = dx - t * this.dir.x;
-        const py = dy - t * this.dir.y;
-        const pz = dz - t * this.dir.z;
-        return px * px + py * py + pz * pz <= this.radius * this.radius;
-    }
-
-    /** Whether the straight run a to b enters the cylinder (sampled at most ~0.25 mm apart). */
-    touchesSegment(a: THREE.Vector3, b: THREE.Vector3): boolean {
-        const steps = Math.max(1, Math.ceil(a.distanceTo(b) / 0.25));
-        for (let i = 0; i <= steps; i++) {
-            const f = i / steps;
-            if (this.contains(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.z + (b.z - a.z) * f)) return true;
-        }
-        return false;
-    }
-}
-
-function parseHoles(path: string): HoleSpec[] {
-    const raw = JSON.parse(readFileSync(path, 'utf-8')) as { holes?: unknown };
-    if (!raw || !Array.isArray(raw.holes)) throw new Error(`${path}: expected {"holes": [...]}`);
-    return raw.holes.map((entry, i) => {
-        const h = entry as Partial<HoleSpec>;
-        const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
-        if (!finite(h.x) || !finite(h.y) || !finite(h.z) || !finite(h.radius_mm) || h.radius_mm <= 0
-            || !finite(h.length_mm) || !Array.isArray(h.direction) || h.direction.length !== 3 || !h.direction.every(finite)
-            || Math.hypot(...(h.direction as number[])) === 0) {
-            throw new Error(`${path}: hole ${i} needs numeric x, y, z, radius_mm > 0, length_mm and a non-zero direction [dx, dy, dz]`);
-        }
-        return h as HoleSpec;
-    });
-}
-
-/**
- * Indices of the model triangles that touch any zone: a vertex, an edge
- * crossing it, or the centroid. Per-zone counts, then the union. A triangle
- * whose bounding box misses a zone's is rejected before any sampling.
- */
-function triangleIndicesInZones(positions: Float32Array, zones: KeepOutZone[]): { perZone: number[]; all: Set<number> } {
-    const perZone = zones.map(() => 0);
-    const all = new Set<number>();
-    const a = new THREE.Vector3();
-    const b = new THREE.Vector3();
-    const c = new THREE.Vector3();
-    const centroid = new THREE.Vector3();
-    const box = new THREE.Box3();
-    for (let t = 0; t < positions.length / 9; t++) {
-        a.fromArray(positions, t * 9);
-        b.fromArray(positions, t * 9 + 3);
-        c.fromArray(positions, t * 9 + 6);
-        box.makeEmpty().expandByPoint(a).expandByPoint(b).expandByPoint(c);
-        centroid.copy(a).add(b).add(c).divideScalar(3);
-        zones.forEach((zone, k) => {
-            if (!zone.box.intersectsBox(box)) return;
-            if (zone.contains(a.x, a.y, a.z) || zone.contains(b.x, b.y, b.z) || zone.contains(c.x, c.y, c.z)
-                || zone.contains(centroid.x, centroid.y, centroid.z)
-                || zone.touchesSegment(a, b) || zone.touchesSegment(b, c) || zone.touchesSegment(c, a)) {
-                perZone[k]++;
-                all.add(t);
-            }
-        });
-    }
-    return { perZone, all };
 }
 
 /** Directions probed from a point to tell a cavity from open air: the 26 neighbours of a cube. */
@@ -663,6 +568,9 @@ async function main(): Promise<void> {
 
     // Keep-out zones: the holes come in the STL's frame, the model now sits in the plate's.
     const zones = options.keepOut ? parseHoles(options.keepOut).map((spec, i) => new KeepOutZone(i, spec, plateShift)) : [];
+    // The height cap is measured from the model's own base, whatever the lift.
+    const capZone = options.maxSupportHeightMm !== null ? new HeightCapZone(box.min.z + options.maxSupportHeightMm) : null;
+    const allZones: Zone[] = capZone ? [...zones, capZone] : zones;
     if (options.probePoints) {
         process.stdout.write(`${JSON.stringify({
             zones: zones.map((zone) => ({
@@ -746,7 +654,11 @@ async function main(): Promise<void> {
     // by default: the only way in is a trunk routed up through the drain hole.
     const internalIds = new Set(islands.filter((island) => isInternalContact(mesh, island.contact)).map((island) => island.id));
     const skippedInternal = options.supportInternalIslands ? [] : islands.filter((island) => internalIds.has(island.id));
-    const placed = options.supportInternalIslands ? islands : islands.filter((island) => !internalIds.has(island.id));
+    // Above the cap nothing is supported: such islands must hold themselves up (Chi's ear tufts did).
+    const aboveCap = capZone ? islands.filter((island) => capZone.contains(island.contact.x, island.contact.y, island.contact.z)) : [];
+    const aboveCapIds = new Set(aboveCap.map((island) => island.id));
+    const placed = (options.supportInternalIslands ? islands : islands.filter((island) => !internalIds.has(island.id)))
+        .filter((island) => !aboveCapIds.has(island.id));
     const tag = (island: DetectedIsland) => (internalIds.has(island.id) ? 'internal' : 'external');
     const describe = (island: DetectedIsland) => `${island.id} (${tag(island)} ${island.source}, contact ${island.contact.x.toFixed(1)}, ${island.contact.y.toFixed(1)}, ${island.contact.z.toFixed(1)})`;
     if (skippedInternal.length > 0) {
@@ -768,9 +680,24 @@ async function main(): Promise<void> {
         supports_removed: 0,
         lost_coverage: [] as string[],
     }));
-    if (zones.length > 0) {
-        const blocked = triangleIndicesInZones(geometry.getAttribute('position').array as Float32Array, zones);
-        blocked.perZone.forEach((count, k) => {
+    const capReport = capZone ? {
+        max_support_height_mm: options.maxSupportHeightMm,
+        cap_plate_z_mm: capZone.capZ,
+        blocked_triangles: 0,
+        islands_above_cap: aboveCap.map((island) => island.id),
+        contacts_removed: 0,
+        supports_removed: 0,
+        lost_coverage: [] as string[],
+    } : null;
+    if (aboveCap.length > 0) {
+        warnings.push(`${aboveCap.length} of ${islands.length} islands lie above the height cap (${options.maxSupportHeightMm} mm above the model's base) and were not supported`);
+    }
+    // Removal counters for every zone, holes first, in `allZones` order.
+    const counters: { contacts_removed: number; supports_removed: number; lost_coverage: string[] }[] = capReport ? [...keepOutReport, capReport] : keepOutReport;
+    if (allZones.length > 0) {
+        const blocked = triangleIndicesInZones(geometry.getAttribute('position').array as Float32Array, allZones);
+        if (capReport) capReport.blocked_triangles = blocked.perZone[zones.length];
+        blocked.perZone.slice(0, zones.length).forEach((count, k) => {
             keepOutReport[k].blocked_triangles = count;
             if (count === 0) warnings.push(`keep-out hole ${k}: no model surface lies within ${zones[k].radius} mm of its axis (does the holes file match this STL?)`);
         });
@@ -800,8 +727,8 @@ async function main(): Promise<void> {
     if (!plan) throw new Error(`auto-support produced no plan (${placed.length} islands)`);
     const result = commitAutoPlacePlan(plan);
     disposeHistory();
-    let keepOutTotals: Record<string, unknown> | null = null;
-    if (zones.length > 0) {
+    let removalTotals: Record<string, unknown> | null = null;
+    if (allZones.length > 0) {
         deleteSupportBlockers(modelId);
         const entitiesBefore = totalEntities();
         // Whatever still enters a zone: a contact the blockers missed or a shaft leaning in.
@@ -815,12 +742,12 @@ async function main(): Promise<void> {
         const before = new Map(placed.map((island) => [island.id, coverageNear(island, probes)]));
         const removedBy = new Map<string, Set<number>>();
         for (const probe of probes) {
-            zones.forEach((zone, k) => {
+            allZones.forEach((zone, k) => {
                 const contact = probe.contacts.some((q) => zone.contains(q.x, q.y, q.z));
                 const shaft = probe.runs.some(([p, q]) => zone.touchesSegment(p, q));
                 if (!contact && !shaft) return;
-                if (contact) keepOutReport[k].contacts_removed++;
-                keepOutReport[k].supports_removed++;
+                if (contact) counters[k].contacts_removed++;
+                counters[k].supports_removed++;
                 removedBy.set(probe.id, (removedBy.get(probe.id) ?? new Set<number>()).add(k));
             });
         }
@@ -849,25 +776,26 @@ async function main(): Promise<void> {
                     if (!removedBy.has(probe.id) || !probe.contacts.some((q) => q.distanceTo(where) <= reachOf(island))) continue;
                     removedBy.get(probe.id)!.forEach((k) => holes.add(k));
                 }
-                holes.forEach((k) => keepOutReport[k].lost_coverage.push(island.id));
-                warnings.push(`island ${describe(island)} lost all its supports to keep-out hole(s) ${[...holes].join(', ') || '?'}`);
+                holes.forEach((k) => counters[k].lost_coverage.push(island.id));
+                warnings.push(`island ${describe(island)} lost all its supports to ${[...holes].map((k) => allZones[k].label).join(', ') || '?'}`);
             } else {
                 // Never had a support: the blockers (or placement) left it bare. Name a hole if one is within reach.
                 const near = zoneNear(island);
                 if (near.length > 0) warnings.push(`island ${describe(island)} has no support within reach; keep-out hole(s) ${near.join(', ')} block the surface nearby`);
             }
         }
-        for (const [k, zone] of zones.entries()) {
-            const r = keepOutReport[k];
+        for (const [k, zone] of allZones.entries()) {
+            const r = counters[k];
             if (r.supports_removed > 0) {
-                warnings.push(`keep-out hole ${k}: removed ${r.supports_removed} support(s) (${r.contacts_removed} by contact, ${r.supports_removed - r.contacts_removed} by shaft) that entered ${zone.radius} mm of its axis`);
+                const where = zone instanceof KeepOutZone ? `entered ${zone.radius} mm of its axis` : 'rose above it';
+                warnings.push(`${zone.label}: removed ${r.supports_removed} support(s) (${r.contacts_removed} by contact, ${r.supports_removed - r.contacts_removed} by shaft) that ${where}`);
             }
         }
         // A last look at what is committed: nothing may be left inside any zone.
-        const residual = live.filter((probe) => zones.some((zone) => probe.contacts.some((q) => zone.contains(q.x, q.y, q.z))
+        const residual = live.filter((probe) => allZones.some((zone) => probe.contacts.some((q) => zone.contains(q.x, q.y, q.z))
             || probe.runs.some(([p, q]) => zone.touchesSegment(p, q)))).length;
-        if (residual > 0) warnings.push(`${residual} support(s) are still inside a keep-out zone after removal`);
-        keepOutTotals = {
+        if (residual > 0) warnings.push(`${residual} support(s) are still inside ${capZone ? "a keep-out zone or above the height cap" : "a keep-out zone"} after removal`);
+        removalTotals = {
             entities_before: entitiesBefore,
             entities_after: totalEntities(),
             entities_removed_total: entitiesBefore - totalEntities(),
@@ -914,6 +842,28 @@ async function main(): Promise<void> {
         offset += 9;
     }
     if (supportTriangles.length === 0 && committed.roots > 0) warnings.push('supports were placed but produced no triangles');
+
+    // Clearance (NDFM-28): supports that pass the model without touching it.
+    // On a clone, as building a BVH reorders the geometry's index.
+    const clearance: ClearanceReport = await time('clearance_ms', () => findGrazes(
+        geometry.clone(),
+        merged.subarray(modelPositions.length),
+        probeCommittedSupports().flatMap((probe) => probe.contacts),
+        { minClearanceMm: options.minClearanceMm },
+    ));
+    const GRAZE_WARNINGS = 5;
+    for (const graze of clearance.grazes.slice(0, GRAZE_WARNINGS)) {
+        const [x, y, z] = graze.at_plate_mm;
+        const run = graze.z_range_mm[1] - graze.z_range_mm[0];
+        warnings.push(
+            `a support passes ${graze.gap_mm.toFixed(2)} mm from the model ${graze.height_above_base_mm.toFixed(1)} mm above its base `
+            + `(plate ${x.toFixed(1)}, ${y.toFixed(1)}, ${z.toFixed(1)})${run >= 0.5 ? `, alongside for ${run.toFixed(1)} mm` : ''}: `
+            + `a gap under ${clearance.min_clearance_mm} mm can cure shut, fusing it to the surface`,
+        );
+    }
+    if (clearance.grazes.length > GRAZE_WARNINGS) {
+        warnings.push(`${clearance.grazes.length - GRAZE_WARNINGS} more support(s) pass within ${clearance.min_clearance_mm} mm of the model (see clearance.grazes)`);
+    }
 
     // The same check on what will actually be sliced, in case a support or the
     // raft ever does rise above the model.
@@ -1034,7 +984,9 @@ async function main(): Promise<void> {
         supported_stl: options.supportedStl,
         output: options.slice ? options.out : null,
         job_dir: options.jobDir,
-        keep_out: options.keepOut ? { source: options.keepOut, holes: keepOutReport, ...keepOutTotals } : null,
+        keep_out: options.keepOut ? { source: options.keepOut, holes: keepOutReport, ...removalTotals } : null,
+        height_cap: capReport ? { ...capReport, ...removalTotals } : null,
+        clearance,
         islands_detected: islands.length,
         islands_internal: internalIds.size,
         islands_internal_skipped: skippedInternal.length,

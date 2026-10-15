@@ -135,8 +135,11 @@ def test_default_arguments(fake_env, stl):
         "--coarse-islands",
         "--no-overhangs",
         "--settings",
+        "--max-support-height",
     ):
         assert flag not in args
+    # The clearance check is on by default (NDFM-28).
+    assert args[args.index("--min-clearance") + 1] == "0.3"
 
 
 def test_options_are_passed_through(fake_env, stl, tmp_path):
@@ -239,7 +242,18 @@ def test_missing_stl_and_material_raise(fake_env, stl, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "kwargs", [{"density": 0}, {"lift_mm": -1}, {"layer_height": 0}, {"aa_preset": "fuzzy"}]
+    "kwargs",
+    [
+        {"density": 0},
+        {"lift_mm": -1},
+        {"layer_height": 0},
+        {"aa_preset": "fuzzy"},
+        {"max_support_height_mm": 0},
+        {"max_support_height_mm": -5},
+        {"max_support_height_mm": float("nan")},
+        {"min_clearance_mm": -0.1},
+        {"min_clearance_mm": float("inf")},
+    ],
 )
 def test_bad_values_raise(fake_env, stl, kwargs):
     with pytest.raises(ValueError):
@@ -619,3 +633,70 @@ def test_real_keep_out_leaves_nothing_inside_the_bore(tmp_path):
     # at the support triangles that were exported: nothing inside the bore itself.
     assert totals["residual_in_zone"] == 0
     assert _support_triangles_in_bore(supported, data["model_triangles"], report, 2.0) == 0
+
+
+HEIGHT_CAP_RESULT = {
+    "max_support_height_mm": 33,
+    "cap_plate_z_mm": 40,
+    "blocked_triangles": 90123,
+    "islands_above_cap": ["voxel-3", "voxel-7"],
+    "contacts_removed": 4,
+    "supports_removed": 11,
+    "lost_coverage": [],
+    "entities_before": 601,
+    "entities_after": 470,
+    "entities_removed_total": 131,
+    "dangling_removed": 2,
+    "residual_in_zone": 0,
+}
+
+CLEARANCE_RESULT = {
+    "min_clearance_mm": 0.3,
+    "tip_allowance_mm": 3,
+    "samples_checked": 81234,
+    "grazes": [
+        {
+            "gap_mm": 0.07,
+            "at_plate_mm": [-15.2, 9.9, 43.1],
+            "height_above_base_mm": 36.1,
+            "z_range_mm": [39.0, 44.2],
+            "samples": 210,
+        }
+    ],
+}
+
+
+def test_height_cap_and_clearance_are_passed_and_mapped(fake_env, stl):
+    fake_env.summary.write_text(
+        json.dumps({**SUMMARY, "height_cap": HEIGHT_CAP_RESULT, "clearance": CLEARANCE_RESULT})
+    )
+    result = run(stl, max_support_height_mm=33, min_clearance_mm=0.25)
+    args = script_args(fake_env)
+    assert args[args.index("--max-support-height") + 1] == "33"
+    assert args[args.index("--min-clearance") + 1] == "0.25"
+    assert result.height_cap.islands_above_cap == ["voxel-3", "voxel-7"]
+    assert result.height_cap.supports_removed == 11 and result.height_cap.cap_plate_z_mm == 40
+    graze = result.clearance.grazes[0]
+    assert graze.gap_mm == 0.07 and graze.z_range_mm == [39.0, 44.2]
+    sidecar = json.loads(Path(result.sidecar_path).read_text())
+    assert sidecar["supports"]["max_support_height_mm"] == 33
+    assert sidecar["supports"]["grazes"] == 1
+
+
+def test_clearance_check_can_be_switched_off(fake_env, stl):
+    result = run(stl, min_clearance_mm=0)
+    args = script_args(fake_env)
+    assert args[args.index("--min-clearance") + 1] == "0"
+    assert result.height_cap is None and result.clearance is None
+
+
+@pytest.mark.integration
+@needs_pipeline
+def test_real_height_cap_keeps_supports_below_it(tmp_path):
+    cap = 4.0
+    data = _run_script(tmp_path, "--no-slice", "--max-support-height", str(cap))
+    report = data["height_cap"]
+    base_z = data["model_bbox_mm"]["min"][2]
+    assert report["cap_plate_z_mm"] == pytest.approx(base_z + cap)
+    assert report["residual_in_zone"] == 0
+    assert data["clearance"]["samples_checked"] > 0
