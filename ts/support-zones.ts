@@ -1,5 +1,5 @@
 /**
- * Where supports may not go, and where they came too close (NDFM-28).
+ * Where supports may not go, and where they came too close (NDFM-28, NDFM-22).
  *
  * SPDX-License-Identifier: AGPL-3.0-or-later
  *
@@ -7,6 +7,10 @@
  * a height cap (`HeightCapZone`). autosupport-slice.ts blocks contacts on the
  * model surface inside any zone before placement, and afterwards removes any
  * support whose contact or shaft still enters one.
+ *
+ * The overhang band (`clipOverhangRegion`, NDFM-22): overhang regions cut at a
+ * height, so the overhang family supports only a lattice's base, while the
+ * voxel family's islands are left alone.
  *
  * Clearance (`findGrazes`): supports that pass close to the model without
  * touching it. In clear resin a gap of a tenth of a millimetre cures shut, so a
@@ -124,6 +128,110 @@ export class HeightCapZone implements Zone {
     touchesSegment(a: THREE.Vector3, b: THREE.Vector3): boolean {
         return a.z > this.capZ || b.z > this.capZ;
     }
+}
+
+/** The fields of a `scan_overhangs` region that clipping changes or reads. */
+export interface ClippableOverhangRegion {
+    triangleIds: number[];
+    areaMm2: number;
+    projectedAreaMm2: number;
+    xyMin: [number, number];
+    xyMax: [number, number];
+    minZ: number;
+    maxZ: number;
+    footprint: { width: number; height: number; originX: number; originY: number; pxMm: number; data: number[]; surfaceZ: number[] };
+    dragMomentMm3?: number;
+}
+
+/**
+ * The overhang band (NDFM-22): an overhang region cut down to the part at and
+ * below `topZ` (the model's base plus `--overhang-max-height`), or null when
+ * none of it is in the band. The scanner may hand back a whole lattice as one
+ * region running from its base to its top (the gyroid lantern did), so a
+ * whole-region filter would keep all of it or none.
+ *
+ * Kept: footprint pixels whose surface is at or below `topZ`, and triangles
+ * with any corner at or below it. Placement samples the surface on the
+ * region's own triangles, so these bound where an overhang contact can land: at
+ * most one triangle's height above the line, where a triangle straddles it.
+ * The areas and drag moment shrink with the triangle area kept; the projected
+ * area with the pixels kept. Perimeter loops are left whole: the ring is
+ * sampled on the same triangles. `positions` holds the model's triangles, 9
+ * floats each, in the order `triangleIds` counts them.
+ */
+export function clipOverhangRegion<R extends ClippableOverhangRegion>(region: R, topZ: number, positions: ArrayLike<number>): R | null {
+    const { width, originX, originY, pxMm, data, surfaceZ } = region.footprint;
+    const keptData = data.map((inside, i) => (inside && surfaceZ[i] <= topZ ? 1 : 0));
+    let pixelsBefore = 0;
+    let pixelsKept = 0;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (let i = 0; i < keptData.length; i++) {
+        if (data[i]) pixelsBefore++;
+        if (!keptData[i]) continue;
+        pixelsKept++;
+        const x = originX + ((i % width) + 0.5) * pxMm;
+        const y = originY + (Math.floor(i / width) + 0.5) * pxMm;
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+    }
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    const triangle = new THREE.Triangle(a, b, c);
+    let areaBefore = 0;
+    let areaKept = 0;
+    const keptTriangles: number[] = [];
+    for (const t of region.triangleIds) {
+        a.fromArray(positions, t * 9);
+        b.fromArray(positions, t * 9 + 3);
+        c.fromArray(positions, t * 9 + 6);
+        const area = triangle.getArea();
+        areaBefore += area;
+        if (Math.min(a.z, b.z, c.z) > topZ) continue;
+        keptTriangles.push(t);
+        areaKept += area;
+    }
+    if (pixelsKept === 0 || (region.triangleIds.length > 0 && keptTriangles.length === 0)) return null;
+    if (pixelsKept === pixelsBefore && keptTriangles.length === region.triangleIds.length) return region;
+    const areaShare = areaBefore > 0 ? areaKept / areaBefore : pixelsKept / pixelsBefore;
+    return {
+        ...region,
+        triangleIds: keptTriangles,
+        areaMm2: region.areaMm2 * areaShare,
+        projectedAreaMm2: region.projectedAreaMm2 * (pixelsKept / pixelsBefore),
+        ...(region.dragMomentMm3 !== undefined ? { dragMomentMm3: region.dragMomentMm3 * areaShare } : {}),
+        xyMin: [minX - pxMm / 2, minY - pxMm / 2],
+        xyMax: [maxX + pxMm / 2, maxY + pxMm / 2],
+        // The lowest point is in the band, or nothing would be; the top is cut at the line.
+        maxZ: Math.min(region.maxZ, topZ),
+        footprint: { ...region.footprint, data: keptData },
+    };
+}
+
+/**
+ * The model's triangles in the order its index lists them, 9 floats each: the
+ * order raycasts' face indices count in once a BVH has sorted the index (an
+ * STL loads unindexed; three-mesh-bvh gives it an index and reorders that).
+ * Anything that names triangles to placement (the overhang scan's region
+ * triangles, the support blockers) must count them this way (NDFM-22).
+ */
+export function positionsInFaceOrder(geometry: THREE.BufferGeometry): Float32Array {
+    const position = geometry.getAttribute('position').array as Float32Array;
+    const index = geometry.getIndex()?.array;
+    if (!index) return position;
+    const out = new Float32Array(index.length * 3);
+    for (let i = 0; i < index.length; i++) {
+        const v = index[i] * 3;
+        out[i * 3] = position[v];
+        out[i * 3 + 1] = position[v + 1];
+        out[i * 3 + 2] = position[v + 2];
+    }
+    return out;
 }
 
 export function parseHoles(path: string): HoleSpec[] {

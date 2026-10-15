@@ -136,6 +136,7 @@ def test_default_arguments(fake_env, stl):
         "--no-overhangs",
         "--settings",
         "--max-support-height",
+        "--overhang-max-height",
     ):
         assert flag not in args
     # The clearance check is on by default (NDFM-28).
@@ -251,6 +252,9 @@ def test_missing_stl_and_material_raise(fake_env, stl, tmp_path):
         {"max_support_height_mm": 0},
         {"max_support_height_mm": -5},
         {"max_support_height_mm": float("nan")},
+        {"overhang_max_height_mm": 0},
+        {"overhang_max_height_mm": float("inf")},
+        {"overhang_max_height_mm": 3, "overhangs": False},
         {"min_clearance_mm": -0.1},
         {"min_clearance_mm": float("inf")},
     ],
@@ -700,3 +704,51 @@ def test_real_height_cap_keeps_supports_below_it(tmp_path):
     assert report["cap_plate_z_mm"] == pytest.approx(base_z + cap)
     assert report["residual_in_zone"] == 0
     assert data["clearance"]["samples_checked"] > 0
+
+
+OVERHANG_BAND_RESULT = {
+    "overhang_max_height_mm": 3,
+    "band_top_plate_z_mm": 10,
+    "regions_scanned": 1,
+    "regions_clipped": 1,
+    "regions_dropped": 0,
+    "voxel_islands_above_band": ["v12", "v25"],
+    "highest_overhang_contact_mm": 2.98,
+    "overhang_contacts_above_band": 0,
+}
+
+
+def test_overhang_band_is_passed_and_mapped(fake_env, stl):
+    fake_env.summary.write_text(json.dumps({**SUMMARY, "overhang_band": OVERHANG_BAND_RESULT}))
+    result = run(stl, overhang_max_height_mm=3)
+    args = script_args(fake_env)
+    assert args[args.index("--overhang-max-height") + 1] == "3"
+    band = result.overhang_band
+    assert band.regions_clipped == 1 and band.voxel_islands_above_band == ["v12", "v25"]
+    assert band.highest_overhang_contact_mm == 2.98 and band.overhang_contacts_above_band == 0
+    assert result.height_cap is None
+    sidecar = json.loads(Path(result.sidecar_path).read_text())
+    assert sidecar["supports"]["overhang_max_height_mm"] == 3
+
+
+def test_overhang_band_absent_without_the_option(fake_env, stl):
+    fake_env.summary.write_text(json.dumps({**SUMMARY, "height_cap": HEIGHT_CAP_RESULT}))
+    result = run(stl, max_support_height_mm=33)
+    assert result.overhang_band is None and result.height_cap.supports_removed == 11
+
+
+@pytest.mark.integration
+@needs_pipeline
+def test_real_overhang_band_keeps_overhang_contacts_in_it(tmp_path):
+    band = 2.0
+    data = _run_script(
+        tmp_path, "--no-slice", "--coarse-islands", "--overhang-max-height", str(band)
+    )
+    report = data["overhang_band"]
+    base_z = data["model_bbox_mm"]["min"][2]
+    assert report["band_top_plate_z_mm"] == pytest.approx(base_z + band)
+    assert report["overhang_contacts_above_band"] == 0
+    if report["highest_overhang_contact_mm"] is not None:
+        assert report["highest_overhang_contact_mm"] <= band + 0.5
+    # Nothing is blocked or removed for the band.
+    assert data["height_cap"] is None and data["keep_out"] is None

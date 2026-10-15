@@ -133,6 +133,23 @@ each contact tip and anything below the model's base. Gaps under
 `min_clearance_mm` (0.3 by default) are reported as grazes and warned about. On
 Chi (a 50 mm cat, 245,000 samples), the check takes about 0.6 s.
 
+It also holds the overhang band (NDFM-22). `overhang_max_height_mm` limits
+the overhang family alone to that height above the model's base, for a lifted
+self-supporting lattice: the base gets the overhang grid, the lattice above
+gets none, and voxel islands are supported wherever they are.
+`clipOverhangRegion` cuts each overhang region at the band's top before it
+becomes an island, because the scanner can return a whole lattice as one
+region. Nothing is blocked or removed. The result's `overhang_band` reports
+the highest overhang contact, and counts any that land more than 0.5 mm above
+the band.
+
+Anything that names model triangles to placement (the overhang regions, the
+support blockers) counts them in the BVH's order, `positionsInFaceOrder`.
+three-mesh-bvh gives an STL's unindexed triangles an index and sorts it, and
+placement's raycasts report faces in that order. Before NDFM-22 we counted them
+in file order, so the overhang grid sampled the wrong triangles and scattered
+contacts up a lattice, and the blockers blocked the wrong triangles.
+
 Previews can also be rendered by hand:
 
 ```bash

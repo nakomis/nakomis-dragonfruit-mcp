@@ -1,5 +1,5 @@
 /**
- * Tests for support-zones.ts (NDFM-28), run by tests/test_support_zones.py:
+ * Tests for support-zones.ts (NDFM-28, NDFM-22), run by tests/test_support_zones.py:
  *
  *   cd vendor/dragonfruit && TSX_TSCONFIG_PATH=$PWD/tsconfig.json NODE_PATH=$PWD/node_modules \
  *     node_modules/.bin/tsx --test --test-reporter=tap ../../ts/tests/support-zones.test.ts
@@ -10,8 +10,17 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import * as THREE from 'three';
+import { acceleratedRaycast, computeBoundsTree } from 'three-mesh-bvh';
 
-import { findGrazes, HeightCapZone, KeepOutZone, triangleIndicesInZones } from '../support-zones';
+import {
+    clipOverhangRegion,
+    findGrazes,
+    HeightCapZone,
+    KeepOutZone,
+    positionsInFaceOrder,
+    triangleIndicesInZones,
+    type ClippableOverhangRegion,
+} from '../support-zones';
 
 /** A non-indexed box, as an STL loads: `size` across, its minimum corner at `min`. */
 function box(size: [number, number, number], min: [number, number, number]): THREE.BufferGeometry {
@@ -98,4 +107,82 @@ test('a clearance of 0 turns the check off', () => {
     const report = findGrazes(model, positions(column), [], { minClearanceMm: 0 });
     assert.equal(report.samples_checked, 0);
     assert.deepEqual(report.grazes, []);
+});
+
+/**
+ * A region as the scanner returns it, over a staircase of three flat
+ * down-facing squares at z 1, 5 and 9, side by side in X: two triangles each
+ * (0-1, 2-3, 4-5), one footprint pixel a millimetre square under each.
+ */
+function staircase(): { region: ClippableOverhangRegion; positions: Float32Array } {
+    const quads = [1, 5, 9].map((z, i) => {
+        const g = new THREE.PlaneGeometry(1, 1).toNonIndexed();
+        g.rotateX(Math.PI); // facing down
+        g.translate(i + 0.5, 0.5, z);
+        return g;
+    });
+    return {
+        positions: positions(...quads),
+        region: {
+            triangleIds: [0, 1, 2, 3, 4, 5],
+            areaMm2: 3,
+            projectedAreaMm2: 3,
+            xyMin: [0, 0],
+            xyMax: [3, 1],
+            minZ: 1,
+            maxZ: 9,
+            dragMomentMm3: 15,
+            footprint: { width: 3, height: 1, originX: 0, originY: 0, pxMm: 1, data: [1, 1, 1], surfaceZ: [1, 5, 9] },
+        },
+    };
+}
+
+test('an overhang region is cut at the band, its areas shrinking with it', () => {
+    const { region, positions: stairs } = staircase();
+    const clipped = clipOverhangRegion(region, 6, stairs)!;
+    assert.deepEqual(clipped.triangleIds, [0, 1, 2, 3]);
+    assert.deepEqual(clipped.footprint.data, [1, 1, 0]);
+    assert.deepEqual(clipped.footprint.surfaceZ, [1, 5, 9]);
+    assert.ok(Math.abs(clipped.areaMm2 - 2) < 1e-6 && Math.abs(clipped.projectedAreaMm2 - 2) < 1e-6);
+    assert.ok(Math.abs(clipped.dragMomentMm3! - 10) < 1e-6);
+    assert.deepEqual(clipped.xyMin, [0, 0]);
+    assert.deepEqual(clipped.xyMax, [2, 1]);
+    assert.equal(clipped.minZ, 1);
+    assert.equal(clipped.maxZ, 6);
+    // The scanner's own record is left alone.
+    assert.deepEqual(region.footprint.data, [1, 1, 1]);
+    assert.equal(region.triangleIds.length, 6);
+});
+
+test('a region wholly in the band is returned as it is, and one wholly above it is dropped', () => {
+    const { region, positions: stairs } = staircase();
+    assert.equal(clipOverhangRegion(region, 9, stairs), region);
+    assert.equal(clipOverhangRegion(region, 0.5, stairs), null);
+});
+
+test("after a BVH sorts the model, a raycast's face index names the triangle positionsInFaceOrder puts there", () => {
+    // Many small boxes, so the BVH has something to sort.
+    const parts: THREE.BufferGeometry[] = [];
+    for (let i = 0; i < 40; i++) parts.push(box([1, 1, 1], [(i * 7) % 13, (i * 5) % 11, i % 3]));
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions(...parts), 3));
+    assert.equal(positionsInFaceOrder(geometry), geometry.getAttribute('position').array);
+    (geometry as unknown as { computeBoundsTree: typeof computeBoundsTree }).computeBoundsTree = computeBoundsTree;
+    (geometry as unknown as { computeBoundsTree: () => void }).computeBoundsTree();
+    const index = geometry.getIndex()!.array;
+    let moved = 0;
+    for (let f = 0; f < index.length / 3; f++) if (index[f * 3] !== f * 3) moved++;
+    assert.ok(moved > 0, 'the BVH left the triangles in their order, so this test proves nothing');
+    const faces = positionsInFaceOrder(geometry);
+    const mesh = new THREE.Mesh(geometry);
+    mesh.raycast = acceleratedRaycast;
+    const raycaster = new THREE.Raycaster(v(0.5, 0.5, -5), v(0, 0, 1));
+    const [hit] = raycaster.intersectObject(mesh, false);
+    // The hit point lies in the triangle that face index names, in face order.
+    const f = hit.faceIndex!;
+    const triangle = new THREE.Triangle(v(faces[f * 9], faces[f * 9 + 1], faces[f * 9 + 2]),
+        v(faces[f * 9 + 3], faces[f * 9 + 4], faces[f * 9 + 5]), v(faces[f * 9 + 6], faces[f * 9 + 7], faces[f * 9 + 8]));
+    const onIt = new THREE.Vector3();
+    triangle.closestPointToPoint(hit.point, onIt);
+    assert.ok(onIt.distanceTo(hit.point) < 1e-6, `face ${f} is not where the ray hit`);
 });
