@@ -35,6 +35,11 @@ class TrimResult(ToolResult):
         description="Up to 10 [layer, regions, pixels] with the most pixels dropped"
     )
     backend: str = Field(description="Which implementation ran: python or rust")
+    fast_path_layers: int | None = Field(
+        None,
+        description="Layers whose cores all rested on held core, so no labelling was needed "
+        "(python backend only; None for rust)",
+    )
     islands_left: int | None = Field(
         None, description="Unsupported cores the independent check still finds; None if skipped"
     )
@@ -122,6 +127,7 @@ def run(
     result = TrimResult(
         output_path=str(dst),
         backend=chosen,
+        fast_path_layers=report.fast_layers if chosen == "python" else None,
         layers=report.layers,
         layers_changed=report.layers_changed,
         regions_dropped=report.regions_dropped,

@@ -362,8 +362,100 @@ def test_rust_matches_python_byte_for_byte(island_goo, tmp_path):
         rs = trim.run(str(src), str(rs_out), 18.0, True, backend="rust")
         assert rs_out.read_bytes() == py_out.read_bytes(), src.name
         assert rs.backend == "rust" and py.backend == "python"
-        assert rs.model_dump(exclude={"backend", "output_path"}) == py.model_dump(
-            exclude={"backend", "output_path"}
-        ), src.name
+        assert rs.model_dump(
+            exclude={"backend", "output_path", "fast_path_layers"}
+        ) == py.model_dump(exclude={"backend", "output_path", "fast_path_layers"}), src.name
         islands = cli.run(trim.GOO_TRIM, ["islands", str(src)], parse_json=True).data["islands"]
         assert [tuple(i) for i in islands] == goo_trim.find_islands(src, workers=1), src.name
+
+
+# --- the fast path and the cropped held mask (NDFM-26) ---------------------------------
+
+
+def _reference_trim(layers: list[np.ndarray]):
+    """The rule as first written: a full-frame held mask, every layer labelled."""
+    out, held = [], None
+    for frame_ in layers:
+        a = frame_.copy()
+        box = goo_trim._box(a > 0, *a.shape)
+        if box is None:
+            held = np.zeros(a.shape, bool)
+            out.append(a)
+            continue
+        view = a[box]
+        core = view >= goo_trim.CORE
+        if held is not None:
+            below = goo_trim._dilate(held[box], goo_trim.TOUCH_PX)
+            labels, count = goo_trim._label(core)
+            core = goo_trim._touching(labels, count, core & below)[labels]
+            view[(view > 0) & ~goo_trim._dilate(core, goo_trim.HUG_PX)] = 0
+        held = np.zeros(a.shape, bool)
+        held[box] = core
+        out.append(a)
+    return out
+
+
+def _random_layers(seed: int, n: int = 12) -> list[np.ndarray]:
+    rng = np.random.default_rng(seed)
+    layers = []
+    for i in range(n):
+        a = np.zeros((H, W), np.uint8)
+        for _ in range(rng.integers(0, 5)):
+            r0, c0 = rng.integers(0, H - 3), rng.integers(0, W - 3)
+            r1, c1 = r0 + rng.integers(1, 12), c0 + rng.integers(1, 12)
+            a[r0:r1, c0:c1] = 255
+        grey = rng.random((H, W)) < 0.05
+        a[grey & (a == 0)] = rng.integers(1, 255)
+        if i == 5:
+            a[:] = 0  # a blank layer in the middle
+        layers.append(a)
+    return layers
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_trim_matches_the_plain_rule_on_random_layers(tmp_path, seed):
+    layers = _random_layers(seed)
+    src = tmp_path / "r.goo"
+    make_goo(src, [a.ravel().tolist() for a in layers], width=W, height=H)
+    out = tmp_path / "out.goo"
+    goo_trim.trim_islands(src, out)
+    for n, expected in enumerate(_reference_trim(layers), 1):
+        assert (pixels_of(out, n) == expected).all(), f"layer {n}"
+
+
+def test_layers_resting_wholly_on_held_core_take_the_fast_path(tmp_path):
+    inner = (8, 12, 8, 12)
+    src = tmp_path / "f.goo"
+    make_goo(src, [frame(BLOCK), frame(inner), frame(inner), frame(BLOCK)], width=W, height=H)
+    report = goo_trim.trim_islands(src, tmp_path / "out.goo")
+    # layer 4 regrows past layer 3's core by more than TOUCH_PX; its ring still
+    # touches the held inner block, so it is labelled and kept
+    assert report.fast_layers == 2
+    assert report.by_layer == []
+
+
+def test_a_fast_path_layer_still_drops_unhugged_grey(tmp_path):
+    lone_grey = ((25, 27, 30, 32), 100)  # faint, far from any held core
+    src = tmp_path / "g.goo"
+    make_goo(src, [frame(BLOCK), frame(BLOCK, grey=[lone_grey])], width=W, height=H)
+    out = tmp_path / "out.goo"
+    report = goo_trim.trim_islands(src, out)
+    assert report.fast_layers == 1
+    assert report.by_layer == [(2, 0, 4)]
+    assert not pixels_of(out, 2)[25:27, 30:32].any()
+
+
+def test_a_layer_shifted_clear_of_the_box_below_is_not_held(tmp_path):
+    far = (22, 28, 28, 38)  # entirely outside the crop of the layer below
+    src = tmp_path / "s.goo"
+    make_goo(src, [frame(BLOCK), frame(far)], width=W, height=H)
+    report = goo_trim.trim_islands(src, tmp_path / "out.goo")
+    assert report.fast_layers == 0
+    assert report.by_layer == [(2, 1, 60)]
+
+
+def test_tool_reports_the_fast_path_layers_for_python_only(tmp_path):
+    src = tmp_path / "f.goo"
+    make_goo(src, [frame(BLOCK), frame((8, 12, 8, 12))], width=W, height=H)
+    result = asyncio.run(trim.trim_islands(str(src), str(tmp_path / "a.goo")))
+    assert result.backend == "python" and result.fast_path_layers == 1

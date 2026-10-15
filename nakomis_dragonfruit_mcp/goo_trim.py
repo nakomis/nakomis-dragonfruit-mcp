@@ -65,6 +65,7 @@ class TrimReport:
     layers_changed: int = 0
     regions_dropped: int = 0
     pixels_dropped: int = 0
+    fast_layers: int = 0  # layers whose cores all rested on held core, so nothing was labelled
     by_layer: list[tuple[int, int, int]] = field(default_factory=list)  # layer, regions, pixels
 
 
@@ -88,6 +89,25 @@ def _box(lit: np.ndarray, h: int, w: int) -> tuple[slice, slice] | None:
     )
 
 
+def _held_in(held: np.ndarray | None, held_box: tuple[slice, slice] | None, box, shape):
+    """The previous layer's held core over `box`, as a fresh array of `shape`.
+
+    `held` is the held core cropped to `held_box` (both None for an empty layer);
+    whatever lies outside that crop is not held.
+    """
+    out = np.zeros(shape, bool)
+    if held is None or held_box is None:
+        return out
+    r0, r1 = max(box[0].start, held_box[0].start), min(box[0].stop, held_box[0].stop)
+    c0, c1 = max(box[1].start, held_box[1].start), min(box[1].stop, held_box[1].stop)
+    if r0 < r1 and c0 < c1:
+        out[r0 - box[0].start : r1 - box[0].start, c0 - box[1].start : c1 - box[1].start] = held[
+            r0 - held_box[0].start : r1 - held_box[0].start,
+            c0 - held_box[1].start : c1 - held_box[1].start,
+        ]
+    return out
+
+
 def trim_islands(src: Path, dst: Path) -> TrimReport:
     """Write `src` to `dst` with every unsupported region removed; never overwrites `dst`."""
     header = goo.read_header(src)
@@ -95,32 +115,42 @@ def trim_islands(src: Path, dst: Path) -> TrimReport:
     data = src.read_bytes()
     report = TrimReport(layers=header.layers)
     pieces: list[bytes] = []
-    held: np.ndarray | None = None  # the held core of the layer below, full frame
+    # The held core of the layer below, cropped to the box it was found in; the
+    # first layer has none (it is never trimmed), an empty layer an empty crop.
+    has_below = False
+    held: np.ndarray | None = None
+    held_box: tuple[slice, slice] | None = None
     first = None
     for n, (off, raw) in enumerate(_layers(data, src), 1):
         first = off if first is None else first
         full = np.frombuffer(goo.decode_layer(raw, w, h), np.uint8).reshape(h, w).copy()
         box = _box(full > 0, h, w)
         if box is None:
-            held = np.zeros((h, w), bool)
+            has_below, held, held_box = True, None, None
             pieces.append(data[off : off + goo.LAYER_DEF_BYTES + 4 + len(raw) + 2])
             continue
         a = full[box]  # a view: blanking it blanks the layer
         core = a >= CORE
-        if held is not None:
-            below = _dilate(held[box], TOUCH_PX)
-            labels, count = _label(core)
-            lut = _touching(labels, count, core & below)
-            core = lut[labels]
+        if has_below:
+            below = _dilate(_held_in(held, held_box, box, core.shape), TOUCH_PX)
+            if not (core & ~below).any():
+                # Every core pixel is within TOUCH_PX of held core, so every region
+                # touches it and is held: labelling could only agree.
+                report.fast_layers += 1
+                count, kept = 0, 0
+            else:
+                labels, count = _label(core)
+                lut = _touching(labels, count, core & below)
+                core = lut[labels]
+                kept = int(lut.sum())
             drop = (a > 0) & ~_dilate(core, HUG_PX)
             if drop.any():
-                regions = count - int(lut.sum())
+                regions = count - kept
                 report.by_layer.append((n, regions, int(drop.sum())))
                 report.regions_dropped += regions
                 report.pixels_dropped += int(drop.sum())
                 a[drop] = 0
-        held = np.zeros((h, w), bool)
-        held[box] = core
+        has_below, held, held_box = True, core, box
         if report.by_layer and report.by_layer[-1][0] == n:
             new = goo.encode_layer(full.tobytes())
             pieces.append(
