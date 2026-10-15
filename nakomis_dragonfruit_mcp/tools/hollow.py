@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ _PUNCH_KEYS = {
     "after",
     "holes",
     "hole_checks",
+    "openings",
     "holes_sidecar",
     "cavities_found",
     "timing_ms",
@@ -43,7 +45,7 @@ class Hole(BaseModel):
     axis: str = Field(description='"-z", "+x" and so on for an axis-aligned hole, else "custom"')
     length_mm: float
     purpose: str = Field(description='"suction relief", "vent", "manual", ...')
-    cavity: int | None = Field(description="Which cavity an automatic hole serves")
+    cavity: int | None = Field(description="Which cavity the hole serves (opens into)")
     extension_mm: float = Field(
         default=0.0,
         description="How far an automatic hole's start was pushed into the cavity so that its "
@@ -56,7 +58,7 @@ class HoleCheck(BaseModel):
     """What was measured on the drilled mesh: the neck's open fraction, and whether it exits."""
 
     hole: int = Field(description="Index into `holes`")
-    checked: bool = Field(description="False for a hole not along an axis, which is not measured")
+    checked: bool = Field(description="Whether it was measured (every hole is, in any direction)")
     hole_area_mm2: float = Field(description="The hole's nominal area, pi r^2")
     min_open_area_mm2: float = Field(
         description="Open area of the narrowest cross-section, within a disc of 0.9 r. This is "
@@ -73,6 +75,14 @@ class HoleCheck(BaseModel):
         description="Whether the hole's end, and a ring of 0.9 r round it, is outside the "
         "original model's outer skin; false means the hole stops short of the outside"
     )
+
+
+class CavityOpenings(BaseModel):
+    """Which holes open into one sealed cavity of the input."""
+
+    cavity: int
+    volume_ml: float
+    holes: list[int] = Field(description="Indices into `holes` that open into it")
 
 
 class HollowResult(ToolResult):
@@ -97,6 +107,10 @@ class DrillResult(ToolResult):
         description="Per hole: the cap/neck open fraction (the narrowest cross-section, from "
         "slicing the drilled mesh across the hole's axis) and whether it exits the outer skin; "
         "a neck below 90% open, or a hole that stops short, also adds a warning"
+    )
+    openings: list[CavityOpenings] = Field(
+        description="Per sealed cavity of the input, the holes that open into it; one "
+        "alone (no drain-and-vent pair) adds a warning"
     )
     holes_sidecar: str = Field(
         description="`<output>.holes.json`: the holes (start point, direction, radius, length, "
@@ -206,6 +220,9 @@ def drill_holes(
     radius_mm: float = 2.0,
     xy: tuple[float, float] | None = None,
     down_axis: str = "-z",
+    vent_route: str = "shortest",
+    lowest_clearance_mm: float = 3.0,
+    clear_resin: bool = False,
 ) -> DrillResult:
     """Punch drain holes through a hollowed model (all lengths in mm).
 
@@ -220,26 +237,45 @@ def drill_holes(
     are an error.
 
     `auto_drain=True` places holes for a bottom-up MSLA print, where the part hangs from
-    the build plate. Checklist it follows, and what you must still check:
+    the build plate. Every void needs TWO openings, a drain at its lowest point and a
+    vent at its highest: with one it cups on every lift (it cannot swap resin) and keeps
+    its resin afterwards (surface tension holds liquid in a single small hole). Checklist
+    it follows, and what you must still check:
     - The cavity end nearest the plate (the base, -Z, printed first) closes first as a
-      cup opening towards the film, so peeling it pulls suction. A hole through the floor
-      at that end is the essential suction relief ("suction relief" in the result).
-    - A second hole at the far end, through the roof ("vent"), lets air in as liquid
-      drains and lets IPA be flushed through.
-    - Every separate cavity gets its own pair: compare `cavities_found` with the holes.
-    - Holes are `radius_mm` (default 2, so 4 mm across; keep at least 2 to 3 mm across).
-    - They go where the skin is flat and square to the hole, clear of detail with a
-      margin of at least 1 mm around the footprint (so away from text and edges), by
-      the shortest vertical path through the wall. Base, crown and back are preferred
-      because they are rarely seen, but the tool only judges flatness: look at where
-      `holes` say they exit.
-    - It cannot see supports or the raft. If the base has supports, pass `xy` (the
-      position across the down axis: x, y for -z) to move the holes clear of them, and
-      keep them at least radius + 1 mm inside the base outline.
-    - If no clear vertical path exists it falls back to a horizontal pair through the
-      side wall and says so in `warnings`; rough skin gets a vertical hole with a
-      warning. Read the warnings.
+      cup opening towards the film, so peeling it pulls suction. A vertical hole through
+      the floor at that end is the drain and essential suction relief ("suction relief").
+    - A second hole from the very top of the cavity ("vent") lets air in as liquid
+      drains and lets IPA be flushed through. With `vent_route="shortest"` (default) it
+      takes the shortest straight route out from the top, up or sideways in any
+      direction, that never comes closer to the surface than to its own exit (it keeps
+      radius + 1 mm of solid round the bore until near the exit, so it cannot graze a
+      flank and break out early); it may exit on a side face, so look where its `note`
+      says it comes out. `vent_route="vertical"` puts it straight up through the roof
+      instead, where the skin is flat (the shortest route also falls back to that).
+    - Every separate cavity gets its own pair: compare `cavities_found` with the holes,
+      and read `openings`.
+    - Holes are `radius_mm` (default 2, so 4 mm across). Under 2 mm across warns: small
+      holes cure shut. Clear or translucent resin has no pigment to stop light spreading
+      sideways and needs 3 mm or more: pass `clear_resin=True` to warn below 3 mm.
+    - The suction relief goes where the skin is flat and square to the hole, clear of
+      detail with a margin of at least 1 mm around the footprint (so away from text and
+      edges), by the shortest vertical path through the wall. Base, crown and back are
+      preferred because they are rarely seen, but the tool only judges flatness: look at
+      where `holes` say they exit.
+    - Supports keep out of a hole's surroundings, so the suction relief prefers spots at
+      least radius + `lowest_clearance_mm` (default 3; 0 turns it off) across from the
+      model's lowest skin, where the first supports land; it warns if the hole would
+      leave the lowest point no support at all. Otherwise it cannot see supports or the
+      raft: if the base has supports, pass `xy` (the position across the down axis: x, y
+      for -z) to move the vertical holes clear of them, and keep them at least radius +
+      1 mm inside the base outline. `xy` does not pin a shortest-route vent; pass
+      `vent_route="vertical"` to pin both.
+    - If no clear vertical path exists the drain falls back to a horizontal hole through
+      the side wall (with a horizontal vent too if the vent also failed) and says so in
+      `warnings`; rough skin gets a vertical hole with a warning. Read the warnings.
     `down_axis` says which way the plate is (default "-z"; also "+z", "+/-x", "+/-y").
+    Each hole's length runs 1 mm past where its whole bore clears the skin, so no
+    membrane is left over the exit.
 
     Each automatic hole starts inside the cavity, far enough that the cavity's width there
     contains the hole's full diameter (`extension_mm` says how far it moved; capped at 10 mm,
@@ -253,7 +289,11 @@ def drill_holes(
       construction), as a fraction of a disc of 0.9 of the hole's radius; below 90% warns;
     - `exits_skin`: whether the hole's end and a ring round it lie outside the original
       model's outer skin; a hole that stops short of the outside warns.
-    Holes not along an axis are not measured, and say so in a warning.
+    Every hole is measured, along an axis or not.
+
+    `openings` lists, per sealed cavity, the holes that open into it (also for `holes`
+    you give; a hole's `cavity` is filled in from it). A cavity with only one opening
+    warns.
 
     Also writes `<output>.holes.json` beside the STL (absolute path in `holes_sidecar`):
     `{"holes": [{x, y, z, radius_mm, direction, axis, length_mm, purpose, cavity}],
@@ -267,15 +307,23 @@ def drill_holes(
         raise cli.CliError("give either `holes` or `auto_drain=True`, not both or neither")
     if xy is not None and not auto_drain:
         raise cli.CliError("`xy` only applies with `auto_drain=True`")
+    vent_route = vent_route.strip().lower()
+    if vent_route not in ("shortest", "vertical"):
+        raise cli.CliError(f'`vent_route` must be "shortest" or "vertical", got {vent_route!r}')
+    if not math.isfinite(lowest_clearance_mm):
+        raise cli.CliError(f"`lowest_clearance_mm` must be a number, got {lowest_clearance_mm}")
     src = _check(Path(stl_path))
     out = _output_path(src, out_path, ".drilled")
     args = ["punch", str(src), "-o", str(out), "--radius-mm", f"{radius_mm:g}", "--json"]
     if auto_drain:
-        args += ["--auto-drain", "--down-axis", down_axis]
+        args += ["--auto-drain", "--down-axis", down_axis, "--vent-route", vent_route]
+        args += ["--lowest-clearance-mm", f"{max(lowest_clearance_mm, 0.0):g}"]
         if xy is not None:
             args += ["--xy", f"{xy[0]:g}", f"{xy[1]:g}"]
     else:
         args += ["--holes", json.dumps(holes)]
+    if clear_resin:
+        args.append("--clear-resin")
     result = cli.run(cli.MCP_TOOLS, args, parse_json=True)
     data = _schema(result.data, _PUNCH_KEYS, "punch", result.stdout)
     if not Path(data["holes_sidecar"]).is_file():
@@ -290,6 +338,7 @@ def drill_holes(
         output_path=str(out),
         holes=[Hole(**h) for h in data["holes"]],
         hole_checks=[HoleCheck(**c) for c in data["hole_checks"]],
+        openings=[CavityOpenings(**o) for o in data["openings"]],
         holes_sidecar=data["holes_sidecar"],
         cavities_found=data["cavities_found"],
         cavities_before=before.cavities,

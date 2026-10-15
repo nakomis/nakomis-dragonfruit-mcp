@@ -44,11 +44,17 @@ Early days. The repository is scaffolded; the tools are being built. Planned too
 - `preview_layer` and `inspect_print`: check the sliced output. They read `.goo` and ZIP-based
   files (`.nanodlp`); the Mars 5 Ultra's default `.ctb` (v5enc) is encrypted and cannot be read,
   so slice with `format=".goo"` to preview it
-- `hollow` and `drill_holes`: hollow a model to save resin, then drill a suction-relief
-  hole through each cavity's floor and a vent through its roof so it can drain
-  (always follow `hollow` with `drill_holes`). Each hole starts inside the cavity far enough
-  for its full diameter to open (a dome narrowing to an apex would otherwise give a slit),
-  is checked by slicing the drilled mesh, and is recorded in `<output>.holes.json`
+- `hollow` and `drill_holes`: hollow a model to save resin, then give each cavity a drain
+  (suction relief) through the floor at its lowest point and a vent at its highest, so it
+  can drain (always follow `hollow` with `drill_holes`). The vent takes the shortest
+  straight route out from the top that never comes closer to the surface than to its own
+  exit, so it cannot graze a flank and break out early (NDFM-19; `vent_route="vertical"`
+  for straight up through the roof). The drain keeps clear of the model's lowest point,
+  where the first supports land. Each hole starts inside the cavity far enough for its full
+  diameter to open (a dome narrowing to an apex would otherwise give a slit), is checked by
+  slicing the drilled mesh, and is recorded in `<output>.holes.json`. A cavity with only
+  one opening warns, as does a hole under 2 mm across (3 mm with `clear_resin=True`: clear
+  resin cures small holes shut)
 - `auto_support_and_slice`: DragonFruit's own auto-supports and raft, sliced
   into the print, with the same printer, format and material options as `slice`
   (NDFM-8; see below). Keeps supports out of drilled holes: reads
