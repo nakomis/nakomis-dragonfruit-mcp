@@ -57,12 +57,9 @@ Early days. The repository is scaffolded; the tools are being built. Planned too
 - `trim_islands`: remove every region of a sliced `.goo` that has nothing cured
   beneath it, which would otherwise peel off as a flake in the vat. Open lattices
   and cut edges are full of tiny ones that mesh-level checks miss. Works on the
-  print file's own layers, re-encodes changed layers byte-compatibly with
-  DragonFruit, and verifies the result (NDFM-20). A region is kept only when it
-  really overlaps the held core below, not when it merely grazes it by a pixel or
-  two (NDFM-27): at least `min_overlap` of the region's own area (default 0.25)
-  and at least `min_overlap_px` pixels (default 8, or the whole region if it is
-  smaller) must sit on it. Both are tool parameters
+  print file's own layers (cured core touching the held core below), re-encodes
+  changed layers byte-compatibly with DragonFruit, and verifies the result
+  (NDFM-20)
 - Preview pictures: `slice` and `auto_support_and_slice` render the model into
   every `.goo` they write, so the printer's screen and print servers show what
   the file holds rather than a placeholder: a three-quarter view, the model in
@@ -93,7 +90,6 @@ The binary also runs on its own:
 
 ```bash
 bin/goo-trim trim print.goo print.trimmed.goo --verify   # JSON report on stdout
-bin/goo-trim trim print.goo out.goo --min-overlap 0.3 --min-overlap-px 10
 bin/goo-trim islands print.trimmed.goo                   # {"islands": [[layer, pixels], ...]}
 ```
 

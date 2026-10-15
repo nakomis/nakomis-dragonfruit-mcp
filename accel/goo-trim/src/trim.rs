@@ -1,9 +1,8 @@
 //! `trim_islands` and `find_islands`, ported from `goo_trim.py`.
 //!
 //! Working up from layer 1, a region's cured core (grey >= CORE) is held when
-//! it overlaps the held core of the layer below: at least `min_overlap` of its
-//! pixels, and at least `min_overlap_px` of them (all of them, for a region
-//! smaller than that), sit on it. Unheld cores are blanked, and so is grey that isn't within HUG_PX of a held core.
+//! it touches the held core of the layer below within TOUCH_PX (L1). Unheld
+//! cores are blanked, and so is grey that isn't within HUG_PX of a held core.
 //! Layers with nothing dropped are copied byte for byte; changed layers are
 //! re-encoded; the header and end marker are kept.
 //!
@@ -28,40 +27,9 @@ use crate::mask::{self, Mask, Masks};
 use crate::rle::{self, Encoder, Run};
 
 pub const CORE: u8 = 128;
-/// The defaults, as in `goo_trim.py`.
-pub const MIN_OVERLAP: f64 = 0.25;
-pub const MIN_OVERLAP_PX: u64 = 8;
+pub const TOUCH_PX: usize = 2;
 pub const HUG_PX: usize = 3;
 const BATCH: usize = 16;
-
-/// How much of a region must sit on held core below for it to be held.
-#[derive(Clone, Copy, Debug)]
-pub struct Thresholds {
-    pub min_overlap: f64,
-    pub min_overlap_px: u64,
-}
-
-impl Default for Thresholds {
-    fn default() -> Self {
-        Thresholds { min_overlap: MIN_OVERLAP, min_overlap_px: MIN_OVERLAP_PX }
-    }
-}
-
-impl Thresholds {
-    pub fn check(&self) -> Result<(), String> {
-        if !(0.0..=1.0).contains(&self.min_overlap) {
-            return Err(format!("min_overlap must be between 0 and 1, not {}", self.min_overlap));
-        }
-        if self.min_overlap_px < 1 {
-            return Err(format!("min_overlap_px must be at least 1, not {}", self.min_overlap_px));
-        }
-        Ok(())
-    }
-
-    fn unheld(&self, core: &Mask, below: &Mask) -> mask::Flood {
-        mask::unheld_components(core, below, self.min_overlap, self.min_overlap_px)
-    }
-}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
@@ -155,7 +123,7 @@ fn writer(
 }
 
 /// The trim itself, writing pieces to `tx` in order. Returns the report.
-fn trim_layers(file: &Arc<Vec<u8>>, g: &Arc<Goo>, t: Thresholds, tx: SyncSender<Piece>) -> Result<Report, String> {
+fn trim_layers(file: &Arc<Vec<u8>>, g: &Arc<Goo>, tx: SyncSender<Piece>) -> Result<Report, String> {
     let mut report = Report { layers: g.layers.len(), ..Default::default() };
     let (dtx, drx) = sync_channel::<Result<Decoded, String>>(2 * BATCH);
     let reader = {
@@ -192,8 +160,8 @@ fn trim_layers(file: &Arc<Vec<u8>>, g: &Arc<Goo>, t: Thresholds, tx: SyncSender<
                 send(Piece::Copy(layer))?;
                 continue;
             };
-            let below = core.project(below_held);
-            let flood = t.unheld(&core, &below);
+            let below = core.project(below_held).dilate_cross(TOUCH_PX);
+            let flood = mask::unheld_components(&core, &below);
             let kept = if flood.sizes.is_empty() { core } else { core.and_not(&flood.unheld) };
             let drop = lit.and_not(&kept.dilate_cross(HUG_PX));
             let pixels = drop.count();
@@ -233,8 +201,7 @@ fn temp_beside(dst: &Path) -> Result<(PathBuf, File), String> {
 }
 
 /// Write `src` to `dst` with every unsupported region removed; never overwrites `dst`.
-pub fn trim_file(src: &Path, dst: &Path, t: Thresholds) -> Result<Report, String> {
-    t.check()?;
+pub fn trim_file(src: &Path, dst: &Path) -> Result<Report, String> {
     if dst.symlink_metadata().is_ok() {
         return Err(format!("{} already exists", dst.display()));
     }
@@ -247,7 +214,7 @@ pub fn trim_file(src: &Path, dst: &Path, t: Thresholds) -> Result<Report, String
             let (file, first, tail, width) = (Arc::clone(&file), g.layers[0].def_off, g.ends_with_marker, g.width);
             thread::spawn(move || writer(file, first, tail, out, width, rx))
         };
-        let report = trim_layers(&file, &g, t, tx);
+        let report = trim_layers(&file, &g, tx);
         let written = w.join().map_err(|_| "the writer panicked".to_string())?;
         // A failed writer makes trim_layers fail too, with only "the writer
         // stopped"; its own error (a full disk, say) is the one worth showing.
@@ -277,10 +244,9 @@ fn core_of(file: &[u8], g: &Goo, n: usize) -> Result<Option<Mask>, String> {
     Ok(mask::build(&runs, g.width, g.height, CORE, |v| v >= CORE, false).map(|m| m.core))
 }
 
-/// (layer, pixels) of every cured core not resting on the cured core of the
-/// layer below: the same check as the Python's `find_islands`.
-pub fn find_islands(file: &[u8], g: &Goo, t: Thresholds) -> Result<Vec<(usize, u64)>, String> {
-    t.check()?;
+/// (layer, pixels) of every cured core with no cured core within TOUCH_PX on
+/// the layer below: the same check as the Python's `find_islands`.
+pub fn find_islands(file: &[u8], g: &Goo) -> Result<Vec<(usize, u64)>, String> {
     let n = g.layers.len();
     let workers = rayon::current_num_threads().max(1);
     let step = n.div_ceil(workers * 4).max(1);
@@ -294,10 +260,10 @@ pub fn find_islands(file: &[u8], g: &Goo, t: Thresholds) -> Result<Vec<(usize, u
                 let core = core_of(file, g, k)?;
                 if let Some(c) = &core {
                     let support = match &below {
-                        Some(b) => c.project(b),
+                        Some(b) => c.project(b).dilate_cross(TOUCH_PX),
                         None => Mask::zeros_like(c),
                     };
-                    found.extend(t.unheld(c, &support).sizes.into_iter().map(|px| (k, px)));
+                    found.extend(mask::unheld_components(c, &support).sizes.into_iter().map(|px| (k, px)));
                 }
                 below = core;
             }
@@ -307,10 +273,10 @@ pub fn find_islands(file: &[u8], g: &Goo, t: Thresholds) -> Result<Vec<(usize, u
     Ok(chunks?.into_iter().flatten().collect())
 }
 
-pub fn find_islands_in(path: &Path, t: Thresholds) -> Result<Vec<(usize, u64)>, String> {
+pub fn find_islands_in(path: &Path) -> Result<Vec<(usize, u64)>, String> {
     let file = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let g = goo::parse(&file).map_err(|e| format!("{}: {e}", path.display()))?;
-    find_islands(&file, &g, t)
+    find_islands(&file, &g)
 }
 
 #[cfg(test)]
@@ -366,10 +332,10 @@ mod tests {
             frame(&[BLOCK, DOT, BRIDGE], &[]),
         ];
         fs::write(&src, make_goo(&layers, W, H, true)).unwrap();
-        assert_eq!(find_islands_in(&src, Thresholds::default()).unwrap(), vec![(2, 16)]);
+        assert_eq!(find_islands_in(&src).unwrap(), vec![(2, 16)]);
 
         let dst = dir.join("out.goo");
-        let report = trim_file(&src, &dst, Thresholds::default()).unwrap();
+        let report = trim_file(&src, &dst).unwrap();
         assert_eq!(report.by_layer, vec![(2, 1, 16), (3, 1, 16)]);
         assert_eq!((report.regions_dropped, report.pixels_dropped, report.layers_changed), (2, 32, 2));
         let out = fs::read(&dst).unwrap();
@@ -380,10 +346,10 @@ mod tests {
             true,
         );
         assert_eq!(out, expected);
-        assert_eq!(find_islands_in(&dst, Thresholds::default()).unwrap(), vec![]);
+        assert_eq!(find_islands_in(&dst).unwrap(), vec![]);
 
         // never overwrites, and leaves no temp file behind
-        assert!(trim_file(&src, &dst, Thresholds::default()).unwrap_err().contains("already exists"));
+        assert!(trim_file(&src, &dst).unwrap_err().contains("already exists"));
         let tmps = fs::read_dir(&dir).unwrap().filter(|e| e.as_ref().unwrap().path().extension() == Some("tmp".as_ref()));
         assert_eq!(tmps.count(), 0);
         fs::remove_dir_all(&dir).unwrap();
@@ -398,7 +364,7 @@ mod tests {
         let faint = ((25, 27, 2, 4), 40);
         fs::write(&src, make_goo(&[frame(&[BLOCK], &[]), frame(&[BLOCK], &[edge, lone, faint])], W, H, false)).unwrap();
         let dst = dir.join("out.goo");
-        let report = trim_file(&src, &dst, Thresholds::default()).unwrap();
+        let report = trim_file(&src, &dst).unwrap();
         assert_eq!(report.by_layer, vec![(2, 1, 8)]);
         let out = fs::read(&dst).unwrap();
         assert!(!out.ends_with(&goo::END_MARKER));
@@ -412,7 +378,7 @@ mod tests {
         let src = dir.join("b.goo");
         fs::write(&src, make_goo(&[frame(&[BLOCK], &[]), frame(&[], &[]), frame(&[BLOCK], &[])], W, H, false)).unwrap();
         let dst = dir.join("out.goo");
-        let report = trim_file(&src, &dst, Thresholds::default()).unwrap();
+        let report = trim_file(&src, &dst).unwrap();
         assert_eq!(report.by_layer, vec![(3, 1, 100)]);
         assert_eq!(pixels(&fs::read(&dst).unwrap(), 3), vec![0; W * H]);
         fs::remove_dir_all(&dir).unwrap();
@@ -428,7 +394,7 @@ mod tests {
         f[last] ^= 0xFF; // break layer 2's checksum
         fs::write(&src, &f).unwrap();
         let dst = dir.join("out.goo");
-        let err = trim_file(&src, &dst, Thresholds::default()).unwrap_err();
+        let err = trim_file(&src, &dst).unwrap_err();
         assert!(err.contains("layer 2") && err.contains("checksum"), "{err}");
         assert!(!dst.exists());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
