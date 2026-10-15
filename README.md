@@ -120,6 +120,17 @@ joins the results: it holds the unsupported voxels as runs along each row rather
 than upstream's one `Set` entry a voxel, which a large part overflows. Its
 islands match upstream's (NDFM-23).
 
+`ts/support-zones.ts` holds where supports may not go and where they came too
+close (NDFM-28). Holes' keep-out cylinders and the height cap
+(`max_support_height_mm`, measured from the model's own base) block contacts on
+the model surface and remove any support that still enters them. A contact just
+under the cap keeps its tip, whose cone can poke a fraction of a millimetre
+above it. The clearance check samples the final support mesh every 0.25 mm and
+measures each point's distance to the model with a BVH, ignoring the 3 mm round
+each contact tip and anything below the model's base. Gaps under
+`min_clearance_mm` (0.3 by default) are reported as grazes and warned about. On
+Chi (a 50 mm cat, 245,000 samples), the check takes about 0.6 s.
+
 Previews can also be rendered by hand:
 
 ```bash
