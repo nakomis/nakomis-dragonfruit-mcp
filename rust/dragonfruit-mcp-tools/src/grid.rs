@@ -8,7 +8,7 @@ use dragonfruit_mesh_repair::{IndexedMesh, Vec3};
 
 use crate::ops::ray_tri;
 
-/// Cells along the longest side at most, so a big model costs a few MB, not hundreds.
+/// Cells along the longest side at most: 200^3 cells cost about 64 MB while building.
 const MAX_CELLS_PER_AXIS: f32 = 200.0;
 /// Cells are at least this big (mm): a hollowed mesh's triangles are about a voxel.
 const MIN_CELL_MM: f32 = 0.25;

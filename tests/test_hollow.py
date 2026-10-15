@@ -194,6 +194,14 @@ def test_drill_unknown_vent_route_is_refused(bin_dir, stl):
     _fake_tools(bin_dir, _punch_report(stl))
     with pytest.raises(cli.CliError, match="vent_route"):
         hollow_tools.drill_holes(stl, auto_drain=True, vent_route="sideways")
+    with pytest.raises(cli.CliError, match="lowest_clearance_mm"):
+        hollow_tools.drill_holes(stl, auto_drain=True, lowest_clearance_mm=float("inf"))
+
+
+def test_drill_vent_route_ignores_case(bin_dir, stl):
+    args = _fake_tools(bin_dir, _punch_report(stl))
+    hollow_tools.drill_holes(stl, auto_drain=True, vent_route=" Vertical ")
+    assert "--vent-route vertical" in args.read_text()
 
 
 def test_drill_xy_and_down_axis_are_passed(bin_dir, stl):

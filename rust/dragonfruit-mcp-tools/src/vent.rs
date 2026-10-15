@@ -34,6 +34,12 @@ const VENT_MAX_STARTS: usize = 200;
 /// straight up. Never downwards: the vent is for air to come in at the top.
 const VENT_AZIMUTH_STEP_DEG: f32 = 15.0;
 const VENT_ELEVATIONS_DEG: [f32; 6] = [0.0, 15.0, 30.0, 45.0, 60.0, 75.0];
+/// The highest starts are always kept when there are too many.
+const VENT_KEEP_HIGHEST: usize = 20;
+/// How much a lowered slanted route may beat its raw length by, for the early stop.
+const VENT_SLACK_MM: f32 = 2.0;
+/// At most this many routes are fully evaluated per cavity.
+const VENT_MAX_EVALUATIONS: usize = 4096;
 /// Routes are tried this many at a time, in parallel.
 const EVAL_BATCH: usize = 64;
 /// The route is sampled this often along its length.
@@ -183,7 +189,26 @@ impl Ctx<'_> {
                 || !self.grid.any_within(add(start, dir, t), need, |tri| {
                     self.shells.triangle_shell[tri] != self.cav
                 })
-        })
+        }) && !self.reenters(start, dir, exit_mm)
+    }
+
+    /// Whether the bore, once out, runs back into the model within its length (out of
+    /// a pocket between, say, an ear and the head): the hole would be cut short there.
+    fn reenters(&self, start: [f32; 3], dir: [f32; 3], exit_mm: f32) -> bool {
+        // Past the axis's exit by the most a slanted rim can lag, plus the margin.
+        let reach = 2.0 * self.radius + 2.0;
+        let mut again = false;
+        self.grid.walk(
+            add(start, dir, exit_mm + 1e-3),
+            dir,
+            reach,
+            |(_, tri, leaving)| {
+                let shell = self.shells.triangle_shell[tri];
+                again = !leaving && self.shells.volumes[shell] > 0.0;
+                !again
+            },
+        );
+        again
     }
 }
 
@@ -201,7 +226,8 @@ fn directions(axis: Axis) -> Vec<[f32; 3]> {
             d[ia] = ce * ca;
             d[ib] = ce * sa;
             d[axis.k] = se * up[axis.k];
-            dirs.push(d);
+            // Snap cos(90) and the like to 0, so the holes file reads cleanly.
+            dirs.push(d.map(|c| if c.abs() < 1e-6 { 0.0 } else { c }));
             a += VENT_AZIMUTH_STEP_DEG;
         }
     }
@@ -296,15 +322,18 @@ pub fn shortest_vent(
         }
     }
     if starts.len() > VENT_MAX_STARTS {
-        // Highest first, then spread evenly over the rest.
+        // The highest few, then the rest spread evenly.
         starts.sort_by(|x, y| axis.height(*y).total_cmp(&axis.height(*x)));
-        let stride = starts.len().div_ceil(VENT_MAX_STARTS);
-        starts = starts.into_iter().step_by(stride).collect();
+        let rest = starts.split_off(VENT_KEEP_HIGHEST);
+        let stride = rest.len().div_ceil(VENT_MAX_STARTS - VENT_KEEP_HIGHEST);
+        starts.extend(rest.into_iter().step_by(stride));
     }
 
-    // Every route's length from its un-lowered start, shortest first: lowering only
-    // ever lengthens an upward route, so once a raw length passes the best score so
-    // far, nothing later can beat it.
+    // Every route's length from its un-lowered start, shortest first. Lowering the start
+    // lengthens a vertical route; a slanted one shifts sideways and may come out a
+    // little sooner (a bulging flank), so the search stops once raw lengths pass the
+    // best score by `VENT_SLACK_MM`, or after `VENT_MAX_EVALUATIONS` routes: the vent is
+    // the shortest clear route found, near enough the shortest of all.
     let dirs = directions(axis);
     let mut raw: Vec<(f32, usize, usize)> = Vec::new();
     for (si, &s) in starts.iter().enumerate() {
@@ -321,13 +350,16 @@ pub fn shortest_vent(
     // In batches, in parallel, then merged in order, so the early stop still holds.
     let mut best: Option<(f32, Route)> = None;
     let mut rejected = 0usize;
-    'batches: for batch in raw.chunks(EVAL_BATCH) {
+    'batches: for batch in raw
+        .chunks(EVAL_BATCH)
+        .take(VENT_MAX_EVALUATIONS / EVAL_BATCH)
+    {
         let routes: Vec<(f32, Option<Route>)> = batch
             .par_iter()
             .map(|&(len, si, di)| {
                 if best
                     .as_ref()
-                    .is_some_and(|(score, r)| r.full_width && len > *score)
+                    .is_some_and(|(score, r)| r.full_width && len > *score + VENT_SLACK_MM)
                 {
                     return (len, None);
                 }
@@ -349,7 +381,7 @@ pub fn shortest_vent(
         for (len, route) in routes {
             if best
                 .as_ref()
-                .is_some_and(|(score, r)| r.full_width && len > *score)
+                .is_some_and(|(score, r)| r.full_width && len > *score + VENT_SLACK_MM)
             {
                 break 'batches;
             }
@@ -384,7 +416,11 @@ mod tests {
     use crate::ops::testutil::*;
 
     fn route(mesh: &IndexedMesh, radius: f32) -> Result<Route, String> {
-        let axis = Axis::parse("-z").unwrap();
+        route_along(mesh, radius, Axis::parse("-z").unwrap())
+    }
+
+    fn route_along(mesh: &IndexedMesh, radius: f32, axis: Axis) -> Result<Route, String> {
+        let (ia, ib) = axis.plane();
         let shells = Shells::of(mesh);
         let cols = Columns::new(mesh, axis);
         let grid = Grid::new(mesh);
@@ -394,7 +430,8 @@ mod tests {
             if shells.triangle_shell[ti] == cav {
                 for &vi in t {
                     let p = mesh.positions[vi as usize];
-                    pts.push((p.x, p.y, p.z));
+                    let p = [p.x, p.y, p.z];
+                    pts.push((p[ia], p[ib], axis.height(p)));
                 }
             }
         }
@@ -482,5 +519,36 @@ mod tests {
         assert!(dirs.iter().all(|d| d[2] >= 0.0));
         let dirs = directions(Axis::parse("+x").unwrap());
         assert!(dirs.iter().all(|d| d[0] <= 0.0));
+    }
+
+    #[test]
+    fn a_route_back_into_the_model_is_refused() {
+        // As the sideways test, but a separate block stands 1 mm off the -x face: the
+        // way out through the 4 mm wall would run straight back into it.
+        let mesh = merge(vec![
+            cube(40.0),
+            cuboid([4.0, 10.0, 6.0], [20.0, 30.0, 34.0], true),
+            cuboid([-6.0, 0.0, 0.0], [-1.0, 40.0, 40.0], false),
+        ]);
+        let r = route(&mesh, 1.0).unwrap();
+        assert!(r.dir[0] > -0.5, "{r:?}");
+    }
+
+    #[test]
+    fn other_down_axes_vent_away_from_the_plate() {
+        // Plate on the +y side, so up is -y. The cavity sits 4 mm from the -x face and
+        // 6 mm from the -y face: out sideways through -x, never towards +y.
+        let mesh = merge(vec![
+            cube(40.0),
+            cuboid([4.0, 6.0, 10.0], [20.0, 34.0, 30.0], true),
+        ]);
+        let r = route_along(&mesh, 1.0, Axis::parse("+y").unwrap()).unwrap();
+        assert!(r.dir[1] <= 1e-6, "{r:?}");
+        assert!(r.dir[0] < -0.95, "{r:?}");
+        // At the top, which is now the low-y end: the rim's edge just inside y = 6.
+        assert!(
+            r.start[1] < 6.0 + 1.0 + FULL_WIDTH_MARGIN_MM + 0.3 + EXTEND_STEP_MM + 0.01,
+            "{r:?}"
+        );
     }
 }

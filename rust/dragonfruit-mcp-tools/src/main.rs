@@ -83,7 +83,8 @@ enum Command {
         #[arg(long, default_value = "-z", allow_hyphen_values = true)]
         down_axis: String,
         /// Pin the vertical holes at this position across the down axis (mm, in x/y/z
-        /// order of the two remaining axes), e.g. to keep clear of supports.
+        /// order of the two remaining axes), e.g. to keep clear of supports. A
+        /// shortest-route vent is not pinned; use --vent-route vertical to pin it too.
         #[arg(
             long,
             num_args = 2,
@@ -97,12 +98,14 @@ enum Command {
         radius_mm: f32,
         /// How the vent leaves the top of each cavity: `shortest` (the shortest straight
         /// route that keeps clear of the surface until its exit, in any upward or
-        /// sideways direction) or `vertical` (straight up through a flat roof).
-        #[arg(long, default_value = "shortest", requires = "auto_drain")]
+        /// sideways direction) or `vertical` (straight up through a flat roof). With
+        /// --auto-drain only.
+        #[arg(long, default_value = "shortest")]
         vent_route: String,
         /// Prefer suction-relief positions at least radius + this (mm) across from the
-        /// model's lowest skin, where the first supports land; 0 turns it off.
-        #[arg(long, default_value_t = 3.0, requires = "auto_drain")]
+        /// model's lowest skin, where the first supports land; 0 turns it off. With
+        /// --auto-drain only.
+        #[arg(long, default_value_t = 3.0)]
         lowest_clearance_mm: f32,
         /// The resin is clear or translucent: warn about holes under 3 mm across, not 2.
         #[arg(long)]

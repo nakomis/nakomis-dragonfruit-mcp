@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -267,7 +268,8 @@ def drill_holes(
       leave the lowest point no support at all. Otherwise it cannot see supports or the
       raft: if the base has supports, pass `xy` (the position across the down axis: x, y
       for -z) to move the vertical holes clear of them, and keep them at least radius +
-      1 mm inside the base outline.
+      1 mm inside the base outline. `xy` does not pin a shortest-route vent; pass
+      `vent_route="vertical"` to pin both.
     - If no clear vertical path exists the drain falls back to a horizontal hole through
       the side wall (with a horizontal vent too if the vent also failed) and says so in
       `warnings`; rough skin gets a vertical hole with a warning. Read the warnings.
@@ -305,8 +307,11 @@ def drill_holes(
         raise cli.CliError("give either `holes` or `auto_drain=True`, not both or neither")
     if xy is not None and not auto_drain:
         raise cli.CliError("`xy` only applies with `auto_drain=True`")
+    vent_route = vent_route.strip().lower()
     if vent_route not in ("shortest", "vertical"):
         raise cli.CliError(f'`vent_route` must be "shortest" or "vertical", got {vent_route!r}')
+    if not math.isfinite(lowest_clearance_mm):
+        raise cli.CliError(f"`lowest_clearance_mm` must be a number, got {lowest_clearance_mm}")
     src = _check(Path(stl_path))
     out = _output_path(src, out_path, ".drilled")
     args = ["punch", str(src), "-o", str(out), "--radius-mm", f"{radius_mm:g}", "--json"]
