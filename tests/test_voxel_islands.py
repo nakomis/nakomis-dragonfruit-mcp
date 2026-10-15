@@ -82,7 +82,9 @@ def test_ts_voxel_islands_unit_tests():
     }
     test_file = cli.REPO_ROOT / "ts" / "tests" / "voxel-islands.test.ts"
     proc = subprocess.run(
-        [str(cli.find_tsx()), "--test", str(test_file)],
+        # TAP, whatever the Node version: newer Nodes default to the spec reporter
+        # even when not on a terminal, and only TAP prints "# fail 0".
+        [str(cli.find_tsx()), "--test", "--test-reporter=tap", str(test_file)],
         cwd=df,
         env=env,
         capture_output=True,
