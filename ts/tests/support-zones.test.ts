@@ -19,6 +19,8 @@ import {
     HeightCapZone,
     KeepOutZone,
     positionsInFaceOrder,
+    SurfaceTilt,
+    tiltDeg,
     triangleIndicesInZones,
     type ClippableOverhangRegion,
 } from '../support-zones';
@@ -253,4 +255,32 @@ test('a triangle partly skipped counts only the part kept', () => {
     const half = findSparseSupport(slab, [], 5, { ...SPARSE, skip: (x) => x < 5 });
     assert.ok(half.overhang_area_mm2 > 40 && half.overhang_area_mm2 < 60, `overhang ${half.overhang_area_mm2}`);
     assert.ok(half.sparse_area_mm2 > 40 && half.sparse_area_mm2 < 60, `sparse ${half.sparse_area_mm2}`);
+});
+
+
+// Steep-wall contacts (NDFM-31).
+test('tilt is 0 for a flat underside, 90 for a wall, 180 for a top', () => {
+    assert.ok(Math.abs(tiltDeg(-1)) < 1e-9);
+    assert.ok(Math.abs(tiltDeg(0) - 90) < 1e-9);
+    assert.ok(Math.abs(tiltDeg(1) - 180) < 1e-9);
+    assert.ok(Math.abs(tiltDeg(-Math.cos(Math.PI / 4)) - 45) < 1e-9);
+});
+
+test('the surface round a tip: underside, wall and top of a box', () => {
+    // A 20 mm cube: points 0.01 mm inside each face's middle.
+    const tilt = new SurfaceTilt(positions(box([20, 20, 20], [0, 0, 0])));
+    assert.ok(Math.abs(tilt.at({ x: 10, y: 10, z: 0.01 })) < 1e-6, 'underside');
+    assert.ok(Math.abs(tilt.at({ x: 0.01, y: 10, z: 10 }) - 90) < 1e-6, 'wall');
+    assert.ok(Math.abs(tilt.at({ x: 10, y: 10, z: 19.99 }) - 180) < 1e-6, 'top');
+    // Off the model altogether: no answer.
+    assert.ok(Number.isNaN(tilt.at({ x: 100, y: 100, z: 100 })));
+});
+
+test('a tip at the edge between an underside and a wall averages both', () => {
+    // Small triangles, so the 1.5 mm radius sees both faces near the edge.
+    const fine = new THREE.BoxGeometry(20, 20, 20, 20, 20, 20).toNonIndexed();
+    fine.translate(10, 10, 10);
+    const tilt = new SurfaceTilt(fine.getAttribute('position').array as Float32Array);
+    const edge = tilt.at({ x: 0, y: 10, z: 0 });
+    assert.ok(edge > 30 && edge < 60, `edge ${edge}`);
 });

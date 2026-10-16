@@ -257,6 +257,8 @@ def test_missing_stl_and_material_raise(fake_env, stl, tmp_path):
         {"overhang_max_height_mm": 3, "overhangs": False},
         {"min_clearance_mm": -0.1},
         {"min_clearance_mm": float("inf")},
+        {"steep_contact_deg": 0},
+        {"steep_contact_deg": 200},
     ],
 )
 def test_bad_values_raise(fake_env, stl, kwargs):
@@ -815,3 +817,39 @@ def test_real_sparse_check_runs_and_reports_its_tries(tmp_path):
     assert data["sparse_support"]["samples_checked"] > 0
     chosen = [t for t in tries if t["density"] == data["density"]["chosen"]][0]
     assert chosen["sparse_area_mm2"] == min(t["sparse_area_mm2"] for t in tries)
+
+
+STEEP_RESULT = {
+    "limit_deg": 60,
+    "radius_mm": 1.5,
+    "avoid": True,
+    "contacts_checked": 1030,
+    "supports_steep": 17,
+    "removed": [{"tilt_deg": 89.0, "at_plate_mm": [13.3, 27.0, 15.7], "height_above_base_mm": 8.7}],
+    "kept_for_coverage": [
+        {
+            "tilt_deg": 75.0,
+            "at_plate_mm": [17.6, 27.0, 10.2],
+            "height_above_base_mm": 3.2,
+            "island": "o11",
+        }
+    ],
+    "entities_removed": 27,
+}
+
+
+def test_steep_contacts_are_passed_and_mapped(fake_env, stl):
+    fake_env.summary.write_text(json.dumps({**SUMMARY, "steep_contacts": STEEP_RESULT}))
+    result = run(stl, steep_contact_deg=70)
+    args = script_args(fake_env)
+    assert args[args.index("--steep-contact-deg") + 1] == "70"
+    assert "--keep-steep-contacts" not in args
+    assert result.steep_contacts.removed[0].tilt_deg == 89.0
+    assert result.steep_contacts.kept_for_coverage[0].island == "o11"
+    sidecar = json.loads(Path(result.sidecar_path).read_text())
+    assert sidecar["supports"]["steep_supports_removed"] == 1
+
+
+def test_steep_contacts_can_be_kept(fake_env, stl):
+    run(stl, avoid_steep_contacts=False)
+    assert "--keep-steep-contacts" in script_args(fake_env)
