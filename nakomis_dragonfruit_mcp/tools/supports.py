@@ -209,6 +209,45 @@ class Clearance(BaseModel):
     grazes: list[Graze] = Field(description="Worst first")
 
 
+class SparseRegion(BaseModel):
+    """Overhang too far from any support contact (NDFM-30)."""
+
+    area_mm2: float
+    max_gap_mm: float = Field(description="The furthest its points lie from a contact")
+    at_plate_mm: list[float] = Field(description="Where that furthest point is, plate frame")
+    centre_plate_mm: list[float]
+    height_above_base_mm: float
+    z_range_mm: list[float]
+    samples: int
+
+
+class SparseSupport(BaseModel):
+    limit_mm: float = Field(description="Overhang further than this from every contact counts")
+    self_support_angle_deg: float
+    min_area_mm2: float = Field(description="Smaller sparse regions are ignored")
+    samples_checked: int
+    overhang_area_mm2: float = Field(description="All the overhang checked")
+    sparse_area_mm2: float
+    regions: list[SparseRegion] = Field(description="Largest first")
+    internal_regions_skipped: int = Field(
+        default=0, description="Sparse regions facing into a sealed cavity, left out"
+    )
+
+
+class DensityTry(BaseModel):
+    density: float
+    contacts: int
+    sparse_area_mm2: float
+    sparse_regions: int
+
+
+class Density(BaseModel):
+    requested: float
+    auto_densify: bool
+    chosen: float = Field(description="The density whose supports were sliced")
+    tries: list[DensityTry]
+
+
 class SupportedSlice(ToolResult):
     output_path: str = Field(description="The sliced print, supports and raft included")
     format: str
@@ -276,6 +315,12 @@ class SupportedSlice(ToolResult):
     )
     clearance: Clearance | None = Field(
         default=None, description="Supports that pass the model too closely (min_clearance_mm)"
+    )
+    sparse_support: SparseSupport | None = Field(
+        default=None, description="Overhang too far from any contact, in the supports sliced"
+    )
+    density: Density | None = Field(
+        default=None, description="What auto_densify tried, and the density kept"
     )
     previews_written: bool = Field(
         default=False,
@@ -383,6 +428,7 @@ async def auto_support_and_slice(
     max_support_height_mm: float | None = None,
     overhang_max_height_mm: float | None = None,
     min_clearance_mm: float = DEFAULT_MIN_CLEARANCE_MM,
+    auto_densify: bool = True,
     options: dict[str, Any] | None = None,
     previews: bool = True,
 ) -> SupportedSlice:
@@ -467,6 +513,16 @@ async def auto_support_and_slice(
     cures shut and the support prints fused to the model. Nothing is removed
     for it: move the model, cap the supports or edit them.
 
+    Sparse support: after placement, overhang surface (down-facing and flatter
+    than the self-support angle) lying further than 1.25 grid spacings (the
+    grid is the square root of the app's area per support, 10 mm² by default)
+    from every contact is reported in `sparse_support.regions` and warned about.
+    Each layer can rest on the one below and still sag or tear there. With
+    `auto_densify` (the default), placement then runs again at 1.5x and 2x the
+    density and the run with the least sparse area is kept; `density` in the
+    result lists what was tried. An explicit `density` is where it starts.
+    Cavity ceilings, keep-out zones and anything above the cap are left out.
+
     Outputs: the print at `out_path`, or beside the STL as
     `<name>-<printer>-supported<ext>`. The printer profile decides the format;
     an `out_path` with another extension is refused. Parent folders are
@@ -517,6 +573,7 @@ async def auto_support_and_slice(
         max_support_height_mm=max_support_height_mm,
         overhang_max_height_mm=overhang_max_height_mm,
         min_clearance_mm=min_clearance_mm,
+        auto_densify=auto_densify,
         options=options,
         previews=previews,
     )
@@ -547,6 +604,7 @@ def run_auto_support_and_slice(
     max_support_height_mm: float | None = None,
     overhang_max_height_mm: float | None = None,
     min_clearance_mm: float = DEFAULT_MIN_CLEARANCE_MM,
+    auto_densify: bool = True,
     options: dict[str, Any] | None = None,
     previews: bool = True,
 ) -> SupportedSlice:
@@ -658,6 +716,8 @@ def run_auto_support_and_slice(
         if overhang_max_height_mm is not None:
             args += ["--overhang-max-height", f"{overhang_max_height_mm:g}"]
         args += ["--min-clearance", f"{min_clearance_mm:g}"]
+        if not auto_densify:
+            args.append("--no-auto-densify")
         if zones:
             # In the STL's frame: the script moves them with the model onto the plate.
             keep_out_file = Path(tmp) / "holes.json"
@@ -726,6 +786,8 @@ def run_auto_support_and_slice(
             "max_support_height_mm": max_support_height_mm,
             "overhang_max_height_mm": overhang_max_height_mm,
             "grazes": len((data.get("clearance") or {}).get("grazes", [])),
+            "density": (data.get("density") or {}).get("chosen"),
+            "sparse_area_mm2": (data.get("sparse_support") or {}).get("sparse_area_mm2"),
             "supported_stl": data.get("supported_stl") if export_supported_stl else None,
         }
         sidecar = slicing.write_sidecar(
@@ -785,6 +847,10 @@ def run_auto_support_and_slice(
                 OverhangBand(**data["overhang_band"]) if data.get("overhang_band") else None
             ),
             clearance=Clearance(**data["clearance"]) if data.get("clearance") else None,
+            sparse_support=(
+                SparseSupport(**data["sparse_support"]) if data.get("sparse_support") else None
+            ),
+            density=Density(**data["density"]) if data.get("density") else None,
             timings_ms=data["timings_ms"],
             previews_written=previews_written,
             warnings=warnings,
