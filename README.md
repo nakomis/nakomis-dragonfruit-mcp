@@ -137,7 +137,13 @@ square root of the app's area per support), where each layer rests on the one
 below but the edge between contacts can still sag or tear. If it finds any,
 placement runs again at 1.5x and 2x the density and the least sparse run is
 kept, restored from a snapshot of the support store so that the supports
-sliced are the ones checked (`auto_densify`, on by default).
+sliced are the ones checked (`auto_densify`, on by default). Steep-wall contacts (NDFM-31): a support whose tips all
+meet surface steeper than 60° from horizontal (averaged over 1.5 mm round the
+tip), with no overhang within that 1.5 mm, holds up a wall that holds itself
+up, and tears a strip out of it when it comes off a soft, fresh print. Such
+supports are removed (`avoid_steep_contacts`, on by default), except where one
+is all that holds an island; this runs inside each placement try, before the
+sparse check, so densifying judges the supports that will print.
 
 It also holds the overhang band (NDFM-22). `overhang_max_height_mm` limits
 the overhang family alone to that height above the model's base, for a lifted
