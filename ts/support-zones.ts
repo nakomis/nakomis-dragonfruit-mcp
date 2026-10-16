@@ -629,14 +629,18 @@ export function findSparseSupport(
         if (twiceArea === 0 || n.z / twiceArea >= maxNz) continue;
         const area = twiceArea / 2;
         const pts: [number, number, number][] = [];
+        let all = 0;
         sampleTriangle(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, spacing, (x, y, z) => {
+            all++;
             if (options.ignoreBelowZ !== undefined && z < options.ignoreBelowZ) return;
             if (options.skip?.(x, y, z)) return;
             pts.push([x, y, z]);
         });
         if (pts.length === 0) continue;
-        const weight = area / pts.length;
-        report.overhang_area_mm2 += area;
+        // Each sample stands for its share of the whole triangle, so a triangle
+        // part-skipped (straddling a zone or the cap) counts only the part kept.
+        const weight = area / all;
+        report.overhang_area_mm2 += weight * pts.length;
         for (const [x, y, z] of pts) {
             report.samples_checked++;
             const gap = nearest(x, y, z);

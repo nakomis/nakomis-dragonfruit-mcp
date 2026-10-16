@@ -583,7 +583,8 @@ async function main(): Promise<void> {
         try {
             return await run();
         } finally {
-            timings[label] = Math.round(performance.now() - started);
+            // Summed: placement and the sparse check run once per density tried.
+            timings[label] = (timings[label] ?? 0) + Math.round(performance.now() - started);
         }
     };
 
@@ -957,12 +958,17 @@ async function main(): Promise<void> {
         {
             selfSupportAngleDeg,
             limitMm: sparseLimitMm,
-            skip: (x, y, z) => allZones.some((zone) => zone.contains(x, y, z)),
+            // Surface left bare on purpose is not sparse: in a zone, above the
+            // cap, above the overhang band (the overhang family stops there), or
+            // anywhere when the overhang family is off (lattices, NDFM-21).
+            skip: (x, y, z) => !options.overhangs || (bandTopZ !== null && z > bandTopZ)
+                || allZones.some((zone) => zone.contains(x, y, z)),
             ignoreBelowZ: options.liftMm === 0 ? box.min.z + layerHeightMm : undefined,
             isEnclosed: (p) => isInternalContact(mesh, p),
         },
     );
-    const densities = options.autoDensify ? [1, 1.5, 2].map((k) => options.density * k) : [options.density];
+    // Without the overhang family the check has nothing to judge, so no retry.
+    const densities = options.autoDensify && options.overhangs ? [1, 1.5, 2].map((k) => options.density * k) : [options.density];
     type Attempt = Awaited<ReturnType<typeof attempt>> & { sparse: SparseSupportReport; snapshot: ReturnType<typeof getSnapshot> };
     const tries: Attempt[] = [];
     for (const density of densities) {

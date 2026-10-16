@@ -246,3 +246,11 @@ test('two separate sparse patches are two regions, the larger first', () => {
     assert.ok(report.regions[0].area_mm2 > report.regions[1].area_mm2);
     assert.ok(report.regions[0].centre_plate_mm[0] < 15);
 });
+
+test('a triangle partly skipped counts only the part kept', () => {
+    const slab = positions(box([10, 10, 1], [0, 0, 5]));
+    // Skip the half of the underside with x < 5.
+    const half = findSparseSupport(slab, [], 5, { ...SPARSE, skip: (x) => x < 5 });
+    assert.ok(half.overhang_area_mm2 > 40 && half.overhang_area_mm2 < 60, `overhang ${half.overhang_area_mm2}`);
+    assert.ok(half.sparse_area_mm2 > 40 && half.sparse_area_mm2 < 60, `sparse ${half.sparse_area_mm2}`);
+});
