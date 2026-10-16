@@ -567,6 +567,25 @@ function findDanglingShafts(): string[] {
     return dangling;
 }
 
+/**
+ * What hangs off each support (hosted on its knots: a leaf or branch, or a
+ * brace's end), which `removeSupportEntity` takes with it.
+ */
+function hostedChildren(): Map<string, string[]> {
+    const state = getSnapshot() as unknown as Record<string, Record<string, Record<string, unknown>>>;
+    const children = new Map<string, string[]>();
+    for (const descriptor of SUPPORT_STATE_TYPES) {
+        for (const [id, entity] of Object.entries(state[descriptor.location.key] ?? {})) {
+            for (const field of ['parentKnotId', 'startKnotId', 'endKnotId']) {
+                const knot = entity[field] ? state.knots?.[entity[field] as string] as { parentShaftId?: string } | undefined : undefined;
+                const host = knot?.parentShaftId;
+                if (host && host !== id) (children.get(host) ?? children.set(host, []).get(host)!).push(id);
+            }
+        }
+    }
+    return children;
+}
+
 function writeBinaryStl(path: string, positions: Float32Array): void {
     const triangles = positions.length / 9;
     const buffer = Buffer.alloc(84 + triangles * 50);
@@ -961,7 +980,7 @@ async function main(): Promise<void> {
         // steeper than the limit. They hold up a wall that holds itself up and
         // tear a strip out of it on removal, so (by default) they go, except
         // where one is all that holds an island: then the least steep stays.
-        type SteepContact = { tilt_deg: number; at_plate_mm: number[]; height_above_base_mm: number; island?: string };
+        type SteepContact = { tilt_deg: number; at_plate_mm: number[]; height_above_base_mm: number; island?: string; id?: string };
         const steep = {
             limit_deg: options.steepContactDeg,
             radius_mm: STEEP_RADIUS_MM,
@@ -974,17 +993,27 @@ async function main(): Promise<void> {
         };
         {
             const live = probeCommittedSupports();
+            const probeById = new Map(live.map((probe) => [probe.id, probe]));
+            // Removing a support takes what hangs off it, so a support is judged
+            // with everything it hosts: steep only if every tip in it is.
+            const children = hostedChildren();
+            const subtree = (id: string): string[] => {
+                const out = new Set<string>([id]);
+                for (const next of out) for (const child of children.get(next) ?? []) out.add(child);
+                return [...out];
+            };
             const steepBy = new Map<string, SteepContact>();
             for (const probe of live) {
-                if (probe.contacts.length === 0) continue;
+                const tips = subtree(probe.id).flatMap((id) => probeById.get(id)?.contacts ?? []);
+                if (tips.length === 0) continue;
                 // Steep where the surface round the tip is steep on average and
                 // none of it needs support: a tip beside a real overhang stays.
-                const around = probe.contacts.map((q) => surfaceTilt.around(q));
+                const around = tips.map((q) => surfaceTilt.around(q));
                 const tilts = around.map((a) => a.mean);
                 steep.contacts_checked += tilts.length;
                 if (!around.every((a) => Number.isFinite(a.mean) && a.mean > options.steepContactDeg && a.flattest >= selfSupportAngleDeg)) continue;
                 const i = tilts.indexOf(Math.min(...tilts));
-                const q = probe.contacts[i];
+                const q = tips[i];
                 steepBy.set(probe.id, { tilt_deg: tilts[i], at_plate_mm: q.toArray(), height_above_base_mm: q.z - box.min.z });
             }
             steep.supports_steep = steepBy.size;
@@ -995,9 +1024,12 @@ async function main(): Promise<void> {
                 if (near.length === 0 || near.some((probe) => !steepBy.has(probe.id))) continue;
                 // Everything near this island is steep-walled: keep the least steep.
                 const keep = near.reduce((p, q) => (steepBy.get(p.id)!.tilt_deg <= steepBy.get(q.id)!.tilt_deg ? p : q));
-                steep.kept_for_coverage.push({ ...steepBy.get(keep.id)!, island: island.id });
+                steep.kept_for_coverage.push({ ...steepBy.get(keep.id)!, island: island.id, id: keep.id });
                 steepBy.delete(keep.id);
             }
+            // Nothing above a kept support may go: it would take the kept one with it.
+            const kept = new Set(steep.kept_for_coverage.map((k) => k.id));
+            for (const id of [...steepBy.keys()]) if (subtree(id).some((d) => kept.has(d))) steepBy.delete(id);
             steep.removed = [...steepBy.values()];
             if (options.avoidSteepContacts && steepBy.size > 0) {
                 const before = totalEntities();

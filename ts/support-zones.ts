@@ -720,25 +720,30 @@ export function tiltDeg(nz: number): number {
  */
 export class SurfaceTilt {
     private readonly cells = new Map<string, number[]>();
-    private readonly tris: THREE.Triangle[] = [];
-    private readonly tilt: number[] = [];
-    private readonly weight: number[] = [];
+    private readonly positions: Float32Array;
+    private readonly tilt: Float32Array;
+    private readonly weight: Float32Array;
+    // One triangle and two vectors reused per query, not one object per face:
+    // a million-triangle model would otherwise hold hundreds of MB.
+    private readonly tri = new THREE.Triangle();
+    private readonly point = new THREE.Vector3();
+    private readonly closest = new THREE.Vector3();
 
     constructor(positions: ArrayLike<number>, readonly radiusMm = STEEP_RADIUS_MM) {
         const count = Math.floor(positions.length / 9);
+        this.positions = Float32Array.from(positions as ArrayLike<number>);
+        this.tilt = new Float32Array(count);
+        this.weight = new Float32Array(count);
         const r = radiusMm;
         const cap = Math.PI * r * r;
         const n = new THREE.Vector3();
         for (let t = 0; t < count; t++) {
-            const a = new THREE.Vector3().fromArray(positions as number[], t * 9);
-            const b = new THREE.Vector3().fromArray(positions as number[], t * 9 + 3);
-            const c = new THREE.Vector3().fromArray(positions as number[], t * 9 + 6);
-            const tri = new THREE.Triangle(a, b, c);
-            tri.getNormal(n);
-            const area = tri.getArea();
-            this.tris.push(tri);
-            this.tilt.push(area === 0 ? 90 : tiltDeg(n.z));
-            this.weight.push(Math.min(area, cap));
+            this.load(t);
+            const { a, b, c } = this.tri;
+            this.tri.getNormal(n);
+            const area = this.tri.getArea();
+            this.tilt[t] = area === 0 ? 90 : tiltDeg(n.z);
+            this.weight[t] = Math.min(area, cap);
             const lo = [Math.min(a.x, b.x, c.x), Math.min(a.y, b.y, c.y), Math.min(a.z, b.z, c.z)].map((v) => Math.floor(v / r));
             const hi = [Math.max(a.x, b.x, c.x), Math.max(a.y, b.y, c.y), Math.max(a.z, b.z, c.z)].map((v) => Math.floor(v / r));
             for (let x = lo[0]; x <= hi[0]; x++) for (let y = lo[1]; y <= hi[1]; y++) for (let z = lo[2]; z <= hi[2]; z++) {
@@ -746,6 +751,13 @@ export class SurfaceTilt {
                 (this.cells.get(k) ?? this.cells.set(k, []).get(k)!).push(t);
             }
         }
+    }
+
+    private load(t: number): void {
+        const p = this.positions;
+        this.tri.a.set(p[t * 9], p[t * 9 + 1], p[t * 9 + 2]);
+        this.tri.b.set(p[t * 9 + 3], p[t * 9 + 4], p[t * 9 + 5]);
+        this.tri.c.set(p[t * 9 + 6], p[t * 9 + 7], p[t * 9 + 8]);
     }
 
     /** The mean tilt round `p`; NaN for a point with no surface within the radius. */
@@ -756,8 +768,7 @@ export class SurfaceTilt {
     /** The mean tilt round `p`, and the flattest surface within the radius. */
     around(p: { x: number; y: number; z: number }): { mean: number; flattest: number } {
         const r = this.radiusMm;
-        const point = new THREE.Vector3(p.x, p.y, p.z);
-        const closest = new THREE.Vector3();
+        this.point.set(p.x, p.y, p.z);
         const seen = new Set<number>();
         let weighted = 0;
         let total = 0;
@@ -769,7 +780,8 @@ export class SurfaceTilt {
             for (const t of this.cells.get(`${gx + dx},${gy + dy},${gz + dz}`) ?? []) {
                 if (seen.has(t)) continue;
                 seen.add(t);
-                if (this.tris[t].closestPointToPoint(point, closest).distanceTo(point) > r) continue;
+                this.load(t);
+                if (this.tri.closestPointToPoint(this.point, this.closest).distanceTo(this.point) > r) continue;
                 weighted += this.tilt[t] * this.weight[t];
                 total += this.weight[t];
                 flattest = Math.min(flattest, this.tilt[t]);
