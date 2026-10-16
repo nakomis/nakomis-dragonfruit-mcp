@@ -752,3 +752,66 @@ def test_real_overhang_band_keeps_overhang_contacts_in_it(tmp_path):
         assert report["highest_overhang_contact_mm"] <= band + 0.5
     # Nothing is blocked or removed for the band.
     assert data["height_cap"] is None and data["keep_out"] is None
+
+
+SPARSE_RESULT = {
+    "limit_mm": 3.95,
+    "self_support_angle_deg": 45,
+    "min_area_mm2": 2,
+    "samples_checked": 50123,
+    "overhang_area_mm2": 2548.0,
+    "sparse_area_mm2": 6.5,
+    "regions": [
+        {
+            "area_mm2": 6.5,
+            "max_gap_mm": 5.2,
+            "at_plate_mm": [1.0, 26.0, 16.0],
+            "centre_plate_mm": [1.5, 26.2, 16.5],
+            "height_above_base_mm": 9.5,
+            "z_range_mm": [15.0, 18.0],
+            "samples": 26,
+        }
+    ],
+    "internal_regions_skipped": 1,
+}
+DENSITY_RESULT = {
+    "requested": 1,
+    "auto_densify": True,
+    "chosen": 1.5,
+    "tries": [
+        {"density": 1, "contacts": 1015, "sparse_area_mm2": 40.2, "sparse_regions": 4},
+        {"density": 1.5, "contacts": 1420, "sparse_area_mm2": 6.5, "sparse_regions": 1},
+        {"density": 2, "contacts": 1890, "sparse_area_mm2": 6.5, "sparse_regions": 1},
+    ],
+}
+
+
+def test_sparse_support_and_density_are_mapped(fake_env, stl):
+    fake_env.summary.write_text(
+        json.dumps({**SUMMARY, "sparse_support": SPARSE_RESULT, "density": DENSITY_RESULT})
+    )
+    result = run(stl)
+    assert result.sparse_support.regions[0].max_gap_mm == 5.2
+    assert result.sparse_support.internal_regions_skipped == 1
+    assert result.density.chosen == 1.5 and len(result.density.tries) == 3
+    sidecar = json.loads(Path(result.sidecar_path).read_text())
+    assert sidecar["supports"]["density"] == 1.5
+    assert sidecar["supports"]["sparse_area_mm2"] == 6.5
+
+
+def test_auto_densify_can_be_switched_off(fake_env, stl):
+    result = run(stl, auto_densify=False)
+    assert "--no-auto-densify" in script_args(fake_env)
+    assert result.sparse_support is None and result.density is None
+
+
+@pytest.mark.integration
+@needs_pipeline
+def test_real_sparse_check_runs_and_reports_its_tries(tmp_path):
+    # Very sparse on purpose: a third of the density should leave something to fix.
+    data = _run_script(tmp_path, "--no-slice", "--density", "0.33")
+    tries = data["density"]["tries"]
+    assert tries[0]["density"] == pytest.approx(0.33)
+    assert data["sparse_support"]["samples_checked"] > 0
+    chosen = [t for t in tries if t["density"] == data["density"]["chosen"]][0]
+    assert chosen["sparse_area_mm2"] == min(t["sparse_area_mm2"] for t in tries)

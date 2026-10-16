@@ -469,3 +469,223 @@ export function findGrazes(
     report.grazes.sort((p, q) => p.gap_mm - q.gap_mm || (q.z_range_mm[1] - q.z_range_mm[0]) - (p.z_range_mm[1] - p.z_range_mm[0]));
     return report;
 }
+
+/**
+ * Sparse support (NDFM-30): overhanging surface too far from any support
+ * contact. Each layer can rest on the one below and still tear: on the 100 mm
+ * Chi the bulge of a haunch leaned out over his tail with one contact every
+ * 9 mm, and the peel of a large cross-section ripped the edge between them.
+ */
+/** Flag overhang this many grid spacings (√areaPerSupportMm2) from any contact. */
+export const SPARSE_SPACING_FACTOR = 1.25;
+/** Sparse regions smaller than this are ignored, mm². */
+export const SPARSE_MIN_AREA_MM2 = 2;
+export const SPARSE_SAMPLE_MM = 0.5;
+export const SPARSE_CLUSTER_MM = 1.5;
+
+export interface SparseRegion {
+    /** Overhang area in the region, mm². */
+    area_mm2: number;
+    /** The furthest any of its points lies from a contact (capped at the search reach). */
+    max_gap_mm: number;
+    /** Where that is, plate frame. */
+    at_plate_mm: [number, number, number];
+    centre_plate_mm: [number, number, number];
+    height_above_base_mm: number;
+    z_range_mm: [number, number];
+    samples: number;
+}
+
+export interface SparseSupportReport {
+    /** Points further than this from every contact count as sparse. */
+    limit_mm: number;
+    self_support_angle_deg: number;
+    min_area_mm2: number;
+    samples_checked: number;
+    /** All overhang surface checked, mm². */
+    overhang_area_mm2: number;
+    /** Sum of the reported regions' areas. */
+    sparse_area_mm2: number;
+    /** Largest first. */
+    regions: SparseRegion[];
+    /** Regions dropped because they face into a sealed cavity. */
+    internal_regions_skipped: number;
+}
+
+export interface SparseOptions {
+    /** Down-facing surface flatter than this, from horizontal, is overhang. */
+    selfSupportAngleDeg: number;
+    limitMm: number;
+    minAreaMm2?: number;
+    sampleMm?: number;
+    clusterMm?: number;
+    /** Points not to check: inside a keep-out zone, above the cap. */
+    skip?: (x: number, y: number, z: number) => boolean;
+    /** Points sitting on the plate rather than over it (lift 0): below this z. */
+    ignoreBelowZ?: number;
+    /** Whether a point on a down-facing surface faces into a sealed cavity. */
+    isEnclosed?: (p: THREE.Vector3) => boolean;
+}
+
+/** Union-find clusters of points within `mm` of each other (indices into `pts`). */
+function clusterPoints(pts: { x: number; y: number; z: number }[], mm: number): number[][] {
+    const parent = pts.map((_, i) => i);
+    const find = (i: number): number => {
+        while (parent[i] !== i) i = parent[i] = parent[parent[i]];
+        return i;
+    };
+    const grid = new Map<string, number[]>();
+    pts.forEach((p, i) => {
+        const gx = Math.floor(p.x / mm);
+        const gy = Math.floor(p.y / mm);
+        const gz = Math.floor(p.z / mm);
+        for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+            for (const j of grid.get(`${gx + dx},${gy + dy},${gz + dz}`) ?? []) {
+                const q = pts[j];
+                if ((q.x - p.x) ** 2 + (q.y - p.y) ** 2 + (q.z - p.z) ** 2 <= mm * mm) parent[find(i)] = find(j);
+            }
+        }
+        const k = `${gx},${gy},${gz}`;
+        (grid.get(k) ?? grid.set(k, []).get(k)!).push(i);
+    });
+    const groups = new Map<number, number[]>();
+    pts.forEach((_, i) => {
+        const r = find(i);
+        (groups.get(r) ?? groups.set(r, []).get(r)!).push(i);
+    });
+    return [...groups.values()];
+}
+
+/**
+ * Overhang surface of the model (`positions`, 9 floats a triangle, outward
+ * winding) that lies further than `limitMm` from every support contact.
+ */
+export function findSparseSupport(
+    positions: ArrayLike<number>,
+    contacts: THREE.Vector3[],
+    baseZ: number,
+    options: SparseOptions,
+): SparseSupportReport {
+    const limit = options.limitMm;
+    const minArea = options.minAreaMm2 ?? SPARSE_MIN_AREA_MM2;
+    const spacing = options.sampleMm ?? SPARSE_SAMPLE_MM;
+    const clusterMm = options.clusterMm ?? SPARSE_CLUSTER_MM;
+    const report: SparseSupportReport = {
+        limit_mm: limit,
+        self_support_angle_deg: options.selfSupportAngleDeg,
+        min_area_mm2: minArea,
+        samples_checked: 0,
+        overhang_area_mm2: 0,
+        sparse_area_mm2: 0,
+        regions: [],
+        internal_regions_skipped: 0,
+    };
+    // Down-facing and flatter than the self-support angle: the unit normal's z
+    // is below -cos(angle).
+    const maxNz = -Math.cos((options.selfSupportAngleDeg * Math.PI) / 180);
+
+    // Contacts by cell; the search reaches REACH cells out for the gap figure.
+    const REACH = 3;
+    const cell = Math.max(limit, 1e-6);
+    const cells = new Map<string, THREE.Vector3[]>();
+    for (const c of contacts) {
+        const k = `${Math.floor(c.x / cell)},${Math.floor(c.y / cell)},${Math.floor(c.z / cell)}`;
+        (cells.get(k) ?? cells.set(k, []).get(k)!).push(c);
+    }
+    const nearest = (x: number, y: number, z: number): number => {
+        const cx = Math.floor(x / cell);
+        const cy = Math.floor(y / cell);
+        const cz = Math.floor(z / cell);
+        let best = Infinity;
+        for (let r = 0; r <= REACH; r++) {
+            // The shell of cells r out (Chebyshev distance).
+            for (let dx = -r; dx <= r; dx++) for (let dy = -r; dy <= r; dy++) for (let dz = -r; dz <= r; dz++) {
+                if (Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz)) !== r) continue;
+                for (const c of cells.get(`${cx + dx},${cy + dy},${cz + dz}`) ?? []) {
+                    best = Math.min(best, Math.hypot(c.x - x, c.y - y, c.z - z));
+                }
+            }
+            // Every contact in a further shell is at least r * cell away.
+            if (best <= r * cell) break;
+        }
+        return Math.min(best, (REACH + 1) * cell);
+    };
+
+    const flagged: { x: number; y: number; z: number; gap: number; area: number }[] = [];
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    const n = new THREE.Vector3();
+    const ab = new THREE.Vector3();
+    const ac = new THREE.Vector3();
+    for (let t = 0; t + 8 < positions.length; t += 9) {
+        a.set(positions[t], positions[t + 1], positions[t + 2]);
+        b.set(positions[t + 3], positions[t + 4], positions[t + 5]);
+        c.set(positions[t + 6], positions[t + 7], positions[t + 8]);
+        ab.subVectors(b, a);
+        ac.subVectors(c, a);
+        n.crossVectors(ab, ac);
+        const twiceArea = n.length();
+        if (twiceArea === 0 || n.z / twiceArea >= maxNz) continue;
+        const area = twiceArea / 2;
+        const pts: [number, number, number][] = [];
+        sampleTriangle(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, spacing, (x, y, z) => {
+            if (options.ignoreBelowZ !== undefined && z < options.ignoreBelowZ) return;
+            if (options.skip?.(x, y, z)) return;
+            pts.push([x, y, z]);
+        });
+        if (pts.length === 0) continue;
+        const weight = area / pts.length;
+        report.overhang_area_mm2 += area;
+        for (const [x, y, z] of pts) {
+            report.samples_checked++;
+            const gap = nearest(x, y, z);
+            if (gap > limit) flagged.push({ x, y, z, gap, area: weight });
+        }
+    }
+
+    for (const members of clusterPoints(flagged, clusterMm)) {
+        let area = 0;
+        let worst = flagged[members[0]];
+        let lo = Infinity;
+        let hi = -Infinity;
+        const centre = new THREE.Vector3();
+        for (const i of members) {
+            const f = flagged[i];
+            area += f.area;
+            if (f.gap > worst.gap) worst = f;
+            lo = Math.min(lo, f.z);
+            hi = Math.max(hi, f.z);
+            centre.x += f.x * f.area;
+            centre.y += f.y * f.area;
+            centre.z += f.z * f.area;
+        }
+        if (area < minArea) continue;
+        centre.divideScalar(area);
+        // A cavity's ceiling is overhang nothing can support; leave it out.
+        // Probe at the region's sample nearest its centre (the centre itself
+        // may lie off the surface).
+        let probe = flagged[members[0]];
+        for (const i of members) {
+            const f = flagged[i];
+            if ((f.x - centre.x) ** 2 + (f.y - centre.y) ** 2 + (f.z - centre.z) ** 2
+                < (probe.x - centre.x) ** 2 + (probe.y - centre.y) ** 2 + (probe.z - centre.z) ** 2) probe = f;
+        }
+        if (options.isEnclosed?.(new THREE.Vector3(probe.x, probe.y, probe.z))) {
+            report.internal_regions_skipped++;
+            continue;
+        }
+        report.regions.push({
+            area_mm2: area,
+            max_gap_mm: worst.gap,
+            at_plate_mm: [worst.x, worst.y, worst.z],
+            centre_plate_mm: [centre.x, centre.y, centre.z],
+            height_above_base_mm: centre.z - baseZ,
+            z_range_mm: [lo, hi],
+            samples: members.length,
+        });
+    }
+    report.regions.sort((p, q) => q.area_mm2 - p.area_mm2);
+    report.sparse_area_mm2 = report.regions.reduce((s, r) => s + r.area_mm2, 0);
+    return report;
+}

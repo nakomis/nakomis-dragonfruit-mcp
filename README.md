@@ -131,7 +131,13 @@ above it. The clearance check samples the final support mesh every 0.25 mm and
 measures each point's distance to the model with a BVH, ignoring the 3 mm round
 each contact tip and anything below the model's base. Gaps under
 `min_clearance_mm` (0.3 by default) are reported as grazes and warned about. On
-Chi (a 50 mm cat, 245,000 samples), the check takes about 0.6 s.
+Chi (a 50 mm cat, 245,000 samples), the check takes about 0.6 s. The sparse-support check (NDFM-30) looks the other way: overhang surface
+that is further than 1.25 grid spacings from every contact (the grid being the
+square root of the app's area per support), where each layer rests on the one
+below but the edge between contacts can still sag or tear. If it finds any,
+placement runs again at 1.5x and 2x the density and the least sparse run is
+kept, restored from a snapshot of the support store so that the supports
+sliced are the ones checked (`auto_densify`, on by default).
 
 It also holds the overhang band (NDFM-22). `overhang_max_height_mm` limits
 the overhang family alone to that height above the model's base, for a lifted

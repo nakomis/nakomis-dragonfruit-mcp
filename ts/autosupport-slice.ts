@@ -39,7 +39,7 @@
  *     --printer-json <profile.json> [--material <material.json>] [--layer-height N]
  *     [--aa-preset sharp|balanced|smooth|raw] [--lift-mm 7] [--density 1] [--raft solid|line|off]
  *     [--settings <json>] [--coarse-islands] [--no-overhangs] [--px-mm 0.05] [--supported-stl <out.stl>] [--plate-stl <out.stl>] [--job-dir <dir>]
- *     [--keep-out <holes.json>] [--max-support-height <mm>] [--overhang-max-height <mm>] [--min-clearance <mm>]
+ *     [--keep-out <holes.json>] [--max-support-height <mm>] [--overhang-max-height <mm>] [--min-clearance <mm>] [--no-auto-densify]
  *     [--support-internal-islands] [--probe-points <json>] [--no-slice] [--verbose]
  *
  * `--supported-stl` writes model, supports and raft as sliced; `--plate-stl` the
@@ -90,6 +90,13 @@
  * In clear resin such a gap cures shut and the support prints fused to the
  * model. Nothing is removed for it.
  *
+ * Sparse support (NDFM-30): after placement, overhang more than 1.25 grid
+ * spacings from every contact is reported in `sparse_support`. Unless
+ * `--no-auto-densify`, placement then runs again at 1.5x and 2x `--density`,
+ * and the run with the least sparse area is restored from its snapshot of the
+ * support store before export, so the supports sliced are the ones checked.
+ * `density` in the summary lists every try.
+ *
  * Islands whose contact faces a sealed cavity are skipped before placement
  * (hollow interiors are not supported in normal resin practice, and the only
  * way to reach them is a trunk up through the drain hole) unless
@@ -111,7 +118,7 @@ import { initializeBVH, accelerateGeometry } from '@/utils/bvh';
 import { createDefaultSettings } from '@/supports/Settings/types';
 import { setSettings } from '@/supports/Settings/state';
 import { clearHistory } from '@/history/historyStore';
-import { getSnapshot, removeSupportEntity, resetKickstandsInState, resetStore } from '@/supports/state';
+import { cloneSupportState, getSnapshot, removeSupportEntity, resetKickstandsInState, resetStore, setSnapshot } from '@/supports/state';
 import { registerSupportHistoryHandlers } from '@/supports/history/useSupportHistoryHandlers';
 import { setModelMesh } from '@/supports/autoSupport/meshStore';
 import { deleteSupportBlockers, setSupportBlockedTriangles } from '@/supports/autoSupport/supportBlockers';
@@ -140,12 +147,15 @@ import {
     clipOverhangRegion,
     DEFAULT_MIN_CLEARANCE_MM,
     findGrazes,
+    findSparseSupport,
     HeightCapZone,
     KeepOutZone,
     parseHoles,
     positionsInFaceOrder,
+    SPARSE_SPACING_FACTOR,
     triangleIndicesInZones,
     type ClearanceReport,
+    type SparseSupportReport,
     type Zone,
 } from './support-zones';
 import { resolveSliceLayerCount, resolveSliceRasterSettings } from '@/features/slicing/sliceJobAssembly';
@@ -212,6 +222,8 @@ interface Options {
     overhangMaxHeightMm: number | null;
     /** Report supports passing closer than this to the model; 0 turns the check off. */
     minClearanceMm: number;
+    /** On finding sparsely supported overhang, retry placement at 1.5x and 2x density (NDFM-30). */
+    autoDensify: boolean;
     supportInternalIslands: boolean;
     probePoints: number[][] | null;
     slice: boolean;
@@ -242,6 +254,7 @@ function parseArgs(argv: string[]): Options {
         maxSupportHeightMm: null,
         overhangMaxHeightMm: null,
         minClearanceMm: DEFAULT_MIN_CLEARANCE_MM,
+        autoDensify: true,
         supportInternalIslands: false,
         probePoints: null,
         slice: true,
@@ -282,6 +295,7 @@ function parseArgs(argv: string[]): Options {
         else if (arg === '--max-support-height') options.maxSupportHeightMm = number();
         else if (arg === '--overhang-max-height') options.overhangMaxHeightMm = number();
         else if (arg === '--min-clearance') options.minClearanceMm = number();
+        else if (arg === '--no-auto-densify') options.autoDensify = false;
         else if (arg === '--support-internal-islands') options.supportInternalIslands = true;
         else if (arg === '--probe-points') options.probePoints = JSON.parse(value()) as number[][];
         else if (arg === '--no-slice') options.slice = false;
@@ -384,6 +398,18 @@ function countCommitted(): { byType: Record<string, number>; contacts: number; r
         }
     }
     return { byType, contacts, roots: Object.keys(state.roots ?? {}).length };
+}
+
+/** Contacts in a saved support state (an attempt's snapshot). */
+function countContacts(snapshot: ReturnType<typeof getSnapshot>): number {
+    const state = snapshot as unknown as Record<string, Record<string, Record<string, unknown>>>;
+    let contacts = 0;
+    for (const descriptor of SUPPORT_STATE_TYPES) {
+        for (const entity of Object.values(state[descriptor.location.key] ?? {})) {
+            for (const field of descriptor.contactFields) if (entity[field]) contacts++;
+        }
+    }
+    return contacts;
 }
 
 /** Directions probed from a point to tell a cavity from open air: the 26 neighbours of a cube. */
@@ -719,22 +745,16 @@ async function main(): Promise<void> {
     const classified = classifyIntersection(voxelIslands, [], { xyToleranceMm: 0.5, zBandMm: layerHeightMm });
     const islands = mergeOverhangRegions(classified.islands, overhangIslands);
 
-    // Placement, through the worker's entry point, then the app's commit.
-    resetStore();
-    resetKickstandsInState();
-    clearHistory();
-    const disposeHistory = registerSupportHistoryHandlers();
+    // Placement settings. Density scales supports per area: twice the density,
+    // half the area each carries. Placement may run more than once (NDFM-30).
     initializeBVH();
     const appSettings = createDefaultSettings();
     const autoDefaults = appSettings.autoSupport;
-    const settingsOverride: Partial<AutoSupportSettings> = {
-        ...autoDefaults,
-        ...options.settings,
-    };
-    if (options.density !== 1) {
-        // Density scales supports per area: twice the density, half the area each carries.
-        settingsOverride.areaPerSupportMm2 = (settingsOverride.areaPerSupportMm2 ?? autoDefaults.areaPerSupportMm2) / options.density;
-    }
+    const baseSettings: Partial<AutoSupportSettings> = { ...autoDefaults, ...options.settings };
+    const baseAreaPerSupportMm2 = baseSettings.areaPerSupportMm2 ?? autoDefaults.areaPerSupportMm2;
+    const settingsFor = (density: number): Partial<AutoSupportSettings> => (
+        density === 1 ? { ...baseSettings } : { ...baseSettings, areaPerSupportMm2: baseAreaPerSupportMm2 / density }
+    );
     setSettings(appSettings);
     // The raft is part of the scene placement sees (stumps and plate roots read it).
     const raftSettings: RaftSettings = { ...DEFAULT_RAFT_SETTINGS, bottomMode: options.raft };
@@ -759,159 +779,216 @@ async function main(): Promise<void> {
         warnings.push(`${skippedInternal.length} of ${islands.length} islands face into a cavity and were not supported (hollow interiors are left bare; pass support_internal_islands to support them)`);
     }
 
-    const keepOutReport = zones.map((zone) => ({
-        hole: zone.index,
-        purpose: zone.spec.purpose ?? null,
-        start_plate_mm: zone.start.toArray(),
-        exit_plate_mm: zone.exit.toArray(),
-        t_range_mm: [zone.tMin, zone.tMax],
-        direction: zone.dir.toArray(),
-        keep_out_radius_mm: zone.radius,
-        blocked_triangles: 0,
-        islands_inside: [] as string[],
-        islands_inside_internal: [] as string[],
-        contacts_removed: 0,
-        supports_removed: 0,
-        lost_coverage: [] as string[],
-    }));
-    const capReport = capZone ? {
-        max_support_height_mm: options.maxSupportHeightMm,
-        cap_plate_z_mm: capZone.capZ,
-        blocked_triangles: 0,
-        islands_above_cap: aboveCap.map((island) => island.id),
-        contacts_removed: 0,
-        supports_removed: 0,
-        lost_coverage: [] as string[],
-    } : null;
-    if (aboveCap.length > 0) {
-        warnings.push(`${aboveCap.length} of ${islands.length} islands lie above the height cap (${options.maxSupportHeightMm} mm above the model's base) and were not supported`);
-    }
-    if (bandReport) {
-        bandReport.voxel_islands_above_band = placed
-            .filter((island) => island.source !== 'overhang' && island.contact.z > bandTopZ!)
-            .map((island) => island.id);
-    }
-    // Removal counters for every zone, holes first, in `allZones` order.
-    const counters: { contacts_removed: number; supports_removed: number; lost_coverage: string[] }[] = capReport ? [...keepOutReport, capReport] : keepOutReport;
-    if (allZones.length > 0) {
-        const blocked = triangleIndicesInZones(facePositions, allZones);
-        if (capReport) capReport.blocked_triangles = blocked.perZone[zones.length];
-        blocked.perZone.slice(0, zones.length).forEach((count, k) => {
-            keepOutReport[k].blocked_triangles = count;
-            if (count === 0) warnings.push(`keep-out hole ${k}: no model surface lies within ${zones[k].radius} mm of its axis (does the holes file match this STL?)`);
-        });
-        setSupportBlockedTriangles(modelId, blocked.all);
-        for (const island of islands) {
-            zones.forEach((zone, k) => {
-                if (!zone.contains(island.contact.x, island.contact.y, island.contact.z)) return;
-                (internalIds.has(island.id) ? keepOutReport[k].islands_inside_internal : keepOutReport[k].islands_inside).push(island.id);
+    // One placement at a density: reset the store, place, commit, then remove
+    // whatever enters a keep-out zone or rises above the cap. Its warnings and
+    // reports are its own until it is chosen.
+    const attempt = async (density: number) => {
+        const warnings: string[] = [];
+        const band = bandReport ? { ...bandReport } : null;
+        resetStore();
+        resetKickstandsInState();
+        clearHistory();
+        const disposeHistory = registerSupportHistoryHandlers();
+        const settingsOverride = settingsFor(density);
+        const keepOutReport = zones.map((zone) => ({
+            hole: zone.index,
+            purpose: zone.spec.purpose ?? null,
+            start_plate_mm: zone.start.toArray(),
+            exit_plate_mm: zone.exit.toArray(),
+            t_range_mm: [zone.tMin, zone.tMax],
+            direction: zone.dir.toArray(),
+            keep_out_radius_mm: zone.radius,
+            blocked_triangles: 0,
+            islands_inside: [] as string[],
+            islands_inside_internal: [] as string[],
+            contacts_removed: 0,
+            supports_removed: 0,
+            lost_coverage: [] as string[],
+        }));
+        const capReport = capZone ? {
+            max_support_height_mm: options.maxSupportHeightMm,
+            cap_plate_z_mm: capZone.capZ,
+            blocked_triangles: 0,
+            islands_above_cap: aboveCap.map((island) => island.id),
+            contacts_removed: 0,
+            supports_removed: 0,
+            lost_coverage: [] as string[],
+        } : null;
+        if (aboveCap.length > 0) {
+            warnings.push(`${aboveCap.length} of ${islands.length} islands lie above the height cap (${options.maxSupportHeightMm} mm above the model's base) and were not supported`);
+        }
+        if (band) {
+            band.voxel_islands_above_band = placed
+                .filter((island) => island.source !== 'overhang' && island.contact.z > bandTopZ!)
+                .map((island) => island.id);
+        }
+        // Removal counters for every zone, holes first, in `allZones` order.
+        const counters: { contacts_removed: number; supports_removed: number; lost_coverage: string[] }[] = capReport ? [...keepOutReport, capReport] : keepOutReport;
+        if (allZones.length > 0) {
+            const blocked = triangleIndicesInZones(facePositions, allZones);
+            if (capReport) capReport.blocked_triangles = blocked.perZone[zones.length];
+            blocked.perZone.slice(0, zones.length).forEach((count, k) => {
+                keepOutReport[k].blocked_triangles = count;
+                if (count === 0) warnings.push(`keep-out hole ${k}: no model surface lies within ${zones[k].radius} mm of its axis (does the holes file match this STL?)`);
+            });
+            setSupportBlockedTriangles(modelId, blocked.all);
+            for (const island of islands) {
+                zones.forEach((zone, k) => {
+                    if (!zone.contains(island.contact.x, island.contact.y, island.contact.z)) return;
+                    (internalIds.has(island.id) ? keepOutReport[k].islands_inside_internal : keepOutReport[k].islands_inside).push(island.id);
+                });
+            }
+            keepOutReport.forEach((r, k) => {
+                if (r.islands_inside.length + r.islands_inside_internal.length === 0) return;
+                warnings.push(`keep-out hole ${k}: ${r.islands_inside.length} external island(s) [${r.islands_inside.join(', ')}] and ${r.islands_inside_internal.length} internal island(s) [${r.islands_inside_internal.join(', ')}] have their contact point inside the zone, so cannot take a support there`);
             });
         }
-        keepOutReport.forEach((r, k) => {
-            if (r.islands_inside.length + r.islands_inside_internal.length === 0) return;
-            warnings.push(`keep-out hole ${k}: ${r.islands_inside.length} external island(s) [${r.islands_inside.join(', ')}] and ${r.islands_inside_internal.length} internal island(s) [${r.islands_inside_internal.join(', ')}] have their contact point inside the zone, so cannot take a support there`);
-        });
-    }
 
-    const plan = await time('auto_place_ms', () => runAutoPlaceRequest({
-        modelId,
-        islands: placed.map(serializeIsland),
-        settingsOverride,
-        sizingBands: resolvedSizingBandsForRun(settingsOverride.sizingPreset ?? autoDefaults.sizingPreset),
-        appSettings,
-        baseState: getSnapshot(),
-        mesh: serializeModelMesh(mesh),
-        meshKey: modelMeshKey(mesh),
-    }));
-    if (!plan) throw new Error(`auto-support produced no plan (${placed.length} islands)`);
-    const result = commitAutoPlacePlan(plan);
-    disposeHistory();
-    let removalTotals: Record<string, unknown> | null = null;
-    if (allZones.length > 0) {
-        deleteSupportBlockers(modelId);
-        const entitiesBefore = totalEntities();
-        // Whatever still enters a zone: a contact the blockers missed or a shaft leaning in.
-        const probes = probeCommittedSupports();
-        const reachOf = (island: DetectedIsland) => Math.max(3, Math.sqrt((island.areaMm2 ?? 0) / Math.PI) + 1);
-        const at = (island: DetectedIsland) => new THREE.Vector3(island.contact.x, island.contact.y, island.contact.z);
-        const coverageNear = (island: DetectedIsland, live: SupportProbe[]): number => {
-            const where = at(island);
-            return live.filter((p) => p.contacts.some((q) => q.distanceTo(where) <= reachOf(island))).length;
-        };
-        const before = new Map(placed.map((island) => [island.id, coverageNear(island, probes)]));
-        const removedBy = new Map<string, Set<number>>();
-        for (const probe of probes) {
-            allZones.forEach((zone, k) => {
-                const contact = probe.contacts.some((q) => zone.contains(q.x, q.y, q.z));
-                const shaft = probe.runs.some(([p, q]) => zone.touchesSegment(p, q));
-                if (!contact && !shaft) return;
-                if (contact) counters[k].contacts_removed++;
-                counters[k].supports_removed++;
-                removedBy.set(probe.id, (removedBy.get(probe.id) ?? new Set<number>()).add(k));
-            });
-        }
-        for (const id of removedBy.keys()) removeSupportEntity(id); // cascades to what hangs off it; a repeat is a harmless null
-        // Shafts left holding nothing (no contact of their own, nothing hanging off them), to a fixed point.
-        const danglingRemoved: string[] = [];
-        for (;;) {
-            const dangling = findDanglingShafts();
-            if (dangling.length === 0) break;
-            for (const id of dangling) removeSupportEntity(id);
-            danglingRemoved.push(...dangling);
-        }
-        const live = probeCommittedSupports();
-        const zoneNear = (island: DetectedIsland): number[] => zones.filter((zone) => {
-            const where = at(island);
-            const t = Math.min(zone.tMax, Math.max(zone.tMin, where.clone().sub(zone.start).dot(zone.dir)));
-            return where.distanceTo(zone.start.clone().addScaledVector(zone.dir, t)) <= reachOf(island) + zone.radius;
-        }).map((zone) => zone.index);
-        for (const island of placed) {
-            if (coverageNear(island, live) > 0) continue;
-            if ((before.get(island.id) ?? 0) > 0) {
-                // Supported before the removals, bare after: say which hole's supports went.
+        const plan = await time('auto_place_ms', () => runAutoPlaceRequest({
+            modelId,
+            islands: placed.map(serializeIsland),
+            settingsOverride,
+            sizingBands: resolvedSizingBandsForRun(settingsOverride.sizingPreset ?? autoDefaults.sizingPreset),
+            appSettings,
+            baseState: getSnapshot(),
+            mesh: serializeModelMesh(mesh),
+            meshKey: modelMeshKey(mesh),
+        }));
+        if (!plan) throw new Error(`auto-support produced no plan (${placed.length} islands)`);
+        const result = commitAutoPlacePlan(plan);
+        disposeHistory();
+        let removalTotals: Record<string, unknown> | null = null;
+        if (allZones.length > 0) {
+            deleteSupportBlockers(modelId);
+            const entitiesBefore = totalEntities();
+            // Whatever still enters a zone: a contact the blockers missed or a shaft leaning in.
+            const probes = probeCommittedSupports();
+            const reachOf = (island: DetectedIsland) => Math.max(3, Math.sqrt((island.areaMm2 ?? 0) / Math.PI) + 1);
+            const at = (island: DetectedIsland) => new THREE.Vector3(island.contact.x, island.contact.y, island.contact.z);
+            const coverageNear = (island: DetectedIsland, live: SupportProbe[]): number => {
                 const where = at(island);
-                const holes = new Set<number>();
-                for (const probe of probes) {
-                    if (!removedBy.has(probe.id) || !probe.contacts.some((q) => q.distanceTo(where) <= reachOf(island))) continue;
-                    removedBy.get(probe.id)!.forEach((k) => holes.add(k));
+                return live.filter((p) => p.contacts.some((q) => q.distanceTo(where) <= reachOf(island))).length;
+            };
+            const before = new Map(placed.map((island) => [island.id, coverageNear(island, probes)]));
+            const removedBy = new Map<string, Set<number>>();
+            for (const probe of probes) {
+                allZones.forEach((zone, k) => {
+                    const contact = probe.contacts.some((q) => zone.contains(q.x, q.y, q.z));
+                    const shaft = probe.runs.some(([p, q]) => zone.touchesSegment(p, q));
+                    if (!contact && !shaft) return;
+                    if (contact) counters[k].contacts_removed++;
+                    counters[k].supports_removed++;
+                    removedBy.set(probe.id, (removedBy.get(probe.id) ?? new Set<number>()).add(k));
+                });
+            }
+            for (const id of removedBy.keys()) removeSupportEntity(id); // cascades to what hangs off it; a repeat is a harmless null
+            // Shafts left holding nothing (no contact of their own, nothing hanging off them), to a fixed point.
+            const danglingRemoved: string[] = [];
+            for (;;) {
+                const dangling = findDanglingShafts();
+                if (dangling.length === 0) break;
+                for (const id of dangling) removeSupportEntity(id);
+                danglingRemoved.push(...dangling);
+            }
+            const live = probeCommittedSupports();
+            const zoneNear = (island: DetectedIsland): number[] => zones.filter((zone) => {
+                const where = at(island);
+                const t = Math.min(zone.tMax, Math.max(zone.tMin, where.clone().sub(zone.start).dot(zone.dir)));
+                return where.distanceTo(zone.start.clone().addScaledVector(zone.dir, t)) <= reachOf(island) + zone.radius;
+            }).map((zone) => zone.index);
+            for (const island of placed) {
+                if (coverageNear(island, live) > 0) continue;
+                if ((before.get(island.id) ?? 0) > 0) {
+                    // Supported before the removals, bare after: say which hole's supports went.
+                    const where = at(island);
+                    const holes = new Set<number>();
+                    for (const probe of probes) {
+                        if (!removedBy.has(probe.id) || !probe.contacts.some((q) => q.distanceTo(where) <= reachOf(island))) continue;
+                        removedBy.get(probe.id)!.forEach((k) => holes.add(k));
+                    }
+                    holes.forEach((k) => counters[k].lost_coverage.push(island.id));
+                    warnings.push(`island ${describe(island)} lost all its supports to ${[...holes].map((k) => allZones[k].label).join(', ') || '?'}`);
+                } else {
+                    // Never had a support: the blockers (or placement) left it bare. Name a hole if one is within reach.
+                    const near = zoneNear(island);
+                    if (near.length > 0) warnings.push(`island ${describe(island)} has no support within reach; keep-out hole(s) ${near.join(', ')} block the surface nearby`);
                 }
-                holes.forEach((k) => counters[k].lost_coverage.push(island.id));
-                warnings.push(`island ${describe(island)} lost all its supports to ${[...holes].map((k) => allZones[k].label).join(', ') || '?'}`);
-            } else {
-                // Never had a support: the blockers (or placement) left it bare. Name a hole if one is within reach.
-                const near = zoneNear(island);
-                if (near.length > 0) warnings.push(`island ${describe(island)} has no support within reach; keep-out hole(s) ${near.join(', ')} block the surface nearby`);
+            }
+            for (const [k, zone] of allZones.entries()) {
+                const r = counters[k];
+                if (r.supports_removed > 0) {
+                    const where = zone instanceof KeepOutZone ? `entered ${zone.radius} mm of its axis` : 'rose above it';
+                    warnings.push(`${zone.label}: removed ${r.supports_removed} support(s) (${r.contacts_removed} by contact, ${r.supports_removed - r.contacts_removed} by shaft) that ${where}`);
+                }
+            }
+            // A last look at what is committed: nothing may be left inside any zone.
+            const residual = live.filter((probe) => allZones.some((zone) => probe.contacts.some((q) => zone.contains(q.x, q.y, q.z))
+                || probe.runs.some(([p, q]) => zone.touchesSegment(p, q)))).length;
+            if (residual > 0) warnings.push(`${residual} support(s) are still inside ${capZone ? "a keep-out zone or above the height cap" : "a keep-out zone"} after removal`);
+            removalTotals = {
+                entities_before: entitiesBefore,
+                entities_after: totalEntities(),
+                entities_removed_total: entitiesBefore - totalEntities(),
+                dangling_removed: danglingRemoved.length,
+                residual_in_zone: residual,
+            };
+        }
+        if (band) {
+            // The check: no overhang support's contact above the band, give or take
+            // a triangle straddling its top.
+            const heights = overhangContactHeights();
+            band.highest_overhang_contact_mm = heights.length > 0 ? Math.max(...heights) - box.min.z : null;
+            band.overhang_contacts_above_band = heights.filter((z) => z > bandTopZ! + OVERHANG_BAND_SLACK_MM).length;
+            if (band.overhang_contacts_above_band > 0) {
+                warnings.push(`${band.overhang_contacts_above_band} overhang support contact(s) landed more than ${OVERHANG_BAND_SLACK_MM} mm above the overhang band (${options.overhangMaxHeightMm} mm above the model's base)`);
             }
         }
-        for (const [k, zone] of allZones.entries()) {
-            const r = counters[k];
-            if (r.supports_removed > 0) {
-                const where = zone instanceof KeepOutZone ? `entered ${zone.radius} mm of its axis` : 'rose above it';
-                warnings.push(`${zone.label}: removed ${r.supports_removed} support(s) (${r.contacts_removed} by contact, ${r.supports_removed - r.contacts_removed} by shaft) that ${where}`);
-            }
-        }
-        // A last look at what is committed: nothing may be left inside any zone.
-        const residual = live.filter((probe) => allZones.some((zone) => probe.contacts.some((q) => zone.contains(q.x, q.y, q.z))
-            || probe.runs.some(([p, q]) => zone.touchesSegment(p, q)))).length;
-        if (residual > 0) warnings.push(`${residual} support(s) are still inside ${capZone ? "a keep-out zone or above the height cap" : "a keep-out zone"} after removal`);
-        removalTotals = {
-            entities_before: entitiesBefore,
-            entities_after: totalEntities(),
-            entities_removed_total: entitiesBefore - totalEntities(),
-            dangling_removed: danglingRemoved.length,
-            residual_in_zone: residual,
-        };
+        return { density, plan, result, settingsOverride, keepOutReport, capReport, removalTotals, band, warnings };
+    };
+
+    // Sparse support (NDFM-30): overhang further than the limit from every
+    // contact. The limit comes from the grid spacing at the starting settings,
+    // so a denser retry is judged against the same yardstick.
+    const sparseLimitMm = SPARSE_SPACING_FACTOR * Math.sqrt(baseAreaPerSupportMm2);
+    const sparseCheck = (): SparseSupportReport => findSparseSupport(
+        facePositions,
+        probeCommittedSupports().flatMap((probe) => probe.contacts),
+        box.min.z,
+        {
+            selfSupportAngleDeg,
+            limitMm: sparseLimitMm,
+            skip: (x, y, z) => allZones.some((zone) => zone.contains(x, y, z)),
+            ignoreBelowZ: options.liftMm === 0 ? box.min.z + layerHeightMm : undefined,
+            isEnclosed: (p) => isInternalContact(mesh, p),
+        },
+    );
+    const densities = options.autoDensify ? [1, 1.5, 2].map((k) => options.density * k) : [options.density];
+    type Attempt = Awaited<ReturnType<typeof attempt>> & { sparse: SparseSupportReport; snapshot: ReturnType<typeof getSnapshot> };
+    const tries: Attempt[] = [];
+    for (const density of densities) {
+        const placedRun = await attempt(density);
+        const sparse = await time('sparse_check_ms', sparseCheck);
+        tries.push({ ...placedRun, sparse, snapshot: cloneSupportState(getSnapshot()) });
+        if (sparse.regions.length === 0) break;
     }
-    if (bandReport) {
-        // The check: no overhang support's contact above the band, give or take
-        // a triangle straddling its top.
-        const heights = overhangContactHeights();
-        bandReport.highest_overhang_contact_mm = heights.length > 0 ? Math.max(...heights) - box.min.z : null;
-        bandReport.overhang_contacts_above_band = heights.filter((z) => z > bandTopZ! + OVERHANG_BAND_SLACK_MM).length;
-        if (bandReport.overhang_contacts_above_band > 0) {
-            warnings.push(`${bandReport.overhang_contacts_above_band} overhang support contact(s) landed more than ${OVERHANG_BAND_SLACK_MM} mm above the overhang band (${options.overhangMaxHeightMm} mm above the model's base)`);
-        }
+    // The least sparse area wins; a tie goes to the earlier, lower density.
+    const best = tries.reduce((p, q) => (q.sparse.sparse_area_mm2 < p.sparse.sparse_area_mm2 ? q : p));
+    if (best !== tries[tries.length - 1]) setSnapshot(cloneSupportState(best.snapshot));
+    const { plan, result, settingsOverride, keepOutReport, capReport, removalTotals } = best;
+    if (bandReport && best.band) Object.assign(bandReport, best.band);
+    warnings.push(...best.warnings);
+    const sparse = best.sparse;
+    if (tries.length > 1) {
+        warnings.push(`sparse support at density ${tries[0].density}: ${tries[0].sparse.sparse_area_mm2.toFixed(1)} mm² of overhang more than ${sparseLimitMm.toFixed(1)} mm from any contact; `
+            + `tried ${tries.slice(1).map((t) => `${t.density} (${t.sparse.sparse_area_mm2.toFixed(1)} mm²)`).join(', ')}; kept density ${best.density}`);
     }
+    const SPARSE_WARNINGS = 3;
+    for (const region of sparse.regions.slice(0, SPARSE_WARNINGS)) {
+        const [x, y, z] = region.centre_plate_mm;
+        warnings.push(`${region.area_mm2.toFixed(1)} mm² of overhang ${region.height_above_base_mm.toFixed(1)} mm above the model's base (plate ${x.toFixed(1)}, ${y.toFixed(1)}, ${z.toFixed(1)}) `
+            + `is up to ${region.max_gap_mm.toFixed(1)} mm from any support: it may sag or tear`);
+    }
+    if (sparse.regions.length > SPARSE_WARNINGS) warnings.push(`${sparse.regions.length - SPARSE_WARNINGS} more sparsely supported overhang region(s) (see sparse_support.regions)`);
     const committed = countCommitted();
     const analytics = plan.analytics;
     if (placed.length === 0) warnings.push('no islands to support: nothing was supported');
@@ -1097,6 +1174,13 @@ async function main(): Promise<void> {
         height_cap: capReport ? { ...capReport, ...removalTotals } : null,
         overhang_band: bandReport,
         clearance,
+        sparse_support: sparse,
+        density: {
+            requested: options.density,
+            auto_densify: options.autoDensify,
+            chosen: best.density,
+            tries: tries.map((t) => ({ density: t.density, contacts: countContacts(t.snapshot), sparse_area_mm2: t.sparse.sparse_area_mm2, sparse_regions: t.sparse.regions.length })),
+        },
         islands_detected: islands.length,
         islands_internal: internalIds.size,
         islands_internal_skipped: skippedInternal.length,

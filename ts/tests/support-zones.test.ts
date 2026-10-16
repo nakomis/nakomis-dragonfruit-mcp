@@ -15,6 +15,7 @@ import { acceleratedRaycast, computeBoundsTree } from 'three-mesh-bvh';
 import {
     clipOverhangRegion,
     findGrazes,
+    findSparseSupport,
     HeightCapZone,
     KeepOutZone,
     positionsInFaceOrder,
@@ -185,4 +186,63 @@ test("after a BVH sorts the model, a raycast's face index names the triangle pos
     const onIt = new THREE.Vector3();
     triangle.closestPointToPoint(hit.point, onIt);
     assert.ok(onIt.distanceTo(hit.point) < 1e-6, `face ${f} is not where the ray hit`);
+});
+
+
+// Sparse support (NDFM-30). A box from z 5 to 6: its 10 x 10 mm underside is a
+// flat overhang (the base face points straight down), its sides are vertical.
+const SPARSE = { selfSupportAngleDeg: 45, limitMm: 4 };
+
+test('a flat underside held only at one corner is sparse; a 3 mm grid of contacts is not', () => {
+    const slab = positions(box([10, 10, 1], [0, 0, 5]));
+    const lonely = findSparseSupport(slab, [v(0, 0, 5)], 5, SPARSE);
+    assert.ok(Math.abs(lonely.overhang_area_mm2 - 100) < 1e-6, `overhang ${lonely.overhang_area_mm2}`);
+    assert.equal(lonely.regions.length, 1);
+    const [region] = lonely.regions;
+    // Everything beyond 4 mm of the corner: 100 - π·4²/4 ≈ 87 mm².
+    assert.ok(region.area_mm2 > 80 && region.area_mm2 < 92, `area ${region.area_mm2}`);
+    assert.ok(region.max_gap_mm > 12, `gap ${region.max_gap_mm}`);
+    assert.ok(Math.abs(region.height_above_base_mm) < 1e-6);
+    assert.equal(lonely.sparse_area_mm2, region.area_mm2);
+
+    const grid: THREE.Vector3[] = [];
+    for (let x = 0; x <= 10; x += 3) for (let y = 0; y <= 10; y += 3) grid.push(v(x + 0.5, y + 0.5, 5));
+    const held = findSparseSupport(slab, grid, 5, SPARSE);
+    assert.deepEqual(held.regions, []);
+    assert.equal(held.sparse_area_mm2, 0);
+});
+
+test('steep and upward-facing surfaces are not overhang', () => {
+    // A tall thin box: its top faces up, its sides are vertical; only the bottom counts.
+    const tower = positions(box([2, 2, 20], [0, 0, 0]));
+    const report = findSparseSupport(tower, [], 0, SPARSE);
+    assert.ok(Math.abs(report.overhang_area_mm2 - 4) < 1e-6, `overhang ${report.overhang_area_mm2}`);
+    // 4 mm² of underside is above the 2 mm² minimum, and no contact is anywhere near.
+    assert.equal(report.regions.length, 1);
+});
+
+test('small regions, skipped points and cavity ceilings are left out', () => {
+    const slab = positions(box([10, 10, 1], [0, 0, 5]));
+    // A larger minimum area than the whole underside.
+    assert.deepEqual(findSparseSupport(slab, [], 5, { ...SPARSE, minAreaMm2: 150 }).regions, []);
+    // Every point skipped (as inside a keep-out zone or above the cap).
+    const skipped = findSparseSupport(slab, [], 5, { ...SPARSE, skip: () => true });
+    assert.equal(skipped.samples_checked, 0);
+    assert.equal(skipped.overhang_area_mm2, 0);
+    // The whole underside facing into a cavity.
+    const cavity = findSparseSupport(slab, [], 5, { ...SPARSE, isEnclosed: () => true });
+    assert.deepEqual(cavity.regions, []);
+    assert.equal(cavity.internal_regions_skipped, 1);
+    // A model standing on the plate: its bottom face is not overhang at all.
+    const onPlate = findSparseSupport(slab, [], 5, { ...SPARSE, ignoreBelowZ: 5.05 });
+    assert.equal(onPlate.samples_checked, 0);
+});
+
+test('two separate sparse patches are two regions, the larger first', () => {
+    const big = box([10, 10, 1], [0, 0, 5]);
+    const small = box([4, 4, 1], [30, 0, 5]);
+    const report = findSparseSupport(positions(small, big), [], 5, SPARSE);
+    assert.equal(report.regions.length, 2);
+    assert.ok(report.regions[0].area_mm2 > report.regions[1].area_mm2);
+    assert.ok(report.regions[0].centre_plate_mm[0] < 15);
 });
