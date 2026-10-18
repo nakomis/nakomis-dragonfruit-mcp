@@ -748,7 +748,6 @@ async function main(): Promise<void> {
 
     // Placement settings. Density scales supports per area: twice the density,
     // half the area each carries. Placement may run more than once (NDFM-30).
-    initializeBVH();
     const appSettings = createDefaultSettings();
     const autoDefaults = appSettings.autoSupport;
     const baseSettings: Partial<AutoSupportSettings> = { ...autoDefaults, ...options.settings };
