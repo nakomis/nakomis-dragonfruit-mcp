@@ -31,6 +31,8 @@ SCRIPT = cli.REPO_ROOT / "ts" / "autosupport-slice.ts"
 TIMEOUT_S = 45 * 60
 # Support surface closer than this to the model is reported (ts/support-zones.ts).
 DEFAULT_MIN_CLEARANCE_MM = 0.3
+# Support tips on surface steeper than this, from horizontal, are steep-wall contacts.
+DEFAULT_STEEP_CONTACT_DEG = 60.0
 
 _REQUIRED_KEYS = {
     "islands",
@@ -248,6 +250,30 @@ class Density(BaseModel):
     tries: list[DensityTry]
 
 
+class SteepContact(BaseModel):
+    """A support tip on a steep wall (NDFM-31)."""
+
+    tilt_deg: float = Field(description="Surface angle round the tip: 0 flat underside, 90 wall")
+    at_plate_mm: list[float]
+    height_above_base_mm: float
+    island: str | None = Field(default=None, description="For one kept: the island it holds")
+
+
+class SteepContacts(BaseModel):
+    limit_deg: float
+    radius_mm: float = Field(description="The surface round a tip is judged over this radius")
+    avoid: bool = Field(description="Whether steep-wall supports were removed")
+    contacts_checked: int
+    supports_steep: int
+    removed: list[SteepContact] = Field(
+        description="Steep-wall supports removed (with avoid) or just found (without)"
+    )
+    kept_for_coverage: list[SteepContact] = Field(
+        description="Steep-wall supports kept, each the only support for an island"
+    )
+    entities_removed: int = Field(default=0, description="With dependants and dangling shafts")
+
+
 class SupportedSlice(ToolResult):
     output_path: str = Field(description="The sliced print, supports and raft included")
     format: str
@@ -321,6 +347,9 @@ class SupportedSlice(ToolResult):
     )
     density: Density | None = Field(
         default=None, description="What auto_densify tried, and the density kept"
+    )
+    steep_contacts: SteepContacts | None = Field(
+        default=None, description="Support tips on steep walls (scar risk), and what was done"
     )
     previews_written: bool = Field(
         default=False,
@@ -429,6 +458,8 @@ async def auto_support_and_slice(
     overhang_max_height_mm: float | None = None,
     min_clearance_mm: float = DEFAULT_MIN_CLEARANCE_MM,
     auto_densify: bool = True,
+    avoid_steep_contacts: bool = True,
+    steep_contact_deg: float = DEFAULT_STEEP_CONTACT_DEG,
     options: dict[str, Any] | None = None,
     previews: bool = True,
 ) -> SupportedSlice:
@@ -523,6 +554,14 @@ async def auto_support_and_slice(
     result lists what was tried. An explicit `density` is where it starts.
     Cavity ceilings, keep-out zones and anything above the cap are left out.
 
+    Steep-wall contacts: a support whose tips all meet surface steeper than
+    `steep_contact_deg` (default 60 from horizontal, averaged over 1.5 mm round
+    the tip), with no overhang within that 1.5 mm, holds up a wall that holds
+    itself up, and tears a strip from it when it comes off a fresh print (the
+    100 mm Chi's haunch). With `avoid_steep_contacts` (the default) such
+    supports are removed, except where one is all that holds an island, when
+    the least steep stays. `steep_contacts` in the result lists both.
+
     Outputs: the print at `out_path`, or beside the STL as
     `<name>-<printer>-supported<ext>`. The printer profile decides the format;
     an `out_path` with another extension is refused. Parent folders are
@@ -574,6 +613,8 @@ async def auto_support_and_slice(
         overhang_max_height_mm=overhang_max_height_mm,
         min_clearance_mm=min_clearance_mm,
         auto_densify=auto_densify,
+        avoid_steep_contacts=avoid_steep_contacts,
+        steep_contact_deg=steep_contact_deg,
         options=options,
         previews=previews,
     )
@@ -605,6 +646,8 @@ def run_auto_support_and_slice(
     overhang_max_height_mm: float | None = None,
     min_clearance_mm: float = DEFAULT_MIN_CLEARANCE_MM,
     auto_densify: bool = True,
+    avoid_steep_contacts: bool = True,
+    steep_contact_deg: float = DEFAULT_STEEP_CONTACT_DEG,
     options: dict[str, Any] | None = None,
     previews: bool = True,
 ) -> SupportedSlice:
@@ -630,6 +673,8 @@ def run_auto_support_and_slice(
             raise ValueError("overhang_max_height_mm must be a positive number of mm")
         if not overhangs:
             raise ValueError("overhang_max_height_mm limits the overhang family: needs overhangs")
+    if not (math.isfinite(steep_contact_deg) and 0 < steep_contact_deg < 180):
+        raise ValueError("steep_contact_deg must be between 0 and 180")
     if not (math.isfinite(min_clearance_mm) and min_clearance_mm >= 0):
         raise ValueError("min_clearance_mm must be 0 (off) or more")
     if aa_preset is not None and aa_preset not in slicing.AA_PRESETS:
@@ -718,6 +763,10 @@ def run_auto_support_and_slice(
         args += ["--min-clearance", f"{min_clearance_mm:g}"]
         if not auto_densify:
             args.append("--no-auto-densify")
+        if not avoid_steep_contacts:
+            args.append("--keep-steep-contacts")
+        if steep_contact_deg != DEFAULT_STEEP_CONTACT_DEG:
+            args += ["--steep-contact-deg", f"{steep_contact_deg:g}"]
         if zones:
             # In the STL's frame: the script moves them with the model onto the plate.
             keep_out_file = Path(tmp) / "holes.json"
@@ -788,6 +837,9 @@ def run_auto_support_and_slice(
             "grazes": len((data.get("clearance") or {}).get("grazes", [])),
             "density": (data.get("density") or {}).get("chosen"),
             "sparse_area_mm2": (data.get("sparse_support") or {}).get("sparse_area_mm2"),
+            "steep_supports_removed": len((data.get("steep_contacts") or {}).get("removed", []))
+            if avoid_steep_contacts
+            else 0,
             "supported_stl": data.get("supported_stl") if export_supported_stl else None,
         }
         sidecar = slicing.write_sidecar(
@@ -851,6 +903,9 @@ def run_auto_support_and_slice(
                 SparseSupport(**data["sparse_support"]) if data.get("sparse_support") else None
             ),
             density=Density(**data["density"]) if data.get("density") else None,
+            steep_contacts=(
+                SteepContacts(**data["steep_contacts"]) if data.get("steep_contacts") else None
+            ),
             timings_ms=data["timings_ms"],
             previews_written=previews_written,
             warnings=warnings,

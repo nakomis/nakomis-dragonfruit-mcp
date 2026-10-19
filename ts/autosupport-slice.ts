@@ -40,6 +40,7 @@
  *     [--aa-preset sharp|balanced|smooth|raw] [--lift-mm 7] [--density 1] [--raft solid|line|off]
  *     [--settings <json>] [--coarse-islands] [--no-overhangs] [--px-mm 0.05] [--supported-stl <out.stl>] [--plate-stl <out.stl>] [--job-dir <dir>]
  *     [--keep-out <holes.json>] [--max-support-height <mm>] [--overhang-max-height <mm>] [--min-clearance <mm>] [--no-auto-densify]
+ *     [--steep-contact-deg 60] [--keep-steep-contacts]
  *     [--support-internal-islands] [--probe-points <json>] [--no-slice] [--verbose]
  *
  * `--supported-stl` writes model, supports and raft as sliced; `--plate-stl` the
@@ -97,6 +98,13 @@
  * support store before export, so the supports sliced are the ones checked.
  * `density` in the summary lists every try.
  *
+ * Steep-wall contacts (NDFM-31): a support whose every tip meets surface
+ * steeper than `--steep-contact-deg` (default 60° from horizontal, averaged
+ * over 1.5 mm round the tip), with nothing within that 1.5 mm flatter than the
+ * self-support angle (no overhang it could be holding), is removed with its dependants, unless it is all
+ * that holds an island, when the least steep is kept. `--keep-steep-contacts`
+ * only reports them. The summary's `steep_contacts` lists both.
+ *
  * Islands whose contact faces a sealed cavity are skipped before placement
  * (hollow interiors are not supported in normal resin practice, and the only
  * way to reach them is a trunk up through the drain hole) unless
@@ -153,6 +161,9 @@ import {
     parseHoles,
     positionsInFaceOrder,
     SPARSE_SPACING_FACTOR,
+    STEEP_CONTACT_DEG,
+    STEEP_RADIUS_MM,
+    SurfaceTilt,
     triangleIndicesInZones,
     type ClearanceReport,
     type SparseSupportReport,
@@ -224,6 +235,10 @@ interface Options {
     minClearanceMm: number;
     /** On finding sparsely supported overhang, retry placement at 1.5x and 2x density (NDFM-30). */
     autoDensify: boolean;
+    /** Contacts on surface steeper than this, from horizontal, are steep-wall contacts (NDFM-31). */
+    steepContactDeg: number;
+    /** Remove steep-wall contacts (keeping one where it is an island's only support). */
+    avoidSteepContacts: boolean;
     supportInternalIslands: boolean;
     probePoints: number[][] | null;
     slice: boolean;
@@ -255,6 +270,8 @@ function parseArgs(argv: string[]): Options {
         overhangMaxHeightMm: null,
         minClearanceMm: DEFAULT_MIN_CLEARANCE_MM,
         autoDensify: true,
+        steepContactDeg: STEEP_CONTACT_DEG,
+        avoidSteepContacts: true,
         supportInternalIslands: false,
         probePoints: null,
         slice: true,
@@ -296,6 +313,8 @@ function parseArgs(argv: string[]): Options {
         else if (arg === '--overhang-max-height') options.overhangMaxHeightMm = number();
         else if (arg === '--min-clearance') options.minClearanceMm = number();
         else if (arg === '--no-auto-densify') options.autoDensify = false;
+        else if (arg === '--steep-contact-deg') options.steepContactDeg = number();
+        else if (arg === '--keep-steep-contacts') options.avoidSteepContacts = false;
         else if (arg === '--support-internal-islands') options.supportInternalIslands = true;
         else if (arg === '--probe-points') options.probePoints = JSON.parse(value()) as number[][];
         else if (arg === '--no-slice') options.slice = false;
@@ -311,6 +330,7 @@ function parseArgs(argv: string[]): Options {
     if (options.maxSupportHeightMm !== null && options.maxSupportHeightMm <= 0) throw new Error('--max-support-height must be positive');
     if (options.overhangMaxHeightMm !== null && options.overhangMaxHeightMm <= 0) throw new Error('--overhang-max-height must be positive');
     if (options.minClearanceMm < 0) throw new Error('--min-clearance must not be negative');
+    if (!(options.steepContactDeg > 0 && options.steepContactDeg < 180)) throw new Error('--steep-contact-deg must be between 0 and 180');
     return options;
 }
 
@@ -545,6 +565,25 @@ function findDanglingShafts(): string[] {
         }
     }
     return dangling;
+}
+
+/**
+ * What hangs off each support (hosted on its knots: a leaf or branch, or a
+ * brace's end), which `removeSupportEntity` takes with it.
+ */
+function hostedChildren(): Map<string, string[]> {
+    const state = getSnapshot() as unknown as Record<string, Record<string, Record<string, unknown>>>;
+    const children = new Map<string, string[]>();
+    for (const descriptor of SUPPORT_STATE_TYPES) {
+        for (const [id, entity] of Object.entries(state[descriptor.location.key] ?? {})) {
+            for (const field of ['parentKnotId', 'startKnotId', 'endKnotId']) {
+                const knot = entity[field] ? state.knots?.[entity[field] as string] as { parentShaftId?: string } | undefined : undefined;
+                const host = knot?.parentShaftId;
+                if (host && host !== id) (children.get(host) ?? children.set(host, []).get(host)!).push(id);
+            }
+        }
+    }
+    return children;
 }
 
 function writeBinaryStl(path: string, positions: Float32Array): void {
@@ -782,6 +821,9 @@ async function main(): Promise<void> {
     // One placement at a density: reset the store, place, commit, then remove
     // whatever enters a keep-out zone or rises above the cap. Its warnings and
     // reports are its own until it is chosen.
+    // The surface's tilt round any point, for judging where tips land (NDFM-31).
+    const surfaceTilt = new SurfaceTilt(facePositions);
+
     const attempt = async (density: number) => {
         const warnings: string[] = [];
         const band = bandReport ? { ...bandReport } : null;
@@ -933,6 +975,80 @@ async function main(): Promise<void> {
                 residual_in_zone: residual,
             };
         }
+        // Steep-wall contacts (NDFM-31): supports whose every tip meets surface
+        // steeper than the limit. They hold up a wall that holds itself up and
+        // tear a strip out of it on removal, so (by default) they go, except
+        // where one is all that holds an island: then the least steep stays.
+        type SteepContact = { tilt_deg: number; at_plate_mm: number[]; height_above_base_mm: number; island?: string; id?: string };
+        const steep = {
+            limit_deg: options.steepContactDeg,
+            radius_mm: STEEP_RADIUS_MM,
+            avoid: options.avoidSteepContacts,
+            contacts_checked: 0,
+            supports_steep: 0,
+            removed: [] as SteepContact[],
+            kept_for_coverage: [] as SteepContact[],
+            entities_removed: 0,
+        };
+        {
+            const live = probeCommittedSupports();
+            const probeById = new Map(live.map((probe) => [probe.id, probe]));
+            // Removing a support takes what hangs off it, so a support is judged
+            // with everything it hosts: steep only if every tip in it is.
+            const children = hostedChildren();
+            const subtree = (id: string): string[] => {
+                const out = new Set<string>([id]);
+                for (const next of out) for (const child of children.get(next) ?? []) out.add(child);
+                return [...out];
+            };
+            const steepBy = new Map<string, SteepContact>();
+            for (const probe of live) {
+                const tips = subtree(probe.id).flatMap((id) => probeById.get(id)?.contacts ?? []);
+                if (tips.length === 0) continue;
+                // Steep where the surface round the tip is steep on average and
+                // none of it needs support: a tip beside a real overhang stays.
+                const around = tips.map((q) => surfaceTilt.around(q));
+                const tilts = around.map((a) => a.mean);
+                steep.contacts_checked += tilts.length;
+                if (!around.every((a) => Number.isFinite(a.mean) && a.mean > options.steepContactDeg && a.flattest >= selfSupportAngleDeg)) continue;
+                const i = tilts.indexOf(Math.min(...tilts));
+                const q = tips[i];
+                steepBy.set(probe.id, { tilt_deg: tilts[i], at_plate_mm: q.toArray(), height_above_base_mm: q.z - box.min.z });
+            }
+            steep.supports_steep = steepBy.size;
+            const reach = (island: DetectedIsland) => Math.max(3, Math.sqrt((island.areaMm2 ?? 0) / Math.PI) + 1);
+            for (const island of placed) {
+                const where = new THREE.Vector3(island.contact.x, island.contact.y, island.contact.z);
+                const near = live.filter((probe) => probe.contacts.some((q) => q.distanceTo(where) <= reach(island)));
+                if (near.length === 0 || near.some((probe) => !steepBy.has(probe.id))) continue;
+                // Everything near this island is steep-walled: keep the least steep.
+                const keep = near.reduce((p, q) => (steepBy.get(p.id)!.tilt_deg <= steepBy.get(q.id)!.tilt_deg ? p : q));
+                steep.kept_for_coverage.push({ ...steepBy.get(keep.id)!, island: island.id, id: keep.id });
+                steepBy.delete(keep.id);
+            }
+            // Nothing above a kept support may go: it would take the kept one with it.
+            const kept = new Set(steep.kept_for_coverage.map((k) => k.id));
+            for (const id of [...steepBy.keys()]) if (subtree(id).some((d) => kept.has(d))) steepBy.delete(id);
+            steep.removed = [...steepBy.values()];
+            if (options.avoidSteepContacts && steepBy.size > 0) {
+                const before = totalEntities();
+                for (const id of steepBy.keys()) removeSupportEntity(id);
+                for (;;) {
+                    const dangling = findDanglingShafts();
+                    if (dangling.length === 0) break;
+                    for (const id of dangling) removeSupportEntity(id);
+                }
+                steep.entities_removed = before - totalEntities();
+            }
+            if (steep.removed.length > 0) {
+                warnings.push(options.avoidSteepContacts
+                    ? `removed ${steep.removed.length} support(s) whose tips met walls steeper than ${options.steepContactDeg}° (scar risk, little support value)`
+                    : `${steep.removed.length} support(s) have their tips on walls steeper than ${options.steepContactDeg}°: they can tear a strip from the surface when removed`);
+            }
+            if (steep.kept_for_coverage.length > 0) {
+                warnings.push(`kept ${steep.kept_for_coverage.length} steep-wall support(s), each the only support for its island (${steep.kept_for_coverage.map((k) => k.island).join(', ')})`);
+            }
+        }
         if (band) {
             // The check: no overhang support's contact above the band, give or take
             // a triangle straddling its top.
@@ -943,7 +1059,7 @@ async function main(): Promise<void> {
                 warnings.push(`${band.overhang_contacts_above_band} overhang support contact(s) landed more than ${OVERHANG_BAND_SLACK_MM} mm above the overhang band (${options.overhangMaxHeightMm} mm above the model's base)`);
             }
         }
-        return { density, plan, result, settingsOverride, keepOutReport, capReport, removalTotals, band, warnings };
+        return { density, plan, result, settingsOverride, keepOutReport, capReport, removalTotals, band, warnings, steep };
     };
 
     // Sparse support (NDFM-30): overhang further than the limit from every
@@ -1180,6 +1296,7 @@ async function main(): Promise<void> {
         overhang_band: bandReport,
         clearance,
         sparse_support: sparse,
+        steep_contacts: best.steep,
         density: {
             requested: options.density,
             auto_densify: options.autoDensify,

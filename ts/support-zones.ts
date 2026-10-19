@@ -693,3 +693,100 @@ export function findSparseSupport(
     report.sparse_area_mm2 = report.regions.reduce((s, r) => s + r.area_mm2, 0);
     return report;
 }
+
+/**
+ * Steep-wall contacts (NDFM-31): a support tip meeting a near-vertical wall
+ * touches it at a glancing angle, so its cone sinks across a tall stripe of
+ * layers and tears out a strip when the supports come off a soft, fresh print
+ * (the 100 mm Chi's haunch, 15 Oct 2026). The wall holds itself up, so such a
+ * contact is scar risk with little support value.
+ */
+/** Contacts on surface steeper than this, from horizontal, are steep-wall contacts. */
+export const STEEP_CONTACT_DEG = 60;
+/** The surface round a tip is judged over this radius. */
+export const STEEP_RADIUS_MM = 1.5;
+
+/** Angle of a surface from horizontal, by its normal: 0 a flat underside, 90 a wall, 180 a top. */
+export function tiltDeg(nz: number): number {
+    return (Math.acos(Math.max(-1, Math.min(1, -nz))) * 180) / Math.PI;
+}
+
+/**
+ * The model surface's tilt round a point: the mean of the tilts of the
+ * triangles within the radius (by true point-to-triangle distance), each
+ * weighted by its area, capped at the disc the radius covers, so one large
+ * flat triangle does not drown a fine one beside it. Large triangles are
+ * indexed in every cell their bounds cover.
+ */
+export class SurfaceTilt {
+    private readonly cells = new Map<string, number[]>();
+    private readonly positions: Float32Array;
+    private readonly tilt: Float32Array;
+    private readonly weight: Float32Array;
+    // One triangle and two vectors reused per query, not one object per face:
+    // a million-triangle model would otherwise hold hundreds of MB.
+    private readonly tri = new THREE.Triangle();
+    private readonly point = new THREE.Vector3();
+    private readonly closest = new THREE.Vector3();
+
+    constructor(positions: ArrayLike<number>, readonly radiusMm = STEEP_RADIUS_MM) {
+        const count = Math.floor(positions.length / 9);
+        this.positions = Float32Array.from(positions as ArrayLike<number>);
+        this.tilt = new Float32Array(count);
+        this.weight = new Float32Array(count);
+        const r = radiusMm;
+        const cap = Math.PI * r * r;
+        const n = new THREE.Vector3();
+        for (let t = 0; t < count; t++) {
+            this.load(t);
+            const { a, b, c } = this.tri;
+            this.tri.getNormal(n);
+            const area = this.tri.getArea();
+            this.tilt[t] = area === 0 ? 90 : tiltDeg(n.z);
+            this.weight[t] = Math.min(area, cap);
+            const lo = [Math.min(a.x, b.x, c.x), Math.min(a.y, b.y, c.y), Math.min(a.z, b.z, c.z)].map((v) => Math.floor(v / r));
+            const hi = [Math.max(a.x, b.x, c.x), Math.max(a.y, b.y, c.y), Math.max(a.z, b.z, c.z)].map((v) => Math.floor(v / r));
+            for (let x = lo[0]; x <= hi[0]; x++) for (let y = lo[1]; y <= hi[1]; y++) for (let z = lo[2]; z <= hi[2]; z++) {
+                const k = `${x},${y},${z}`;
+                (this.cells.get(k) ?? this.cells.set(k, []).get(k)!).push(t);
+            }
+        }
+    }
+
+    private load(t: number): void {
+        const p = this.positions;
+        this.tri.a.set(p[t * 9], p[t * 9 + 1], p[t * 9 + 2]);
+        this.tri.b.set(p[t * 9 + 3], p[t * 9 + 4], p[t * 9 + 5]);
+        this.tri.c.set(p[t * 9 + 6], p[t * 9 + 7], p[t * 9 + 8]);
+    }
+
+    /** The mean tilt round `p`; NaN for a point with no surface within the radius. */
+    at(p: { x: number; y: number; z: number }): number {
+        return this.around(p).mean;
+    }
+
+    /** The mean tilt round `p`, and the flattest surface within the radius. */
+    around(p: { x: number; y: number; z: number }): { mean: number; flattest: number } {
+        const r = this.radiusMm;
+        this.point.set(p.x, p.y, p.z);
+        const seen = new Set<number>();
+        let weighted = 0;
+        let total = 0;
+        let flattest = Infinity;
+        const gx = Math.floor(p.x / r);
+        const gy = Math.floor(p.y / r);
+        const gz = Math.floor(p.z / r);
+        for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+            for (const t of this.cells.get(`${gx + dx},${gy + dy},${gz + dz}`) ?? []) {
+                if (seen.has(t)) continue;
+                seen.add(t);
+                this.load(t);
+                if (this.tri.closestPointToPoint(this.point, this.closest).distanceTo(this.point) > r) continue;
+                weighted += this.tilt[t] * this.weight[t];
+                total += this.weight[t];
+                flattest = Math.min(flattest, this.tilt[t]);
+            }
+        }
+        return total > 0 ? { mean: weighted / total, flattest } : { mean: Number.NaN, flattest: Number.NaN };
+    }
+}
