@@ -450,6 +450,7 @@ async def auto_support_and_slice(
     export_supported_stl: bool = False,
     fast_islands: bool = False,
     overhangs: bool = True,
+    minima: bool = False,
     overhang_angle_deg: float | None = None,
     keep_out_holes: bool = True,
     holes: list[dict[str, Any]] | None = None,
@@ -605,6 +606,7 @@ async def auto_support_and_slice(
         export_supported_stl=export_supported_stl,
         fast_islands=fast_islands,
         overhangs=overhangs,
+        minima=minima,
         overhang_angle_deg=overhang_angle_deg,
         keep_out_holes=keep_out_holes,
         holes=holes,
@@ -638,6 +640,7 @@ def run_auto_support_and_slice(
     export_supported_stl: bool = False,
     fast_islands: bool = False,
     overhangs: bool = True,
+    minima: bool = False,
     overhang_angle_deg: float | None = None,
     keep_out_holes: bool = True,
     holes: list[dict[str, Any]] | None = None,
@@ -751,6 +754,8 @@ def run_auto_support_and_slice(
             args.append("--coarse-islands")
         if not overhangs:
             args.append("--no-overhangs")
+        if minima:
+            args.append("--minima")
         if overhang_angle_deg is not None:
             settings = {"overhangSelfSupportAngleDeg": overhang_angle_deg}
             args += ["--settings", json.dumps(settings, separators=(",", ":"))]

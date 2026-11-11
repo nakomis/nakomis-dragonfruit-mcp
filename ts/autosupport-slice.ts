@@ -179,6 +179,7 @@ import { classifyIntersection } from '@/volumeAnalysis/Islands/intersection';
 import type { DetectedIsland, OverhangRegion, OverhangScan } from '@/volumeAnalysis/Islands/types';
 
 import { detectVoxelIslandsBounded, type WorkerLike } from './voxel-islands';
+import { detectMeshMinima } from './mesh-minima';
 
 /** The footprint resolution the app's island panel asks `scan_overhangs` for (useIslands.ts). */
 const OVERHANG_FOOTPRINT_PX_MM = 0.25;
@@ -223,6 +224,9 @@ interface Options {
     pxMm: number | null;
     coarseIslands: boolean;
     overhangs: boolean;
+    /** Use the mesh-minima island family (voxel + minima, point-based) in place
+     *  of the overhang density grid — the app's "Generate Supports" set. Sparse. */
+    minima: boolean;
     supportedStl: string | null;
     plateStl: string | null;
     jobDir: string | null;
@@ -262,6 +266,7 @@ function parseArgs(argv: string[]): Options {
         pxMm: null,
         coarseIslands: false,
         overhangs: true,
+        minima: false,
         supportedStl: null,
         plateStl: null,
         jobDir: null,
@@ -305,6 +310,7 @@ function parseArgs(argv: string[]): Options {
         else if (arg === '--px-mm') options.pxMm = number();
         else if (arg === '--coarse-islands') options.coarseIslands = true;
         else if (arg === '--no-overhangs') options.overhangs = false;
+        else if (arg === '--minima') options.minima = true;
         else if (arg === '--supported-stl') options.supportedStl = resolve(value());
         else if (arg === '--plate-stl') options.plateStl = resolve(value());
         else if (arg === '--job-dir') options.jobDir = resolve(value());
@@ -744,8 +750,9 @@ async function main(): Promise<void> {
     const selfSupportAngleDeg = options.settings.overhangSelfSupportAngleDeg
         ?? createDefaultSettings().autoSupport.overhangSelfSupportAngleDeg;
     let overhangRegions: OverhangRegion[] | null = null;
-    if (!options.overhangs) {
-        // Asked for: self-supporting shapes (lattices) whose saddles read as overhangs.
+    if (!options.overhangs || options.minima) {
+        // Asked for: self-supporting shapes (lattices) whose saddles read as overhangs;
+        // or minima mode, which replaces the overhang grid with point-based minima.
     } else if (options.tools) {
         overhangRegions = await time('overhangs_ms', () => scanOverhangs(
             options.tools!,
@@ -783,7 +790,13 @@ async function main(): Promise<void> {
     }
     const overhangIslands = (overhangRegions ?? []).map(overhangRegionToIsland);
     const classified = classifyIntersection(voxelIslands, [], { xyToleranceMm: 0.5, zBandMm: layerHeightMm });
-    const islands = mergeOverhangRegions(classified.islands, overhangIslands);
+    let islands = mergeOverhangRegions(classified.islands, overhangIslands);
+    if (options.minima) {
+        // The app's "Generate Supports" set: voxel islands + mesh minima (points),
+        // in place of the overhang density grid (reimplemented headless).
+        const minimaIslands = detectMeshMinima(facePositions);
+        islands = [...islands, ...minimaIslands];
+    }
 
     // Placement settings. Density scales supports per area: twice the density,
     // half the area each carries. Placement may run more than once (NDFM-30).
